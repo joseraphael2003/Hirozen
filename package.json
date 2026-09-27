@@ -1,0 +1,19 @@
+{
+  "name": "hirozen",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "omp plugin giving the agent read-only access to a running Zen browser",
+  "omp": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "^18.3.4",
+    "@types/bun": "latest",
+    "typescript": "^5.9.0"
+  }
+}
