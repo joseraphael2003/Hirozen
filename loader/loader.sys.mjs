@@ -284,7 +284,7 @@ class Loader {
   #loaderSha256 = null;
   #client = null; // authenticated omp connection
   #handshakeInFlight = false; // an outgoing connection attempt is in progress
-  #notices = new Set(); // the live Hirozen notification, one per open non-private window
+  #notices = new Map(); // live notice element -> the notification box of the window showing it
   #noticeGen = 0; // bumped on every close, so an append still in flight cannot revive itself
   #status = {
     version: STATUS_VERSION,
@@ -362,16 +362,21 @@ class Loader {
     this.#connect(handoff);
   }
 
+  // Removal goes through the box with the slide-out animation skipped. Notification.close() only
+  // starts that animation and the element is detached on the stack's `transitionend`, which a
+  // background (occluded) window never runs - the notice, Stop button included, stays on screen.
+  #removeNotice(box, notification) {
+    try {
+      box.removeNotification(notification, true);
+    } catch {
+      // Zen may have removed the notification already, or the window (and its box) went away; UI
+      // cleanup must never break the connection teardown.
+    }
+  }
+
   #closeNotice() {
     this.#noticeGen++;
-    for (const notification of this.#notices) {
-      try {
-        notification.close();
-      } catch {
-        // Zen may have removed the notification already (window closed, user dismissed it); UI cleanup
-        // must never break the connection teardown.
-      }
-    }
+    for (const [notification, box] of this.#notices) this.#removeNotice(box, notification);
     this.#notices.clear();
   }
 
@@ -393,14 +398,8 @@ class Loader {
         buttons
       ).then(
         notification => {
-          if (generation === this.#noticeGen) this.#notices.add(notification);
-          else {
-            try {
-              notification.close(); // a newer notice (or teardown) replaced this one while it was appended
-            } catch {
-              // the window went away in the meantime
-            }
-          }
+          if (generation === this.#noticeGen) this.#notices.set(notification, box);
+          else this.#removeNotice(box, notification); // a newer notice (or teardown) replaced it meanwhile
         },
         () => {} // the window went away before the notification was appended
       );
