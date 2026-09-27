@@ -284,7 +284,8 @@ class Loader {
   #loaderSha256 = null;
   #client = null; // authenticated omp connection
   #handshakeInFlight = false; // an outgoing connection attempt is in progress
-  #notice = null;
+  #notices = new Set(); // the live Hirozen notification, one per open non-private window
+  #noticeGen = 0; // bumped on every close, so an append still in flight cannot revive itself
   #status = {
     version: STATUS_VERSION,
     loaderSha256: null,
@@ -362,38 +363,61 @@ class Loader {
   }
 
   #closeNotice() {
-    try {
-      this.#notice?.close();
-    } catch {
-      // Zen may have removed the notification already (window closed, user dismissed it); UI cleanup
-      // must never break the connection teardown.
+    this.#noticeGen++;
+    for (const notification of this.#notices) {
+      try {
+        notification.close();
+      } catch {
+        // Zen may have removed the notification already (window closed, user dismissed it); UI cleanup
+        // must never break the connection teardown.
+      }
     }
-    this.#notice = null;
+    this.#notices.clear();
   }
 
+  // Shown in every open non-private window, each with its own Stop button: the user may be looking at
+  // any of them, and Stop has to be reachable from wherever the prompt is. Windows opened later get
+  // nothing (Hirozen does not watch for new windows).
   #showNotice(text, { warning = false, stopButton = true } = {}) {
-    const box = browserWindows()[0]?.gNotificationBox;
-    if (!box) return;
     this.#closeNotice();
+    const generation = this.#noticeGen;
     const buttons = stopButton
       ? [{ label: "Stop", callback: () => { this.#disconnect("stopped by user in Zen", CLOSE_STOPPED); return false; } }]
       : [];
-    box.appendNotification(
-      "hirozen",
-      { label: text, priority: warning ? box.PRIORITY_WARNING_HIGH : box.PRIORITY_INFO_HIGH },
-      buttons
-    ).then(
-      notification => { this.#notice = notification; },
-      () => {} // the window went away before the notification was appended
-    );
+    for (const win of browserWindows()) {
+      const box = win.gNotificationBox;
+      if (!box) continue;
+      box.appendNotification(
+        "hirozen",
+        { label: text, priority: warning ? box.PRIORITY_WARNING_HIGH : box.PRIORITY_INFO_HIGH },
+        buttons
+      ).then(
+        notification => {
+          if (generation === this.#noticeGen) this.#notices.add(notification);
+          else {
+            try {
+              notification.close(); // a newer notice (or teardown) replaced this one while it was appended
+            } catch {
+              // the window went away in the meantime
+            }
+          }
+        },
+        () => {} // the window went away before the notification was appended
+      );
+    }
+  }
+
+  // The omp identity from the handoff that started this link, as every notice names it.
+  #who() {
+    const handoff = this.#status.lastHandoff;
+    return `omp pid ${handoff?.pid ?? "?"} (${handoff?.cwd ?? "unknown folder"})`;
   }
 
   #connect({ port, nonce, pid, cwd }) {
     this.#handshakeInFlight = true;
-    const who = `omp pid ${pid ?? "?"} (${cwd ?? "unknown folder"})`;
-    // Shown before any Firefox prompt, so the user can correlate the dialog with a terminal process.
-    this.#showNotice(`Hirozen: ${who} is connecting to Zen.`);
     this.#writeStatus({ state: "authenticating", lastHandoff: { pid: pid ?? null, cwd: cwd ?? null, at: new Date().toISOString() } });
+    // Shown before any Firefox prompt, so the user can correlate the dialog with a terminal process.
+    this.#showNotice(`Hirozen: ${this.#who()} is connecting to Zen.`);
     const myChallenge = randomHex(32);
     let authed = false;
     const authTimer = setTimeout(() => {
@@ -425,7 +449,7 @@ class Loader {
             // A fresh authenticated connection clears the abandoned flag and joins the pending start:
             // the consent prompt stays open until the user answers it, so it can still be adopted.
             this.#abandoned = false;
-            this.#showNotice(`Hirozen: ${who} is connected. Stop ends the session.`);
+            this.#showNotice(`Hirozen: ${this.#who()} is connected. Stop ends the session.`);
             this.#writeStatus({ state: "connected", lastClose: null });
             ws.send({
               type: "ready",
@@ -638,9 +662,13 @@ class Loader {
       }
     }
 
-    // Busy port => startAtRuntime's listener would force-quit Zen, so refuse before touching the agent.
+    // Port not bindable => startAtRuntime's listener would force-quit Zen, so refuse before touching the
+    // agent. A Windows-reserved range (Hyper-V/WinNAT/WSL) refuses the bind just like a listener does.
     if (!bidiPortFree()) {
-      throw this.#refuseStart("E_PORT_BUSY", "127.0.0.1:9222 is busy; refusing to start (a busy port would force-quit Zen). zen.* keeps working.");
+      throw this.#refuseStart(
+        "E_PORT_BUSY",
+        "127.0.0.1:9222 cannot be bound (in use or reserved by Windows: check `netsh int ipv4 show excludedportrange protocol=tcp`); refusing to start. zen.* keeps working."
+      );
     }
 
     Services.prefs.setBoolPref("remote.prefs.recommended", false);
@@ -654,7 +682,7 @@ class Loader {
         throw new LoaderError("E_UNSAFE_START", `unsafe BiDi start: port=${port} dynamic=${RA.isDynamicStartRunning} automation=${RA.isBrowserAutomationRunning} recommendedPrefsApplied=${applied}`);
       }
       await this.#openBidiSocket();
-      this.#showNotice(`Hirozen: answer Zen's "Allow remote control?" dialog to let omp pid ${this.#status.lastHandoff?.pid ?? "?"} read tabs.`);
+      this.#showNotice(`Hirozen: answer Zen's "Allow remote control?" dialog to let ${this.#who()} read Zen tabs.`);
       // No timer here: Gecko's consent dialog cannot be dismissed from code, so a bound would only
       // strand the start while the dialog (and the agent) stayed up. This stays joinable until answered.
       const session = await this.#bidiCommand("session.new", SESSION_NEW_PARAMS, Infinity);
@@ -666,16 +694,29 @@ class Loader {
       }
       this.#writeStatus({ bidi: { state: "running", port, sessionId: session.sessionId } });
       this.#emit("bidi.running", { port, sessionId: session.sessionId });
+      // Consent was granted: the "answer the dialog" wording must not survive on screen.
+      this.#showNotice(`Hirozen: ${this.#who()} is connected - Hirozen can read Zen tabs. Stop ends the session.`);
       return { port, sessionId: session.sessionId };
     } catch (e) {
       const failure = e instanceof LoaderError ? e : classifySessionNewError(e) ?? new LoaderError("E_STOPPED", String(e?.message ?? e));
+      // Only a notice while omp is still there: an abandoned start already had its notice removed by
+      // teardown, and re-adding one would leave a Stop button on a dead link.
+      const connected = this.#client !== null;
       if (failure.code === "E_COMPROMISE") {
         // A fresh WebDriverBiDi is created per startAtRuntime and the in-progress flag is set by our own
         // call, so a max-sessions failure has no legitimate cause: someone else holds a session.
         await this.#stopBidi("session refused: another session is active").catch(() => {});
-        this.#showNotice("Hirozen: Zen refused a remote-control session because another session is already active. The remote agent was stopped; Hirozen has no control.", { warning: true, stopButton: false });
+        if (connected) this.#showNotice("Hirozen: Zen refused a remote-control session because another session is already active. The remote agent was stopped; Hirozen has no control.", { warning: true, stopButton: false });
       } else {
         await this.#stopBidi("BiDi start failed").catch(() => {});
+        if (connected) {
+          // The prompt settled (Deny) or the start died: either way the dialog is no longer the task.
+          this.#showNotice(
+            failure.code === "E_DENIED"
+              ? 'Hirozen: the "Allow remote control?" prompt was denied in Zen - Hirozen has no control of Zen. Stop ends the session.'
+              : `Hirozen: remote control could not start (${failure.code}) - Hirozen has no control of Zen. Stop ends the session.`
+          );
+        }
       }
       throw failure;
     }

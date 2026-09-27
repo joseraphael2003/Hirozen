@@ -27,7 +27,9 @@ export type AttachOptions = {
   zenDir: string;
   /** Exact profile directory of the running Zen; forwarded verbatim as `--profile`. */
   profileDir: string;
-  /** Terminal notice (`ctx.ui.notify`): what to accept in Zen, then the local RDP client port. */
+  /** Terminal notice (`ctx.ui.notify`): what to accept in Zen, then the local RDP client port. The
+   * message is the body only - the presenter adds its own "Hirozen:" prefix, so adding one here would
+   * render twice. */
   notify: (message: string) => void;
 };
 
@@ -485,9 +487,11 @@ export async function attachNow(options: AttachOptions): Promise<AttachResult> {
   // Forwarding needs the two DevTools prefs (checked above) and a plain-TCP flag: `ws:` has no Origin
   // or Host check and would let a web page reach chrome eval.
   const port = await pickFreePort();
+  // Every check has passed and the command line is about to be forwarded: only now can the prompt
+  // appear, so this is the first notice that may be shown (a refusal above sends none).
   notify(
-    `Hirozen: attaching the loader to the running Zen. Accept the "Incoming Connection" prompt in Zen ` +
-      `(server 127.0.0.1:${port}); Cancel aborts and leaves the loader unused.`,
+    `attaching the loader to the running Zen: click OK on the "Incoming Connection" prompt (never ` +
+      `"Disable") so this session can attach (server 127.0.0.1:${port}); Cancel aborts and leaves the loader unused.`,
   );
   Bun.spawn({
     cmd: [zenExe, "--profile", profileDir, "--start-debugger-server", String(port)],
@@ -500,7 +504,7 @@ export async function attachNow(options: AttachOptions): Promise<AttachResult> {
   const client = await RdpClient.connect(port, deadline);
   await client.wait(packet => packet.from === "root" && "applicationType" in packet, "the DevTools greeting");
   notify(
-    `Hirozen: connected to Zen's debugger (client 127.0.0.1:${client.localPort} -> server 127.0.0.1:${port}); ` +
+    `connected to Zen's debugger (client 127.0.0.1:${client.localPort} -> server 127.0.0.1:${port}); ` +
       `installing the loader now - the listener closes when the eval is done.`,
   );
 

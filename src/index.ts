@@ -45,7 +45,7 @@ const PLUGIN_CODES: Record<string, true> = {
 const CODE_TEXT: Record<string, string> = {
   E_COMPROMISE: "another debugger had already started remote control in Zen; Hirozen stopped it and refused to continue",
   E_DENIED: "the remote-control prompt was denied in Zen",
-  E_PORT_BUSY: "127.0.0.1:9222 is already in use by another program; Zen was left untouched",
+  E_PORT_BUSY: "127.0.0.1:9222 cannot be bound - the port is in use by another program or reserved by Windows (check `netsh int ipv4 show excludedportrange protocol=tcp`); Zen was left untouched",
   E_PRIVATE: "that tab is in a private window, which Hirozen never touches",
   E_PRIVILEGED_PAGE: "that tab is a privileged page, which Hirozen refuses to read",
   E_STOPPED: "the loader dropped the session (fail-closed); retry, or run /hirozen-connect",
@@ -434,6 +434,15 @@ function failCall(error: unknown, consentBudget: boolean): AgentToolResult<unkno
   return fail(described);
 }
 
+/** How much of a URL the header echoes: a `data:` URL can be tens of thousands of characters long. */
+const URL_HEADER_CAP = 300;
+
+/** `# <title>\n<url>\n\n<text>` with the URL capped, so one page cannot flood the terminal. */
+function renderRead(page: ZenRead): string {
+  const url = page.url.length > URL_HEADER_CAP ? `${page.url.slice(0, URL_HEADER_CAP)}…` : page.url;
+  return `# ${page.title}\n${url}\n\n${page.text}`;
+}
+
 async function runBrowserRead(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -447,7 +456,7 @@ async function runBrowserRead(
   try {
     const page = await access.link.call<ZenRead>("browser.read", { tabKey }, { timeoutMs, signal });
     return {
-      content: [{ type: "text", text: `# ${page.title}\n${page.url}\n\n${page.text}` }],
+      content: [{ type: "text", text: renderRead(page) }],
       details: { tabKey: page.tabKey, url: page.url, title: page.title, truncated: page.truncated, chars: page.text.length },
     };
   } catch (error) {
@@ -510,11 +519,9 @@ async function runAttachCommand(ctx: ExtensionContext): Promise<void> {
     ctx.ui.notify(`Hirozen: ${config.problem}`, "error");
     return;
   }
-  ctx.ui.notify(
-    'Hirozen: Zen will show an "Incoming Connection" alert from its debugger — click OK there (never "Disable") so this session can attach.',
-    "info",
-  );
   try {
+    // attachNow notifies right before it forwards the command line: the "Incoming Connection" prompt
+    // only appears once the prefs, lock and loader-hash checks have passed, so a refusal stays silent.
     const attached = await attachNow({
       zenDir: config.config.zenDir,
       profileDir: config.config.profileDir,
