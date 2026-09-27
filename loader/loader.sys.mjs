@@ -284,6 +284,7 @@ class Loader {
   #loaderSha256 = null;
   #client = null; // authenticated omp connection
   #handshakeInFlight = false; // an outgoing connection attempt is in progress
+  #tearingDown = false; // a teardown is stopping BiDi; #poll must leave any new handoff to it
   #notices = new Map(); // live notice element -> the notification box of the window showing it
   #noticeGen = 0; // bumped on every close, so an append still in flight cannot revive itself
   #status = {
@@ -340,9 +341,11 @@ class Loader {
   }
 
   async #poll() {
-    // One owner at a time, and no new handoff while our own handshake is still in flight
-    // (a second connection would fight the first one for the single BiDi session).
-    if (this.#client || this.#handshakeInFlight) return;
+    // One owner at a time: no new handoff while our own handshake is still in flight (a second
+    // connection would fight the first one for the single BiDi session), and none while a teardown is
+    // still stopping BiDi - the handoff file waits (or expires) until the teardown's trailing
+    // "dormant" status write is done, so that write cannot clobber the fresh session.
+    if (this.#client || this.#handshakeInFlight || this.#tearingDown) return;
     const path = PathUtils.join(PathUtils.profileDir, HANDOFF_FILE);
     let handoff;
     try {
@@ -495,18 +498,25 @@ class Loader {
   // Runs whenever the omp connection ends, however it ends: BiDi must not outlive its owner.
   async #teardown(reason) {
     this.#client = null;
-    this.#writeStatus({ state: "stopping", lastClose: reason });
-    if (this.#startPromise) {
-      // A consent prompt is still pending. Gecko's confirmEx cannot be dismissed from code, and
-      // stopAtRuntime never waits for createSession (RemoteAgent #stop), so the start may stay pending
-      // without blocking our teardown: it is marked abandoned and cleaned up when the user answers.
-      this.#abandoned = true;
-    } else {
-      // #stopBidi records its own failure in the status file; teardown has nothing left to report.
-      await this.#stopBidi(reason).catch(() => {});
+    // Held until the trailing status write: while it is set, #poll leaves a new handoff in the profile
+    // instead of accepting a session whose status this teardown would immediately overwrite.
+    this.#tearingDown = true;
+    try {
+      this.#writeStatus({ state: "stopping", lastClose: reason });
+      if (this.#startPromise) {
+        // A consent prompt is still pending. Gecko's confirmEx cannot be dismissed from code, and
+        // stopAtRuntime never waits for createSession (RemoteAgent #stop), so the start may stay pending
+        // without blocking our teardown: it is marked abandoned and cleaned up when the user answers.
+        this.#abandoned = true;
+      } else {
+        // #stopBidi records its own failure in the status file; teardown has nothing left to report.
+        await this.#stopBidi(reason).catch(() => {});
+      }
+      this.#closeNotice();
+      this.#writeStatus({ state: "dormant" });
+    } finally {
+      this.#tearingDown = false;
     }
-    this.#closeNotice();
-    this.#writeStatus({ state: "dormant" });
   }
 
   async #handle(msg) {
@@ -785,45 +795,50 @@ class Loader {
   async #stopBidi(reason) {
     const RA = lazy.RemoteAgent;
     let forceClosed = 0;
-    if (this.#bidi) {
-      // Best effort: the session may already be gone (that is often why we are stopping).
-      await this.#bidiCommand("session.end", {}, SESSION_END_TIMEOUT_MS).catch(() => {});
-      this.#bidi.close(CLOSE_DONE, "loader stop");
-      this.#bidi = null;
-      this.#bidiSessionId = null;
-      this.#bidiPort = null;
-    }
-    if (RA.running) {
-      // Remote Agent bug: a rejected WebSocket handshake leaves its connection in httpd forever, and
-      // stop() waits for it (httpd L451-470). Close the leftovers, then bound the wait.
-      for (const conn of Object.values(RA.server?._connections ?? {})) {
-        try {
-          conn.close();
-          forceClosed++;
-        } catch {
-          // A connection that died on its own is one less leftover to worry about.
+    try {
+      if (this.#bidi) {
+        // Best effort: the session may already be gone (that is often why we are stopping).
+        await this.#bidiCommand("session.end", {}, SESSION_END_TIMEOUT_MS).catch(() => {});
+        this.#bidi.close(CLOSE_DONE, "loader stop");
+        this.#bidi = null;
+        this.#bidiSessionId = null;
+        this.#bidiPort = null;
+      }
+      if (RA.running) {
+        // Remote Agent bug: a rejected WebSocket handshake leaves its connection in httpd forever, and
+        // stop() waits for it (httpd L451-470). Close the leftovers, then bound the wait.
+        for (const conn of Object.values(RA.server?._connections ?? {})) {
+          try {
+            conn.close();
+            forceClosed++;
+          } catch {
+            // A connection that died on its own is one less leftover to worry about.
+          }
+        }
+        const { promise: timedOut, resolve: onTimeout } = Promise.withResolvers();
+        const timer = setTimeout(() => onTimeout("stopAtRuntime did not finish within 10 s"), STOP_TIMEOUT_MS);
+        // A rejected stopAtRuntime is a failed stop too: record it so the next start retries instead of
+        // treating the half-stopped agent as another client's.
+        const failure = await Promise.race([
+          RA.stopAtRuntime().then(() => null, e => `stopAtRuntime failed: ${String(e?.message ?? e)}`),
+          timedOut,
+        ]);
+        clearTimeout(timer);
+        if (failure) {
+          this.#lastStopError = failure;
+          this.#writeStatus({ lastStopError: failure });
+          throw new LoaderError("E_STOPPED", failure);
         }
       }
-      const { promise: timedOut, resolve: onTimeout } = Promise.withResolvers();
-      const timer = setTimeout(() => onTimeout("stopAtRuntime did not finish within 10 s"), STOP_TIMEOUT_MS);
-      // A rejected stopAtRuntime is a failed stop too: record it so the next start retries instead of
-      // treating the half-stopped agent as another client's.
-      const failure = await Promise.race([
-        RA.stopAtRuntime().then(() => null, e => `stopAtRuntime failed: ${String(e?.message ?? e)}`),
-        timedOut,
-      ]);
-      clearTimeout(timer);
-      if (failure) {
-        this.#lastStopError = failure;
-        this.#writeStatus({ lastStopError: failure });
-        throw new LoaderError("E_STOPPED", failure);
-      }
+      this.#lastStopError = null;
+      this.#writeStatus({ bidi: { state: "off" }, lastStopError: null });
+      this.#emit("bidi.off", { reason });
+      return { stopped: true, forceClosed };
+    } finally {
+      // A half-stopped agent must never leave the dynamic start enabled for the next start (the plan
+      // requires this reset on every failure path), and a stopped one must not either.
+      Services.prefs.setBoolPref("remote.experimental.dynamicstart.enabled", false);
     }
-    this.#lastStopError = null;
-    Services.prefs.setBoolPref("remote.experimental.dynamicstart.enabled", false);
-    this.#writeStatus({ bidi: { state: "off" }, lastStopError: null });
-    this.#emit("bidi.off", { reason });
-    return { stopped: true, forceClosed };
   }
 
   #emit(name, data) {
