@@ -1,0 +1,61 @@
+// Hirozen autoconfig. Firefox skips this first line.
+// Loads exactly one module, hirozen/loader.sys.mjs next to the Zen executable, and only if its SHA-256 matches.
+(() => {
+  const EXPECTED_SHA256 = "@@LOADER_SHA256@@";
+  const { classes: Cc, interfaces: Ci } = Components;
+  const obs = Cc["@mozilla.org/observer-service;1"].getService(Ci.nsIObserverService);
+  const dirs = Cc["@mozilla.org/file/directory_service;1"].getService(Ci.nsIProperties);
+
+  // Status goes to the default pref branch (never saved to prefs.js) and to a profile file for inspection.
+  const report = text => {
+    try {
+      Cc["@mozilla.org/preferences-service;1"].getService(Ci.nsIPrefService)
+        .getDefaultBranch("").setStringPref("hirozen.autoconfig.status", text);
+      const f = dirs.get("ProfD", Ci.nsIFile);
+      f.append("hirozen-autoconfig.txt");
+      const out = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(Ci.nsIFileOutputStream);
+      out.init(f, 0x02 | 0x08 | 0x20, 0o600, 0);
+      const line = `${new Date().toISOString()} ${text}\n`;
+      out.write(line, line.length);
+      out.close();
+    } catch {
+      // Best-effort diagnostics only: never break the browser because the status channel failed.
+    }
+  };
+
+  const load = () => {
+    try {
+      const dir = dirs.get("GreD", Ci.nsIFile);
+      dir.append("hirozen");
+      const file = dir.clone();
+      file.append("loader.sys.mjs");
+      const stream = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(Ci.nsIFileInputStream);
+      stream.init(file, 0x01, 0, 0);
+      const hasher = Cc["@mozilla.org/security/hash;1"].createInstance(Ci.nsICryptoHash);
+      hasher.init(Ci.nsICryptoHash.SHA256);
+      hasher.updateFromStream(stream, 0xffffffff);
+      stream.close();
+      const hex = Array.from(hasher.finish(false), c => c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
+      if (hex !== EXPECTED_SHA256) {
+        report(`refused: loader hash ${hex} != pinned ${EXPECTED_SHA256}`);
+        return;
+      }
+      const io = Cc["@mozilla.org/network/io-service;1"].getService(Ci.nsIIOService);
+      io.getProtocolHandler("resource").QueryInterface(Ci.nsIResProtocolHandler)
+        .setSubstitution("hirozen", io.newFileURI(dir));
+      const { HirozenLoader } = ChromeUtils.importESModule("resource://hirozen/loader.sys.mjs");
+      report(`loaded (sha256 ${hex}): ${HirozenLoader.init("startup", hex)}`);
+    } catch (e) {
+      report(`error: ${e}`);
+    }
+  };
+
+  // Autoconfig runs during pref init; wait until the first browser window exists.
+  const observer = {
+    observe() {
+      obs.removeObserver(observer, "browser-delayed-startup-finished");
+      load();
+    },
+  };
+  obs.addObserver(observer, "browser-delayed-startup-finished");
+})();
