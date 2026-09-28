@@ -35,9 +35,11 @@ ChromeUtils.defineESModuleGetters(lazy, {
 // The same cap V1's extraction used in the loader (TEXT_CAP): the two must agree, the marker text
 // below is part of what browser.read returns to the agent.
 const TEXT_CAP = 40_000;
-// Cap on the snapshot, and on what the agent sees of any one element.
+// Cap on the snapshot, and on what the agent sees of any one element: a name, and a page-chosen token
+// (an explicit role, a tag name) which has no reason to be longer than a role phrase.
 const MAX_ELEMENTS = 400;
 const MAX_NAME_CHARS = 80;
+const MAX_TOKEN_CHARS = 32;
 const MAX_TYPE_CHARS = 2_000;
 const MAX_DY = 10_000;
 const REF_TOKEN_CHARS = 6;
@@ -240,7 +242,7 @@ export class HirozenChild extends JSWindowActorChild {
         ref: refFor(state, el),
         role: roleOf(el),
         name: nameOf(el, labels),
-        tag: el.localName,
+        tag: capToken(el.localName),
         rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
       });
     }
@@ -387,10 +389,11 @@ function refFor(state, el) {
 }
 
 // The plan's role rule: an explicit role attribute wins, then the element's own semantics, and
-// anything else is generic (no a11y engine is consulted).
+// anything else is generic (no a11y engine is consulted). The explicit role is a page-chosen token, so
+// it is capped like everything else the page can make arbitrarily long.
 function roleOf(el) {
   const explicit = el.getAttribute("role");
-  if (explicit && explicit.trim()) return explicit.trim().split(/\s+/)[0];
+  if (explicit && explicit.trim()) return capToken(explicit.trim().split(/\s+/)[0]);
   const tag = el.localName;
   if (tag === "a") return "link";
   if (tag === "button" || tag === "summary") return "button";
@@ -416,8 +419,9 @@ function roleOf(el) {
 }
 
 // The plan's name rule: aria-label -> aria-labelledby -> label[for] -> alt/placeholder/value ->
-// trimmed textContent. Whatever the source, the result is capped so a page cannot hand the agent
-// megabytes of label text through one element.
+// trimmed textContent. Whatever the source, the result is collapsed and capped so a page cannot hand
+// the agent megabytes of label text - or newlines that break the snapshot's one-element-per-line
+// shape and the approval details' one-field-per-line shape - through one element.
 function nameOf(el, labels) {
   const ariaLabel = el.getAttribute("aria-label");
   if (ariaLabel && ariaLabel.trim()) return capName(ariaLabel);
@@ -447,6 +451,15 @@ function nameOf(el, labels) {
   return capName(el.textContent || "");
 }
 
+// One line per name and one name per element: every whitespace run (a textContent newline, an
+// aria-label full of tabs) becomes a single space before the cap.
 function capName(text) {
-  return text.trim().slice(0, MAX_NAME_CHARS);
+  return text.replace(/\s+/g, " ").trim().slice(0, MAX_NAME_CHARS);
+}
+
+// A page-chosen token - an explicit role, a tag name (custom elements can be any length) - is capped
+// hard: it is short by contract and every character reaches the agent's tool output and the approval
+// details.
+function capToken(text) {
+  return text.replace(/\s+/g, " ").trim().slice(0, MAX_TOKEN_CHARS);
 }
