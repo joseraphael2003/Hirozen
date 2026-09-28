@@ -14,7 +14,7 @@ import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/
 
 import { attachNow } from "./attach";
 import { type VerifyResult, install, sha256File, verify } from "./install";
-import { HirozenError, type LinkCloseInfo, type LoaderEvent, ZenLink, readStatusFile } from "./link";
+import { HirozenError, type LinkCloseInfo, type LoaderEvent, type StopKind, ZenLink, readStatusFile } from "./link";
 
 /** `loader/loader.sys.mjs` in this checkout: the hash install() pins and the running loader must report. */
 const LOADER_SOURCE = fileURLToPath(new URL("../loader/loader.sys.mjs", import.meta.url));
@@ -28,7 +28,15 @@ const CONSENT_REPEAT_MS = 60_000;
 
 const CONSENT_NOTICE =
   'Zen is showing the "Allow remote control?" dialog — click Allow so omp can read this Zen session.';
-const STOPPED_NOTICE = "the Hirozen session was stopped in Zen — run /hirozen-connect (or /hirozen-attach) to start a new one.";
+
+/** Per-kind wording of a sticky stop; the tool refusal, the notice and /hirozen-status all use it. */
+const STOP_TEXT: Record<StopKind, string> = {
+  "zen-stop": "the Hirozen session was stopped in Zen — run /hirozen-connect (or /hirozen-attach) to start a new one.",
+  "zen-disconnect":
+    "remote control was turned off in Zen (Disconnect) — run /hirozen-connect (or /hirozen-attach) to allow it again.",
+  "zen-disabled":
+    "remote control was disabled permanently in Zen; re-enable remote.experimental.dynamicstart.enabled in about:config, then run /hirozen-connect.",
+};
 
 /** Loader error codes the plugin owns; their message is already written for the user. */
 const PLUGIN_CODES: Record<string, true> = {
@@ -43,11 +51,17 @@ const PLUGIN_CODES: Record<string, true> = {
 
 /** Plain-English gloss per loader code, followed by the loader's own message. */
 const CODE_TEXT: Record<string, string> = {
+  E_BIDI_LOST: "the remote-control (BiDi) session was lost mid-call — the socket or the browser session went away",
   E_COMPROMISE: "another debugger had already started remote control in Zen; Hirozen stopped it and refused to continue",
   E_DENIED: "the remote-control prompt was denied in Zen",
+  E_DISABLED_IN_ZEN:
+    "remote control was disabled permanently in Zen; re-enable remote.experimental.dynamicstart.enabled in about:config to use browser_* again",
+  E_INTERNAL: "the Zen loader hit an unexpected internal error",
   E_PORT_BUSY: "127.0.0.1:9222 cannot be bound - the port is in use by another program or reserved by Windows (check `netsh int ipv4 show excludedportrange protocol=tcp`); Zen was left untouched",
   E_PRIVATE: "that tab is in a private window, which Hirozen never touches",
   E_PRIVILEGED_PAGE: "that tab is a privileged page, which Hirozen refuses to read",
+  E_READ_FAILED: "the loader returned no usable page data (the page may still be loading, crashed or reloading)",
+  E_STOP_FAILED: "Hirozen's own remote-control stop failed; the session may still be up in Zen",
   E_STOPPED: "the loader dropped the session (fail-closed); retry, or run /hirozen-connect",
   E_SYSTEM_ACCESS: "MOZ_REMOTE_ALLOW_SYSTEM_ACCESS is set; Hirozen refuses to start remote control with system access",
   E_TAB_INACTIVE_SPACE: "that tab is in an inactive space, and Hirozen never switches spaces",
@@ -86,10 +100,16 @@ let link: ZenLink | null = null;
 /** Root context that owns the live link; it supplies the managed timers for the consent notice. */
 let linkCtx: ExtensionContext | null = null;
 let connectPromise: Promise<ZenLink> | null = null;
+/**
+ * Bumped by every connect attempt and by releaseLink(). An attempt publishes its link, and clears
+ * connectPromise in its catch, only while its generation is still the current one: an attempt that
+ * session_shutdown superseded must not touch the state a newer attempt owns (doc §15.1 B).
+ */
+let connectGen = 0;
 let bidiPhase: "off" | "starting" | "running" = "off";
 let consentRepeat: (() => void) | null = null;
-/** Set by the in-Zen Stop button (close 4010); only /hirozen-connect and /hirozen-attach clear it. */
-let stoppedByZen = false;
+/** Set by an in-Zen stop (close 4010/4011); only /hirozen-connect and /hirozen-attach clear it. */
+let stopKind: StopKind | null = null;
 let teardownHooked = false;
 let warnedAboutBrowserMcp = false;
 
@@ -158,15 +178,31 @@ function clearConsentNotice(): void {
   consentRepeat = null;
 }
 
+function notifyConsent(ctx: ExtensionContext, repeated: boolean): void {
+  ctx.ui.notify(`Hirozen: ${repeated ? "still waiting — " : ""}${CONSENT_NOTICE}`, "warning");
+}
+
 /** BiDi left "off": the consent dialog is being shown for the first time, so tell the user. */
 function announceConsent(): void {
   const ctx = linkCtx;
   if (!ctx) return;
-  ctx.ui.notify(`Hirozen: ${CONSENT_NOTICE}`, "warning");
+  notifyConsent(ctx, false);
+  armConsentRepeat(ctx);
+}
+
+/**
+ * Remind again every CONSENT_REPEAT_MS for as long as the dialog is unanswered. A start that failed
+ * (E_DENIED and friends) reaches the extension as `bidi.off`, and `bidi.running` means consent was
+ * granted: either one clears the reminder.
+ */
+function armConsentRepeat(ctx: ExtensionContext): void {
   clearConsentNotice();
-  consentRepeat = scheduleOnce(ctx, CONSENT_REPEAT_MS, () =>
-    ctx.ui.notify(`Hirozen: still waiting — ${CONSENT_NOTICE}`, "warning"),
-  );
+  consentRepeat = scheduleOnce(ctx, CONSENT_REPEAT_MS, () => {
+    consentRepeat = null;
+    if (bidiPhase !== "starting") return;
+    notifyConsent(ctx, true);
+    armConsentRepeat(ctx);
+  });
 }
 
 /** The loader emits `bidi.starting` again for every call that joins the pending start: notify once. */
@@ -190,6 +226,7 @@ function handleLoaderEvent(event: LoaderEvent): void {
 }
 
 function releaseLink(): void {
+  connectGen += 1; // any attempt still in flight is stale now; its link must never be published
   link = null;
   linkCtx = null;
   connectPromise = null;
@@ -197,11 +234,18 @@ function releaseLink(): void {
   clearConsentNotice();
 }
 
-function handleLinkClose(info: LinkCloseInfo): void {
+/**
+ * The close handler of one ZenLink instance. Only the live link may release module state: an orphan
+ * (a stale-sha attempt closing itself, or one session_shutdown superseded) must be a no-op, or it
+ * would drop the link a newer attempt just published — the false E_IN_USE of doc §15.1 B.
+ */
+function handleLinkClose(closed: ZenLink, info: LinkCloseInfo): void {
+  if (link !== closed) return;
   const ctx = linkCtx;
-  if (info.stoppedByUser) stoppedByZen = true;
   releaseLink();
-  if (info.stoppedByUser && ctx) ctx.ui.notify(`Hirozen: ${STOPPED_NOTICE}`, "warning");
+  if (info.stopKind === null) return;
+  stopKind = info.stopKind;
+  if (ctx) ctx.ui.notify(`Hirozen: ${STOP_TEXT[info.stopKind]}`, "warning");
 }
 
 function shutdownLink(): void {
@@ -214,14 +258,17 @@ function shutdownLink(): void {
 function ensureLink(pi: ExtensionAPI, ctx: ExtensionContext, config: HirozenConfig): Promise<ZenLink> {
   if (link) return Promise.resolve(link);
   if (connectPromise) return connectPromise;
-  connectPromise = (async () => {
+  const generation = ++connectGen;
+  const attempt = (async () => {
     try {
       const checked = verify(config.zenDir);
       if (!checked.ok) {
         const hint = checked.reason.includes("/hirozen-install") ? "" : "; run /hirozen-install, restart Zen";
         throw new HirozenError("E_STALE_LOADER", `${checked.reason}${hint}`);
       }
-      const fresh = new ZenLink({ onEvent: handleLoaderEvent, onClose: handleLinkClose });
+      // The onClose is bound to this instance: a close of a link that is not (or no longer) the live
+      // one releases nothing.
+      const fresh = new ZenLink({ onEvent: handleLoaderEvent, onClose: info => handleLinkClose(fresh, info) });
       const ready = await fresh.connect(config.profileDir);
       let sourceSha: string;
       try {
@@ -240,6 +287,12 @@ function ensureLink(pi: ExtensionAPI, ctx: ExtensionContext, config: HirozenConf
           `the running loader reports sha256 ${ready.loaderSha256}, this plugin ships ${sourceSha}; run /hirozen-install, restart Zen`,
         );
       }
+      if (generation !== connectGen) {
+        // session_shutdown, or a newer attempt, ran while this one was connecting: this link was never
+        // published, so it owns nothing and is closed here (a no-op close, per the instance handler).
+        fresh.close();
+        throw new HirozenError("E_STOPPED", "the omp session ended while the Zen loader was connecting; retry the call");
+      }
       link = fresh;
       linkCtx = ctx;
       if (!teardownHooked) {
@@ -252,11 +305,14 @@ function ensureLink(pi: ExtensionAPI, ctx: ExtensionContext, config: HirozenConf
       }
       return fresh;
     } catch (error) {
-      connectPromise = null;
+      // Only while this attempt is current: a superseded attempt must not clear the promise a newer
+      // one installed (that is what let two connects run at once).
+      if (generation === connectGen) connectPromise = null;
       throw error;
     }
   })();
-  return connectPromise;
+  connectPromise = attempt;
+  return attempt;
 }
 
 /** The tool check order fixed by the plan: root/UI, sticky stop, config, connect. */
@@ -269,7 +325,7 @@ async function requireLink(pi: ExtensionAPI, ctx: ExtensionContext): Promise<{ l
       },
     };
   }
-  if (stoppedByZen) return { failure: { code: "E_STOPPED", text: STOPPED_NOTICE } };
+  if (stopKind) return { failure: { code: "E_STOPPED", text: STOP_TEXT[stopKind] } };
   const config = readConfig();
   if (!config.ok) return { failure: { code: "E_CONFIG", text: config.problem } };
   try {
@@ -527,7 +583,7 @@ async function runAttachCommand(ctx: ExtensionContext): Promise<void> {
       profileDir: config.config.profileDir,
       notify: message => ctx.ui.notify(`Hirozen: ${message}`, "info"),
     });
-    stoppedByZen = false;
+    stopKind = null;
     ctx.ui.notify(
       `Hirozen: attached through local devtools port ${attached.port} (loader sha256 ${attached.loaderSha256.slice(0, 12)}…); the DevTools settings are off again. Tool calls can connect now.`,
       "info",
@@ -539,8 +595,8 @@ async function runAttachCommand(ctx: ExtensionContext): Promise<void> {
 }
 
 async function runConnectCommand(ctx: ExtensionContext): Promise<void> {
-  const wasStopped = stoppedByZen;
-  stoppedByZen = false;
+  const wasStopped = stopKind !== null;
+  stopKind = null;
   ctx.ui.notify(
     wasStopped
       ? "Hirozen: cleared the stop; the next zen_tabs / browser_* call starts a new link (Zen will ask for consent again)."
@@ -589,6 +645,10 @@ function renderStatusFile(profileDir: string): string {
   ];
   if (status.lastClose) parts.push(`lastClose=${status.lastClose}`);
   if (status.lastStopError) parts.push(`lastStopError=${status.lastStopError}`);
+  if (status.lastStartError) {
+    const { code, message, at } = status.lastStartError;
+    parts.push(`lastStartError=${code ?? "?"}${at ? ` @ ${at}` : ""}${message ? `: ${message}` : ""}`);
+  }
   return parts.join(" ");
 }
 
@@ -604,8 +664,8 @@ async function runStatusCommand(ctx: ExtensionContext): Promise<void> {
   const zenDir = (process.env.HIROZEN_ZEN_DIR ?? "").trim();
   const profileDir = (process.env.HIROZEN_PROFILE ?? "").trim();
   const installed = zenDir === "" ? null : checkInstalled(zenDir);
-  const session = stoppedByZen
-    ? "stopped by the Zen Stop button (run /hirozen-connect)"
+  const session = stopKind
+    ? `stopped (${stopKind}) — run /hirozen-connect`
     : link
       ? "connected"
       : "not connected (the first tool call connects)";
@@ -617,7 +677,7 @@ async function runStatusCommand(ctx: ExtensionContext): Promise<void> {
     `status file: ${profileDir === "" ? "not read (HIROZEN_PROFILE is unset)" : renderStatusFile(profileDir)}`,
     `devtools prefs: ${profileDir === "" ? "not read (HIROZEN_PROFILE is unset)" : renderDevtoolsPrefs(profileDir)}`,
   ];
-  ctx.ui.notify(lines.join("\n"), stoppedByZen || (installed !== null && !installed.ok) ? "warning" : "info");
+  ctx.ui.notify(lines.join("\n"), stopKind !== null || (installed !== null && !installed.ok) ? "warning" : "info");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -704,7 +764,7 @@ export default function hirozen(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("hirozen-connect", {
-    description: "Clear the Hirozen stop set by the in-Zen Stop button",
+    description: "Clear the Hirozen stop (Zen's Stop button, or remote control turned off in Zen)",
     handler: (_args, ctx) => runConnectCommand(ctx),
   });
 

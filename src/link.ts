@@ -10,9 +10,15 @@
 //        omp    -> {type:"auth", mac: HMAC(nonce, "omp:"+loaderChallenge)}
 //        loader -> {type:"ready", loaderVersion, loaderSha256, zenVersion, platformVersion, zenPid}
 //   4. Requests {id, method, params} are answered with {id, result} or {id, error: {code, message}};
-//      loader events arrive as {type: "event", name, data}.
+//      loader events arrive as {type: "event", name, data}; the loader's 5 s liveness frame
+//      {type: "ping", t} is answered with {type: "pong", t}, and any frame type this link does not
+//      know is ignored.
 //   5. Exactly one authenticated connection: any further upgrade is closed with 4009, a pre-auth message
-//      that is not auth with 4002, a bad proof with 4003, and Zen's Stop button closes with 4010.
+//      that is not auth with 4002, a bad proof with 4003, Zen's Stop button with 4010, remote control
+//      turned off in Zen with 4011 ("external disconnect", or "disabled permanently" when the user
+//      disabled it for good), and the loader's heartbeat reap with 4012.
+//   6. The close code picks the stop kind (LinkCloseInfo): 4010 and 4011 are sticky in the extension
+//      until /hirozen-connect; 4012 and every other close are not, so the next call reconnects.
 //
 // The listener is loopback-only on an ephemeral port and the handoff file is deleted on every path out
 // of connect(), so a crashed session cannot leave a phantom owner behind.
@@ -83,15 +89,23 @@ export type ZenStatus = {
   bidi?: { state?: "off" | "starting" | "running"; port?: number; sessionId?: string };
   lastClose?: string;
   lastStopError?: string;
+  /** The last failed BiDi start, kept so a refused call explains itself later. */
+  lastStartError?: { code?: string; message?: string; at?: string };
 };
 
 export type LoaderEvent = { name: string; data?: unknown };
 
+/**
+ * Why a live link ended for good: Zen's Stop button (`"zen-stop"`), remote control turned off in Zen
+ * (`"zen-disconnect"`, or `"zen-disabled"` when the user disabled it permanently). The extension holds
+ * these three sticky until /hirozen-connect; every other close (heartbeat reap, clean close) is null.
+ */
+export type StopKind = "zen-stop" | "zen-disconnect" | "zen-disabled";
+
 export type LinkCloseInfo = {
   code: number;
   reason: string;
-  /** Zen's Stop button closes the link with 4010: the user ended the session. */
-  stoppedByUser: boolean;
+  stopKind: StopKind | null;
 };
 
 export type ZenLinkOptions = {
@@ -129,6 +143,8 @@ type Frame = {
   data?: unknown;
   mac?: unknown;
   challenge?: unknown;
+  /** The loader's liveness timestamp on a `ping` frame. */
+  t?: unknown;
 };
 
 /** Per-connect handshake state (the loader never re-handshakes on a live socket). */
@@ -168,6 +184,17 @@ export function readStatusFile(profileDir: string): ZenStatus | null {
   return readJson<ZenStatus>(join(profileDir, STATUS_FILE));
 }
 
+/**
+ * The sticky stop a close code means. 4010 is Zen's Stop button; 4011 is remote control turned off in
+ * Zen (the loader writes `disabled permanently` in the reason when the user disabled it for good); 4012
+ * is the loader's heartbeat reap, and no other close is a stop at all - the next call reconnects.
+ */
+function stopKindOf(code: number, reason: string): StopKind | null {
+  if (code === 4010) return "zen-stop";
+  if (code !== 4011) return null;
+  return /disabl/i.test(reason) ? "zen-disabled" : "zen-disconnect";
+}
+
 /** `process.kill(pid, 0)` as a liveness probe; EPERM still means the process exists. */
 function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -179,8 +206,48 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-/** The single-owner pre-check: another omp's unexpired handoff, or a live loader session. */
-function findOwner(profileDir: string): { pid?: number; message: string } | null {
+/** How long the status branch re-reads before it refuses, and how often. */
+const OWNER_RECHECK_ATTEMPTS = 10;
+const OWNER_RECHECK_INTERVAL_MS = 100;
+
+/** The loader writes the status file as it transitions; give it a moment to settle. */
+function sleep(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
+}
+
+/**
+ * The live loader session the status file claims, or null. An owner pid that is this process is the
+ * session Zen can no longer reach (a dead peer the loader drops on the next heartbeat).
+ */
+function statusOwner(profileDir: string): { pid?: number; message: string } | null {
+  const status = readStatusFile(profileDir);
+  if (
+    (status?.state !== "connected" && status?.state !== "authenticating") ||
+    typeof status.zenPid !== "number" ||
+    !pidAlive(status.zenPid)
+  ) {
+    return null;
+  }
+  const ownerPid = status.lastHandoff?.pid;
+  if (ownerPid === process.pid) {
+    return {
+      pid: ownerPid,
+      message: `this omp session (pid ${ownerPid}) owns the Zen session, but Zen is no longer reachable; the loader drops a silent peer after ~15 s - retry then`,
+    };
+  }
+  return { pid: status.zenPid, message: `Zen (pid ${status.zenPid}) is ${status.state} to another omp session` };
+}
+
+/**
+ * The single-owner pre-check: another omp's unexpired handoff, or a live loader session.
+ *
+ * The handoff branch is strict - it means another process is actively waiting. The status branch is
+ * not: the loader keeps saying `connected` for a moment while it tears the session down, so the record
+ * is re-read up to 10x at 100 ms before refusing, and a session that clears in that window is gone.
+ */
+async function findOwner(profileDir: string): Promise<{ pid?: number; message: string } | null> {
   const handoff = readJson<HandoffFile>(join(profileDir, HANDOFF_FILE));
   if (handoff && typeof handoff.expiry === "number" && handoff.expiry > Date.now()) {
     return {
@@ -188,15 +255,12 @@ function findOwner(profileDir: string): { pid?: number; message: string } | null
       message: `another omp session (pid ${handoff.pid}) is waiting for the loader: ${HANDOFF_FILE} is unexpired`,
     };
   }
-  const status = readStatusFile(profileDir);
-  if (
-    (status?.state === "connected" || status?.state === "authenticating") &&
-    typeof status.zenPid === "number" &&
-    pidAlive(status.zenPid)
-  ) {
-    return { pid: status.zenPid, message: `Zen (pid ${status.zenPid}) is ${status.state} to another omp session` };
+  for (let attempt = 0; ; attempt++) {
+    const owner = statusOwner(profileDir);
+    if (!owner) return null;
+    if (attempt + 1 >= OWNER_RECHECK_ATTEMPTS) return owner;
+    await sleep(OWNER_RECHECK_INTERVAL_MS);
   }
-  return null;
 }
 
 export class ZenLink {
@@ -226,7 +290,7 @@ export class ZenLink {
    */
   async connect(profileDir: string, options: ConnectOptions = {}): Promise<ReadyFrame> {
     if (this.#server) throw new HirozenError("E_IN_USE", "this ZenLink is already connected; call close() first");
-    const owner = findOwner(profileDir);
+    const owner = await findOwner(profileDir);
     if (owner) throw new HirozenError("E_IN_USE", owner.message, { pid: owner.pid });
 
     const session: Session = {
@@ -375,6 +439,12 @@ export class ZenLink {
       session.ready.resolve(ready);
       return;
     }
+    if (frame.type === "ping") {
+      // The loader's liveness frame (every 5 s). It is answered whatever `t` holds: the loader counts
+      // any inbound frame, and a dropped pong would make it reap this link after 15 s.
+      ws.send(JSON.stringify({ type: "pong", t: frame.t }));
+      return;
+    }
     if (frame.type === "event") {
       if (typeof frame.name === "string") this.onEvent?.({ name: frame.name, data: frame.data });
       return;
@@ -412,7 +482,7 @@ export class ZenLink {
       return;
     }
     this.#teardown();
-    this.onClose?.({ code, reason, stoppedByUser: code === 4010 });
+    this.onClose?.({ code, reason, stopKind: stopKindOf(code, reason) });
   }
 
   /** Closes a connection without authenticating it: 4002 (protocol) or 4003 (bad proof). */

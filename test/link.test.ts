@@ -6,7 +6,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HANDOFF_FILE, HirozenError, STATUS_FILE, ZenLink } from "../src/link";
-import type { HandoffFile, LoaderEvent, ReadyFrame } from "../src/link";
+import type { HandoffFile, LinkCloseInfo, LoaderEvent, ReadyFrame } from "../src/link";
 
 const READY_FRAME: ReadyFrame = {
   type: "ready",
@@ -131,6 +131,24 @@ async function authenticate(socket: LoaderSocket, nonce: string, challenge: stri
   expect(auth.mac).toBe(hmacHex(nonce, `omp:${myChallenge}`));
 }
 
+/** Connects, authenticates, then closes the socket with `code`/`reason` and returns the close info. */
+async function closeInfo(code: number, reason: string): Promise<LinkCloseInfo> {
+  const dir = makeProfileDir();
+  const link = useLink(new ZenLink());
+  const infos: LinkCloseInfo[] = [];
+  link.onClose = info => infos.push(info);
+
+  const connecting = link.connect(dir, { timeoutMs: 5_000 });
+  const { socket, handoff, challenge } = await connectAsLoader(dir);
+  await authenticate(socket, handoff.nonce, challenge);
+  socket.send(READY_FRAME);
+  await connecting;
+
+  socket.ws.close(code, reason);
+  await waitFor(() => infos.length === 1);
+  return infos[0];
+}
+
 afterEach(async () => {
   const open = sockets.splice(0);
   for (const socket of open) socket.close();
@@ -228,12 +246,45 @@ test("a second connection after auth is refused with 4009", async () => {
   expect(socket.ws.readyState).toBe(WebSocket.OPEN); // the owner keeps its connection
 });
 
+test("a ping is answered with a pong carrying the same timestamp", async () => {
+  const dir = makeProfileDir();
+  const link = useLink(new ZenLink());
+  const connecting = link.connect(dir, { timeoutMs: 5_000 });
+  const { socket, handoff, challenge } = await connectAsLoader(dir);
+  await authenticate(socket, handoff.nonce, challenge);
+  socket.send(READY_FRAME);
+  await connecting;
+
+  socket.send({ type: "ping", t: 1_700_000_000_123 });
+  expect(await socket.next()).toEqual({ type: "pong", t: 1_700_000_000_123 });
+});
+
+test("a frame type the link does not know is ignored", async () => {
+  const dir = makeProfileDir();
+  const link = useLink(new ZenLink());
+  const connecting = link.connect(dir, { timeoutMs: 5_000 });
+  const { socket, handoff, challenge } = await connectAsLoader(dir);
+  await authenticate(socket, handoff.nonce, challenge);
+  socket.send(READY_FRAME);
+  await connecting;
+
+  socket.send({ type: "bidi.running", port: 9222, note: "not a frame this link knows" });
+
+  // No error reply, and the link keeps answering: the next reply is the one for this request.
+  const call = link.call("zen.inventory", {});
+  const request = await socket.next();
+  expect(request.method).toBe("zen.inventory");
+  socket.send({ id: request.id, result: [] });
+  expect(await call).toEqual([]);
+});
+
 test("an existing unexpired handoff is refused with E_IN_USE", async () => {
   const dir = makeProfileDir();
   const foreign: HandoffFile = { port: 39421, nonce: hex(), pid: process.pid, cwd: dir, expiry: Date.now() + 60_000 };
   writeFileSync(join(dir, HANDOFF_FILE), JSON.stringify(foreign));
 
   const link = useLink(new ZenLink());
+  const startedAt = Date.now();
   const refused = await link.connect(dir, { timeoutMs: 500 }).then(
     () => null,
     (reason: unknown) => reason,
@@ -241,6 +292,9 @@ test("an existing unexpired handoff is refused with E_IN_USE", async () => {
   expect(refused).toBeInstanceOf(HirozenError);
   expect((refused as HirozenError).code).toBe("E_IN_USE");
   expect((refused as HirozenError).pid).toBe(process.pid);
+  // The handoff branch is strict: it refuses at once instead of re-reading the status file like the
+  // branch below (which would take ~1 s), hence the wall-clock bound.
+  expect(Date.now() - startedAt).toBeLessThan(500);
   // the other session's handoff is not ours to delete
   expect(JSON.parse(readFileSync(join(dir, HANDOFF_FILE), "utf8"))).toEqual(foreign);
 
@@ -258,4 +312,74 @@ test("an existing unexpired handoff is refused with E_IN_USE", async () => {
   expect(rejected).toBeInstanceOf(HirozenError);
   expect((rejected as HirozenError).code).toBe("E_IN_USE");
   expect((rejected as HirozenError).pid).toBe(process.pid);
+});
+
+test("the status branch re-reads the record, so one that clears does not refuse the connect", async () => {
+  const dir = makeProfileDir();
+  const connected = (state: string) =>
+    JSON.stringify({ version: "1", state, zenPid: process.pid, updated: new Date().toISOString() });
+  writeFileSync(join(dir, STATUS_FILE), connected("connected"));
+
+  const link = useLink(new ZenLink());
+  const connecting = link.connect(dir, { timeoutMs: 5_000 });
+  const settled = connecting.then(
+    () => null,
+    (reason: unknown) => reason,
+  );
+  // The loader's own teardown writes `dormant` a moment later, right while connect() sits between two
+  // of its status reads: the record flips here, not on a timer.
+  writeFileSync(join(dir, STATUS_FILE), connected("dormant"));
+
+  const { socket, handoff, challenge } = await connectAsLoader(dir);
+  await authenticate(socket, handoff.nonce, challenge);
+  socket.send(READY_FRAME);
+  expect(await settled).toBeNull();
+});
+
+test("a status record owned by this omp names the pid and the ~15 s wait", async () => {
+  const dir = makeProfileDir();
+  writeFileSync(
+    join(dir, STATUS_FILE),
+    JSON.stringify({
+      version: "1",
+      state: "connected",
+      zenPid: process.pid,
+      lastHandoff: { pid: process.pid, cwd: dir },
+      updated: new Date().toISOString(),
+    }),
+  );
+
+  const link = useLink(new ZenLink());
+  const refused = await link.connect(dir, { timeoutMs: 500 }).then(
+    () => null,
+    (reason: unknown) => reason,
+  );
+  expect(refused).toBeInstanceOf(HirozenError);
+  expect((refused as HirozenError).code).toBe("E_IN_USE");
+  expect((refused as HirozenError).pid).toBe(process.pid);
+  expect((refused as HirozenError).message).toContain(`this omp session (pid ${process.pid})`);
+  expect((refused as HirozenError).message).toContain("15 s");
+});
+
+test("Zen's Stop button (4010) reports the zen-stop kind", async () => {
+  const info = await closeInfo(4010, "stopped by user");
+  expect(info).toEqual({ code: 4010, reason: "stopped by user", stopKind: "zen-stop" });
+});
+
+test("4011 is the external stop, named by its reason", async () => {
+  expect(await closeInfo(4011, "external disconnect")).toEqual({
+    code: 4011,
+    reason: "external disconnect",
+    stopKind: "zen-disconnect",
+  });
+  expect(await closeInfo(4011, "disabled permanently")).toEqual({
+    code: 4011,
+    reason: "disabled permanently",
+    stopKind: "zen-disabled",
+  });
+});
+
+test("4012 (heartbeat timeout) carries no sticky kind", async () => {
+  const info = await closeInfo(4012, "heartbeat timeout");
+  expect(info).toEqual({ code: 4012, reason: "heartbeat timeout", stopKind: null });
 });
