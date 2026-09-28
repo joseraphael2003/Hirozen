@@ -1551,7 +1551,6 @@ class Loader {
   }
 
   async #zenOpen(params, req) {
-    const started = Date.now();
     const url = params?.url;
     let scheme = null;
     try {
@@ -1568,6 +1567,10 @@ class Loader {
     }
     await this.#gate("act", req);
     this.#checkDeadline(req);
+    // The load bound is measured from here, after the gate: the time a person spends on the Allow/Deny
+    // notice is their own (omp's budget already allows for it), and must not be charged to the page
+    // load - a long Allow would otherwise leave the load as little as 1 s and fail a tab that opened.
+    const started = Date.now();
     const spaceId = await this.#ensureAgentSpace(win);
     await this.#waitForSpaceElement(win, spaceId);
     this.#checkDeadline(req);
@@ -1578,9 +1581,9 @@ class Loader {
     win.gZenWorkspaces.moveTabToWorkspace(tab, spaceId);
     const tabKey = await this.#waitForTabKey(tab);
     // The tab exists now, so E_DEADLINE ("nothing was done") would be a lie: only the load wait's own
-    // bound may fail from here on. The bound is what is left of the plugin's 15 s budget - zen.open's
-    // worst case is the agent-space wait (5 s) + the tab-key wait (2 s) + this load, and NAVIGATE's
-    // 12 s is the whole budget the plugin gives a load, so the load gets 12 s minus what already went.
+    // bound may fail from here on. zen.open's worst case is the agent-space wait (5 s) + the tab-key
+    // wait (2 s) + this load, and NAVIGATE's 12 s is the whole budget the plugin gives a load, so the
+    // load gets 12 s minus what the agent-space and tab-key waits already took.
     const bound = Math.max(1_000, NAVIGATE_TIMEOUT_MS - (Date.now() - started));
     const landed = await this.#waitForLoad(tabKey, tab.linkedBrowser, {
       // A brand-new tab starts on about:blank (live QA saw exactly that) and only an http(s) load may
