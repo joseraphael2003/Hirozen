@@ -2,6 +2,17 @@
 
 All notable changes to Hirozen are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.2] - 2026-09-28
+
+Follow-ups from the V1.1 final wave. The loader changed, so run `/hirozen-install` and restart Zen.
+
+### Fixed
+
+- Reconnecting within seconds of Firefox stopping a session that was still waiting for consent no longer reports a false `E_COMPROMISE`: the loader waits out a stop that is still in flight before its rogue check.
+- The sticky stop text names both Firefox buttons - "remote control was turned off in Zen (Disconnect / Turn off remote control)" - instead of only Disconnect, because the loader cannot tell the two apart.
+- A call in flight when the link closes with a sticky stop (Zen's Stop, or remote control turned off) gets that stop's text; the generic "retry, or run `/hirozen-connect`" gloss remains only where retrying actually works.
+- The `link.ts` error-code comment lists the V1.1 loader codes (`E_BIDI_LOST`, `E_READ_FAILED`, `E_STOP_FAILED`, `E_INTERNAL`, `E_DISABLED_IN_ZEN`) and close codes 4010/4011/4012.
+
 ## [0.1.1] - 2026-09-28
 
 Hardening from live QA. Verified on Zen 1.22.3b (Gecko 156.0.1), Windows. The loader changed, so run `/hirozen-install` and restart Zen.
@@ -58,5 +69,6 @@ First release: read-only access to a running Zen browser from omp. Verified on Z
 - Two one-off results could not be reproduced: a Deny that returned an uncaptured code, and a transient `E_IN_USE` on an immediate reconnect.
 - Not yet validated on a daily profile. Click, type, navigation and Zen layout actions are planned for V2.
 
-[0.1.1]: https://github.com/joseraphael2003/Hirozen/compare/aeb80e4...main
+[0.1.2]: https://github.com/joseraphael2003/Hirozen/compare/21eaaec...main
+[0.1.1]: https://github.com/joseraphael2003/Hirozen/compare/aeb80e4...21eaaec
 [0.1.0]: https://github.com/joseraphael2003/Hirozen/commits/main
