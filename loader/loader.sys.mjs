@@ -1337,6 +1337,7 @@ class Loader {
       done: null,
       finish: null,
       timer: null, // armed by #armGrace once the act is over, never before it
+      finished: false, // set when the grace ends: #armGrace must not revive an unwatched state
     };
     state.done = new Promise(resolve => { state.finish = resolve; });
     box.states.push(state);
@@ -1350,7 +1351,10 @@ class Loader {
   // moved into the agent space nor reported, and could keep the selection and switch the user's space
   // (plan: re-homing covers the act "and for 1 s after").
   #armGrace(state) {
-    if (!state || state.timer !== null) return;
+    // `finished`: the state was already unwatched (a teardown, or #collectOpened's awaited grace) -
+    // arming it again would leave a stray timer that unwatches a state the box no longer holds and
+    // would put a view back a second time.
+    if (!state || state.finished || state.timer !== null) return;
     state.timer = setTimeout(() => this.#unwatchAgentTabOpens(state.win, state.box, state), TAB_OPEN_GRACE_MS);
   }
 
@@ -1465,6 +1469,7 @@ class Loader {
   #unwatchAgentTabOpens(win, box, state) {
     clearTimeout(state.timer);
     state.timer = null;
+    state.finished = true;
     // One last look before the grace ends: Zen's own space switch for a re-homed popup may have landed
     // while the timer was running, and that switch re-selects the popup - which is exactly what lets
     // #restoreUserView act (see there: nobody else's selection is ever put back).
