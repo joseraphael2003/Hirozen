@@ -4,7 +4,7 @@ All notable changes to Hirozen are documented here. Format follows [Keep a Chang
 
 ## [0.1.2] - 2026-09-28
 
-Follow-ups from the V1.1 final wave. The loader changed, so run `/hirozen-install` and restart Zen.
+Follow-ups from the V1.1 final wave. Verified on Zen 1.22.3b (Gecko 156.0.1), Windows, on a test install. The loader changed, so run `/hirozen-install` and restart Zen.
 
 ### Fixed
 
@@ -12,6 +12,10 @@ Follow-ups from the V1.1 final wave. The loader changed, so run `/hirozen-instal
 - The sticky stop text names both Firefox buttons - "remote control was turned off in Zen (Disconnect / Turn off remote control)" - instead of only Disconnect, because the loader cannot tell the two apart.
 - A call in flight when the link closes with a sticky stop (Zen's Stop, or remote control turned off) gets that stop's text; the generic "retry, or run `/hirozen-connect`" gloss remains only where retrying actually works.
 - The `link.ts` error-code comment lists the V1.1 loader codes (`E_BIDI_LOST`, `E_READ_FAILED`, `E_STOP_FAILED`, `E_INTERNAL`, `E_DISABLED_IN_ZEN`) and close codes 4010/4011/4012.
+
+### Changed
+
+- README: the roadmap describes the planned V2 design (loader-first, WebDriver BiDi started only for features that need it), and the safety notes cover Firefox's own remote-control buttons.
 
 ## [0.1.1] - 2026-09-28
 
