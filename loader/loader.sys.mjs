@@ -4,20 +4,40 @@
 // omp, proves a shared nonce with HMAC, and from then on is Zen's only WebDriver BiDi client.
 // V1 is read-only: inventory/spaces come from chrome scope, browser.read/screenshot go through BiDi.
 //
-// Wire & status contract (.sisyphus/plans/hirozen-v1.md, shared with the omp side in src/link.ts):
+// Wire & status contract (.sisyphus/plans/hirozen-v1.md and hirozen-v1.1.md, shared with the omp side
+// in src/link.ts):
 //   request {id, method, params}; success {id, result}; error {id, error: {code, message}};
 //   loader events {type: "event", name, data}. Status file: hirozen-status.json.
+//   loader->omp heartbeat {type: "ping", t}; omp->loader {type: "pong", t}, dropped before #handle.
+//   Close codes: 1000 done, 4002 pre-auth message, 4003 auth failed, 4010 stopped by user,
+//   4011 remote control turned off in Zen (sticky), 4012 heartbeat timeout (not sticky).
 //
 // Every Gecko/Zen API used here was checked against the shipped Zen 1.22.3b (Gecko 156.0.1) sources:
 //  - RemoteAgent.sys.mjs: running / isDynamicStartRunning / isBrowserAutomationRunning / server /
 //    startAtRuntime / stopAtRuntime, and MOZ_REMOTE_ALLOW_SYSTEM_ACCESS read in its constructor.
-//  - WebDriverBiDi.sys.mjs createSession: the SessionNotCreatedError texts classified below.
+//    #stop() swallows httpd errors ("this function must never fail"), so a resolved stopAtRuntime()
+//    is not proof the agent stopped; #stopBidi re-checks running.
+//  - WebDriverBiDi.sys.mjs createSession: the SessionNotCreatedError texts classified below. Its
+//    stop() deletes the session and closes every sessionless connection (shipped L296-310);
+//    shared/webdriver/Session.sys.mjs destroy() (L303-320) closes the session's WebSocket
+//    connections - this is why Firefox's own buttons surface here as a BiDi onClose.
+//  - browser/components/remotecontrol/RemoteControlBanner.sys.mjs: the buttons are "Disconnect"
+//    (connected banner), "Turn off remote control" and "Disable remote control permanently". All
+//    three run #stopServers -> RemoteControlServers.stop() -> RemoteAgent.stopAtRuntime(), and only
+//    Disable writes remote.experimental.dynamicstart.enabled=false, which it does *before* stopping.
 //  - httpd.sys.mjs: server._connections; stop() waits for every connection whose request had started.
 //  - NavigableManager.sys.mjs getIdForBrowser: one stable uuid per browser.permanentKey.
+//  - chrome/toolkit/content/global/elements/notificationbox.js appendNotification(type, notification,
+//    buttons, disableClickJackingDelay=false, dismissable=true): the 5th argument reaches
+//    moz-message-bar.mjs, which renders its dismiss button only when dismissable is true (L196).
+//  - chrome/browser/content/browser/browser-init.js L739 notifies "browser-delayed-startup-finished"
+//    once per top-level window (DevToolsStartup.sys.mjs L372-375 relies on the same topic), which is
+//    how a notice reaches a window opened after it was shown.
+//  - modules/Timer.sys.mjs exports both setTimeout and setInterval (used by the heartbeat).
 //  - modules/zen/ZenSpaceManager.mjs: allStoredTabs / getWorkspaces / activeWorkspace; a tab's
 //    zen-workspace-id is absent on pinned/essential tabs; modules/zen/ZenWindowSync.sys.mjs sets
 //    tab.id on every tab, private windows included.
-import { setTimeout, clearTimeout } from "resource://gre/modules/Timer.sys.mjs";
+import { setTimeout, clearTimeout, setInterval, clearInterval } from "resource://gre/modules/Timer.sys.mjs";
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
@@ -35,16 +55,28 @@ const AUTH_TIMEOUT_MS = 10_000;
 const BIDI_COMMAND_TIMEOUT_MS = 60_000;
 const SESSION_END_TIMEOUT_MS = 5_000;
 const STOP_TIMEOUT_MS = 10_000;
+const HEARTBEAT_PING_MS = 5_000;
+const HEARTBEAT_REAP_MS = 1_000;
+const HEARTBEAT_TIMEOUT_MS = 15_000;
 const BIDI_PORT = 9222;
 const BIDI_URL = `ws://127.0.0.1:${BIDI_PORT}/session`;
 const SANDBOX = "hirozen";
 const TEXT_CAP = 40_000;
 
-// Close codes (contract): 1000 done, 4002 pre-auth message, 4003 auth failed, 4010 stopped by user.
+// Prefs: the dynamic-start switch Firefox's own remote-control UI drives, and the Hirozen-owned
+// memory of "Disable remote control permanently" (set on that reason, cleared only when the user
+// puts dynamicstart back to true - see #startBidi).
+const PREF_DYNAMIC_START = "remote.experimental.dynamicstart.enabled";
+const PREF_DISABLED_BY_USER = "hirozen.remotecontrol.disabledByUser";
+
+// Close codes (contract): 1000 done, 4002 pre-auth message, 4003 auth failed, 4010 stopped by user,
+// 4011 remote control turned off in Zen (sticky, after owed replies), 4012 heartbeat timeout.
 const CLOSE_DONE = 1000;
 const CLOSE_PROTO = 4002;
 const CLOSE_AUTH = 4003;
 const CLOSE_STOPPED = 4010;
+const CLOSE_REMOTE_OFF = 4011;
+const CLOSE_HEARTBEAT = 4012;
 
 class LoaderError extends Error {
   constructor(code, message) {
@@ -297,6 +329,7 @@ class Loader {
     lastHandoff: null,
     bidi: { state: "off" },
     lastClose: null,
+    lastStartError: null,
     lastStopError: null,
   };
   #bidi = null; // loader-owned BiDi socket
@@ -305,8 +338,17 @@ class Loader {
   #bidiPort = null;
   #bidiSessionId = null;
   #startPromise = null; // single-flight BiDi start
+  #stopPromise = null; // single-flight BiDi stop; concurrent callers share the first one
   #abandoned = false; // omp dropped while a consent prompt was still pending
   #lastStopError = null; // our own stop failed; the next start retries once instead of blaming a rogue client
+  #prefSetByUs = false; // true only while remote.experimental.dynamicstart.enabled is ours to reset
+  #externalStop = null; // Firefox turned remote control off; read by the pending start's catch
+  #deferredClose = null; // {ws, reason, starting, stopping}: the 4011 close owes this connection replies
+  #pingTimer = null; // heartbeat ping interval, live only while #client is set
+  #reapTimer = null; // heartbeat reap interval
+  #lastInbound = 0; // last frame (JSON) heard from omp; pongs included
+  #noticeState = null; // {generation, text, warning, buttons} of the notice currently shown
+  #noticeObserver = null; // browser-delayed-startup-finished observer while a notice is up
 
   init(mode, sha256) {
     if (this.#started) return "already-started";
@@ -379,34 +421,64 @@ class Loader {
 
   #closeNotice() {
     this.#noticeGen++;
+    if (this.#noticeObserver) {
+      try {
+        Services.obs.removeObserver(this.#noticeObserver, "browser-delayed-startup-finished");
+      } catch {
+        // The observer is already gone (shutdown); UI cleanup must never break the connection teardown.
+      }
+      this.#noticeObserver = null;
+    }
+    this.#noticeState = null;
     for (const [notification, box] of this.#notices) this.#removeNotice(box, notification);
     this.#notices.clear();
   }
 
   // Shown in every open non-private window, each with its own Stop button: the user may be looking at
-  // any of them, and Stop has to be reachable from wherever the prompt is. Windows opened later get
-  // nothing (Hirozen does not watch for new windows).
+  // any of them, and Stop has to be reachable from wherever the prompt is. A window opened while the
+  // notice is up gets it too: "browser-delayed-startup-finished" is notified once per top-level
+  // browser window (browser-init.js L739, the topic DevToolsStartup.sys.mjs L372-375 listens on).
+  // Private windows are excluded, exactly like everywhere else.
   #showNotice(text, { warning = false, stopButton = true } = {}) {
     this.#closeNotice();
-    const generation = this.#noticeGen;
-    const buttons = stopButton
-      ? [{ label: "Stop", callback: () => { this.#disconnect("stopped by user in Zen", CLOSE_STOPPED); return false; } }]
-      : [];
-    for (const win of browserWindows()) {
-      const box = win.gNotificationBox;
-      if (!box) continue;
-      box.appendNotification(
-        "hirozen",
-        { label: text, priority: warning ? box.PRIORITY_WARNING_HIGH : box.PRIORITY_INFO_HIGH },
-        buttons
-      ).then(
-        notification => {
-          if (generation === this.#noticeGen) this.#notices.set(notification, box);
-          else this.#removeNotice(box, notification); // a newer notice (or teardown) replaced it meanwhile
-        },
-        () => {} // the window went away before the notification was appended
-      );
-    }
+    const state = {
+      generation: this.#noticeGen,
+      text,
+      warning,
+      buttons: stopButton
+        ? [{ label: "Stop", callback: () => { this.#disconnect("stopped by user in Zen", CLOSE_STOPPED); return false; } }]
+        : [],
+    };
+    this.#noticeState = state;
+    this.#noticeObserver = subject => {
+      if (this.#noticeState !== state || !subject || subject.closed) return;
+      if (!subject.gNotificationBox || isPrivateWindow(subject)) return;
+      this.#appendNotice(subject, state);
+    };
+    Services.obs.addObserver(this.#noticeObserver, "browser-delayed-startup-finished");
+    for (const win of browserWindows()) this.#appendNotice(win, state);
+  }
+
+  // dismissable=false: the notice must have no ✕. The 5th appendNotification argument lands on the
+  // notification-message element (notificationbox.js L145-151, L178) and moz-message-bar.mjs renders
+  // its dismiss button only when dismissable is true (L196): with a ✕ the user could drop the notice -
+  // and with it the only Stop button - while the session and Firefox's prompt are still up.
+  #appendNotice(win, state) {
+    const box = win.gNotificationBox;
+    if (!box) return;
+    box.appendNotification(
+      "hirozen",
+      { label: state.text, priority: state.warning ? box.PRIORITY_WARNING_HIGH : box.PRIORITY_INFO_HIGH },
+      state.buttons,
+      false,
+      false
+    ).then(
+      notification => {
+        if (state.generation === this.#noticeGen && this.#noticeState === state) this.#notices.set(notification, box);
+        else this.#removeNotice(box, notification); // a newer notice (or teardown) replaced it meanwhile
+      },
+      () => {} // the window went away before the notification was appended
+    );
   }
 
   // The omp identity from the handoff that started this link, as every notice names it.
@@ -448,9 +520,11 @@ class Loader {
             clearTimeout(authTimer);
             this.#handshakeInFlight = false;
             this.#client = ws;
+            ws.pendingReplies = 0;
             // A fresh authenticated connection clears the abandoned flag and joins the pending start:
             // the consent prompt stays open until the user answers it, so it can still be adopted.
             this.#abandoned = false;
+            this.#startHeartbeat();
             this.#showNotice(`Hirozen: ${this.#who()} is connected. Stop ends the session.`);
             this.#writeStatus({ state: "connected", lastClose: null });
             ws.send({
@@ -466,18 +540,33 @@ class Loader {
           }
           return;
         }
+        // The heartbeat is answered by the peer, so any frame proves the link is alive; a pong is a
+        // heartbeat reply, not a request: it must never reach #handle (which would answer
+        // E_UNKNOWN_METHOD for a frame that has no method).
+        this.#lastInbound = Date.now();
+        if (msg.type === "pong") return;
+        ws.pendingReplies++;
         this.#handle(msg).then(
           result => ws.send({ id: msg.id, result }),
           e => ws.send({
             id: msg.id,
-            // Every failure path throws a LoaderError; anything else is a loader bug, reported with the
-            // closest available code plus its real message.
-            error: { code: e instanceof LoaderError ? e.code : "E_STOPPED", message: `${e instanceof LoaderError ? "" : "internal error: "}${e?.message ?? e}` },
+            // Every failure path throws a LoaderError; anything else is a loader bug, reported as
+            // E_INTERNAL with its real message.
+            error: { code: e instanceof LoaderError ? e.code : "E_INTERNAL", message: `${e instanceof LoaderError ? "" : "internal error: "}${e?.message ?? e}` },
           })
-        );
+        ).finally(() => {
+          ws.pendingReplies--;
+          // The 4011 close armed by an external stop owes this connection its replies: it waits here,
+          // after the send, until the count is back to 0 (and only ever closes the current link).
+          const deferred = this.#deferredClose;
+          if (deferred?.ws === ws && this.#client === ws && ws.pendingReplies === 0) {
+            this.#disconnect(deferred.reason, CLOSE_REMOTE_OFF, { notice: true, starting: deferred.starting, stopping: deferred.stopping });
+          }
+        });
       },
       onClose: (code, reason) => {
         clearTimeout(authTimer);
+        this.#stopHeartbeat();
         this.#handshakeInFlight = false;
         if (this.#client === ws) {
           this.#teardown(`${code} ${reason}`);
@@ -489,18 +578,66 @@ class Loader {
     });
   }
 
-  #disconnect(reason, code) {
+  // Closes the omp link and runs the teardown, which is returned so a caller can act when the state
+  // really settled. `stopping` joins an external path's stop instead of running a second one; `notice`
+  // is for the external path, whose sticky notice may only appear once the teardown is done.
+  #disconnect(reason, code, { notice = false, starting = false, stopping = null } = {}) {
+    this.#stopHeartbeat();
+    this.#deferredClose = null;
     const ws = this.#client;
-    this.#teardown(reason);
+    const done = this.#teardown(reason, { stopping });
     ws?.close(code, reason);
+    if (notice) done.then(() => this.#showRemoteOffNotice(reason, starting));
+    return done;
+  }
+
+  // The one notice that survives its teardown (user decision 2026-09-28): the link is gone, so there
+  // is no Stop button, and the user has to run /hirozen-connect in omp to allow control again. It is
+  // shown without a ✕ and stays - in every window, including windows opened later - until the next
+  // authenticated connect replaces it or Zen restarts.
+  #showRemoteOffNotice(reason, starting) {
+    if (this.#client) return; // a new link took over while the teardown was finishing
+    const text =
+      `Hirozen: remote control was turned off in Zen (${reason}). Run /hirozen-connect in omp to allow it again.` +
+      (starting ? " Zen's remote-control dialog may still be open; you can Deny it." : "");
+    this.#showNotice(text, { warning: true, stopButton: false });
+  }
+
+  // Heartbeat (V1.1): a ping every 5 s, plus a separate 1 s check that reaps a peer which has sent
+  // nothing for 15 s. Enforced from authentication on - no first-pong gate - so a frozen omp (its
+  // event loop blocked, the socket still open) is noticed and the session does not stay locked.
+  #startHeartbeat() {
+    this.#lastInbound = Date.now();
+    this.#stopHeartbeat();
+    this.#pingTimer = setInterval(() => {
+      this.#client?.send({ type: "ping", t: Date.now() });
+    }, HEARTBEAT_PING_MS);
+    this.#reapTimer = setInterval(() => {
+      if (!this.#client) return;
+      if (Date.now() - this.#lastInbound > HEARTBEAT_TIMEOUT_MS) {
+        this.#disconnect("heartbeat timeout", CLOSE_HEARTBEAT);
+      }
+    }, HEARTBEAT_REAP_MS);
+  }
+
+  #stopHeartbeat() {
+    if (this.#pingTimer !== null) {
+      clearInterval(this.#pingTimer);
+      this.#pingTimer = null;
+    }
+    if (this.#reapTimer !== null) {
+      clearInterval(this.#reapTimer);
+      this.#reapTimer = null;
+    }
   }
 
   // Runs whenever the omp connection ends, however it ends: BiDi must not outlive its owner.
-  async #teardown(reason) {
+  async #teardown(reason, { stopping = null } = {}) {
     this.#client = null;
     // Held until the trailing status write: while it is set, #poll leaves a new handoff in the profile
     // instead of accepting a session whose status this teardown would immediately overwrite.
     this.#tearingDown = true;
+    this.#deferredClose = null;
     try {
       this.#writeStatus({ state: "stopping", lastClose: reason });
       if (this.#startPromise) {
@@ -510,7 +647,9 @@ class Loader {
         this.#abandoned = true;
       } else {
         // #stopBidi records its own failure in the status file; teardown has nothing left to report.
-        await this.#stopBidi(reason).catch(() => {});
+        // An external stop that is already on its way is joined, never duplicated: a second
+        // stopAtRuntime() would race the first one's httpd teardown.
+        await (stopping ?? this.#stopBidi(reason)).catch(() => {});
       }
       this.#closeNotice();
       this.#writeStatus({ state: "dormant" });
@@ -599,7 +738,7 @@ class Loader {
       const detail = result?.type === "exception"
         ? `script exception: ${result.exceptionDetails?.text ?? "unknown"}`
         : `unexpected result type ${result?.result?.type ?? result?.type ?? "none"}`;
-      throw new LoaderError("E_STOPPED", `browser.read could not read tab ${tabKey}: ${detail}`);
+      throw new LoaderError("E_READ_FAILED", `browser.read could not read tab ${tabKey}: ${detail}`);
     }
     const page = JSON.parse(value);
     return { tabKey, url: page.url, title: page.title, text: page.text, truncated: page.truncated };
@@ -611,20 +750,34 @@ class Loader {
     // captureScreenshot defaults to the viewport origin and the PNG format (browsingContext.sys.mjs).
     const result = await this.#call("browsingContext.captureScreenshot", { context: contextId }, "browser.screenshot");
     if (typeof result?.data !== "string" || !result.data) {
-      throw new LoaderError("E_STOPPED", `captureScreenshot returned no image data for tab ${tabKey}`);
+      throw new LoaderError("E_READ_FAILED", `captureScreenshot returned no image data for tab ${tabKey}`);
     }
     return { tabKey, mimeType: "image/png", data: result.data };
   }
 
   // Single-flight start: the caller assigns #startPromise synchronously, before any await, so every
   // browser.* call either starts one session or joins the one already starting. Two concurrent starts
-  // would make the second bind fail and force-quit Zen.
+  // would make the second bind fail and force-quit Zen. The promise is also where the failure is
+  // persisted for /hirozen-status: every refusal code (#refuseStart) and every start failure lands
+  // here, and a session that did start clears the record.
   async #ensureBidi() {
     if (this.#bidi && this.#bidiSessionId) {
       return { port: this.#bidiPort, sessionId: this.#bidiSessionId };
     }
     if (!this.#startPromise) {
-      this.#startPromise = this.#startBidi().finally(() => { this.#startPromise = null; });
+      this.#startPromise = this.#startBidi().then(
+        result => {
+          this.#writeStatus({ lastStartError: null });
+          return result;
+        },
+        e => {
+          // A non-LoaderError here is a loader bug (or an unexpected Gecko throw): E_INTERNAL, with
+          // its real message, is the only honest code for it.
+          const failure = e instanceof LoaderError ? e : new LoaderError("E_INTERNAL", String(e?.message ?? e));
+          this.#writeStatus({ lastStartError: { code: failure.code, message: failure.message, at: new Date().toISOString() } });
+          throw failure;
+        }
+      ).finally(() => { this.#startPromise = null; });
     } else {
       // Joining a start that is already pending: a consent dialog may still be waiting for an answer,
       // so the caller waits for that, not for a second session.
@@ -633,20 +786,50 @@ class Loader {
     return this.#startPromise;
   }
 
-  // A start that never produced a session still has to leave the status file, the event stream and the
-  // dynamic-start pref in a state omp can trust: BiDi is off, omp sees phase "off" (not a stuck
-  // "starting"), and a pref left true by an earlier crashed run does not survive a refusal.
+  // A start that never produced a session still has to leave the status file and the event stream in a
+  // state omp can trust: BiDi is off and omp sees phase "off" (not a stuck "starting"). The
+  // dynamic-start pref is released only if this loader set it (V1.1 deviation 3): a `true` left by a
+  // crashed Zen run, or one the user set in about:config, is not Hirozen's to clear.
   #refuseStart(code, message) {
-    Services.prefs.setBoolPref("remote.experimental.dynamicstart.enabled", false);
+    this.#releasePref();
     this.#writeStatus({ bidi: { state: "off" } });
     this.#emit("bidi.off", { reason: code });
     return new LoaderError(code, message);
   }
 
+  // The loader owns remote.experimental.dynamicstart.enabled only while #prefSetByUs is set: Firefox's
+  // own banner, a crashed run or the user may have set it, and Hirozen must never write over a value
+  // it did not write. Never touches hirozen.remotecontrol.disabledByUser.
+  #releasePref() {
+    if (!this.#prefSetByUs) return;
+    Services.prefs.setBoolPref(PREF_DYNAMIC_START, false);
+    this.#prefSetByUs = false;
+  }
+
   async #startBidi() {
+    // Per-attempt state: a new start drops the deferred 4011 close of a previous episode, and clears
+    // the external-stop reason (it is only ever read by the catch of the start that saw it).
+    this.#deferredClose = null;
+    this.#externalStop = null;
     this.#writeStatus({ bidi: { state: "starting" } });
     this.#emit("bidi.starting", {});
     const RA = lazy.RemoteAgent;
+
+    // "Disable remote control permanently" in Zen writes dynamicstart.enabled=false before stopping
+    // the servers (RemoteControlBanner #stopServers), so that pref alone cannot tell a user's decision
+    // from a crashed run. The Hirozen-owned flag remembers it; the only way out is the user setting the
+    // pref back to true in about:config - this loader writes true just below and #releasePref only
+    // writes false for its own write, so a `true` while the flag is set can only be the user's.
+    if (Services.prefs.getBoolPref(PREF_DISABLED_BY_USER, false)) {
+      if (Services.prefs.getBoolPref(PREF_DYNAMIC_START, false)) {
+        Services.prefs.setBoolPref(PREF_DISABLED_BY_USER, false);
+      } else {
+        throw this.#refuseStart(
+          "E_DISABLED_IN_ZEN",
+          "remote control was disabled permanently in Zen; re-enable `remote.experimental.dynamicstart.enabled` in about:config to use browser_* again"
+        );
+      }
+    }
 
     // Chrome-scope access is granted by the environment Zen was launched from, not by this module
     // (RemoteAgent reads the variable in its constructor): never open a session in that configuration.
@@ -681,7 +864,10 @@ class Loader {
     }
 
     Services.prefs.setBoolPref("remote.prefs.recommended", false);
-    Services.prefs.setBoolPref("remote.experimental.dynamicstart.enabled", true);
+    Services.prefs.setBoolPref(PREF_DYNAMIC_START, true);
+    // From here the pref is the loader's to reset (see #releasePref): teardown and refusals must not
+    // write over a value the user set themselves.
+    this.#prefSetByUs = true;
     try {
       const port = await RA.startAtRuntime({ isBrowserAutomation: false });
       // Post-start assertions: automation mode would set navigator.webdriver and skip the consent
@@ -701,13 +887,26 @@ class Loader {
         // Late consent: omp is gone, so this session has no owner. Cleanup, not a compromise.
         throw new LoaderError("E_STOPPED", "the consent dialog was answered after omp disconnected; the session was ended");
       }
+      if (this.#externalStop) {
+        // Firefox's own stop landed between the session reply and this continuation: the session is
+        // not ours to report as running (the external path already stopped BiDi and wrote the status).
+        throw new LoaderError("E_STOPPED", `remote control was turned off in Zen (${this.#externalStop})`);
+      }
       this.#writeStatus({ bidi: { state: "running", port, sessionId: session.sessionId } });
       this.#emit("bidi.running", { port, sessionId: session.sessionId });
       // Consent was granted: the "answer the dialog" wording must not survive on screen.
       this.#showNotice(`Hirozen: ${this.#who()} is connected - Hirozen can read Zen tabs. Stop ends the session.`);
       return { port, sessionId: session.sessionId };
     } catch (e) {
-      const failure = e instanceof LoaderError ? e : classifySessionNewError(e) ?? new LoaderError("E_STOPPED", String(e?.message ?? e));
+      // Firefox's own stop already ran the external-stop path: it stopped BiDi through the shared
+      // single-flight stop, wrote bidi off / lastClose and shows the sticky notice when the teardown
+      // settles. This catch reports that outcome - never E_BIDI_LOST - and adds no notice of its own.
+      if (this.#externalStop) {
+        throw e instanceof LoaderError ? e : new LoaderError("E_STOPPED", `remote control was turned off in Zen (${this.#externalStop})`);
+      }
+      // E_INTERNAL for whatever the specific classifiers cannot name: a startAtRuntime rejection and
+      // every other unclassified start failure (an unsafe start and a deny keep their own codes).
+      const failure = e instanceof LoaderError ? e : classifySessionNewError(e) ?? new LoaderError("E_INTERNAL", String(e?.message ?? e));
       // Only a notice while omp is still there: an abandoned start already had its notice removed by
       // teardown, and re-adding one would leave a Stop button on a dead link.
       const connected = this.#client !== null;
@@ -733,8 +932,15 @@ class Loader {
 
   #openBidiSocket() {
     const { promise, resolve, reject } = Promise.withResolvers();
+    // Per-socket record (external-stop step 0): #bidi is reassigned on every start, so the
+    // self-stop discriminator has to travel with the socket it describes. `opened` is only true once
+    // Gecko's WebSocket handshake finished; `selfClosing` is set by our own #stopBidi before it closes.
+    const record = { opened: false, selfClosing: false };
     const ws = openWebSocket(BIDI_URL, {
-      onOpen: () => resolve(),
+      onOpen: () => {
+        record.opened = true;
+        resolve();
+      },
       onMessage: raw => {
         let msg;
         try {
@@ -752,26 +958,80 @@ class Loader {
         // context (private or otherwise) can leak to omp through this socket.
       },
       onClose: (code, reason) => {
-        for (const pending of this.#bidiPending.values()) pending.reject(new Error(`BiDi socket closed ${code} ${reason}`));
+        const socketClosed = `BiDi socket closed ${code} ${reason}`;
+        // External-stop detection (step 0) before #bidi is nulled below: only a socket that completed
+        // its handshake, was not closed by our own stop, and is still the current one can have been
+        // closed by Firefox itself. Firefox's buttons never touch our state, so this is the only
+        // signal - and the pref cannot stand in (our own reset runs after the close).
+        const external = this.#bidi === ws && !record.selfClosing && record.opened;
+        // The reason is read before pending commands are rejected (step 1): only Disable writes this
+        // pref, and RemoteControlBanner writes it before stopping, so `false` here is that user
+        // decision while `true` can only be a Disconnect / Turn-off.
+        const externalReason = external
+          ? Services.prefs.getBoolPref(PREF_DYNAMIC_START, false) ? "external disconnect" : "disabled permanently"
+          : null;
+        // Pending commands: a socket we lost to Firefox is E_BIDI_LOST, one our own stop closed (or one
+        // a newer socket superseded) is E_STOPPED, and a pending session.new carries the user's reason
+        // so the start catch reports the sticky outcome instead of a lost socket.
+        for (const pending of this.#bidiPending.values()) {
+          if (external && pending.method === "session.new") {
+            pending.reject(new LoaderError("E_STOPPED", `remote control was turned off in Zen (${externalReason})`));
+          } else if (external) {
+            pending.reject(new LoaderError("E_BIDI_LOST", socketClosed));
+          } else {
+            pending.reject(new LoaderError("E_STOPPED", socketClosed));
+          }
+        }
         this.#bidiPending.clear();
         if (this.#bidi === ws) {
           this.#bidi = null;
           this.#bidiSessionId = null;
           this.#bidiPort = null;
         }
-        reject(new Error(`BiDi socket closed ${code} ${reason}`)); // no-op once the socket has opened
+        // A socket that never opened is a failed start, which the start catch reports as E_BIDI_LOST
+        // (step 2); our own stop keeps E_STOPPED. No-op once the socket has opened.
+        reject(record.selfClosing ? new LoaderError("E_STOPPED", socketClosed) : new LoaderError("E_BIDI_LOST", socketClosed));
+        if (external) this.#onExternalStop(externalReason);
       },
     });
+    ws.record = record;
     this.#bidi = ws;
     return promise;
   }
 
+  // Firefox stopped remote control itself (Disconnect / Turn off remote control / Disable remote
+  // control permanently: RemoteControlBanner #stopServers -> RemoteControlServers.stop ->
+  // RemoteAgent.stopAtRuntime, which closes this socket). Steps 2-4 of the external-stop path; the
+  // listener's own stopAtRuntime either hangs (our upgraded connection keeps httpd busy, doc §6.6) or
+  // lands here first, so the loader's stop is what completes it.
+  #onExternalStop(reason) {
+    this.#externalStop = reason; // read by the pending start's catch; cleared by the next start
+    const starting = this.#startPromise !== null;
+    // Only Disable writes dynamicstart.enabled=false before stopping, so the reason is what turns the
+    // user's decision into a sticky memory a later start refuses against.
+    if (reason === "disabled permanently") Services.prefs.setBoolPref(PREF_DISABLED_BY_USER, true);
+    // Step 3: the socket is already gone, so the shared stop skips session.end and goes straight to
+    // stopAtRuntime(); the stop is handed to the teardown below so it is never run twice. Its rejection
+    // is handled here (a failed stop is recorded in the status file, not thrown at the socket close).
+    const stopping = this.#stopBidi(reason).catch(() => {});
+    // Step 4: if omp is gone there is no link to close and nobody to tell; a connection that still owes
+    // replies gets its 4011 close only after the last reply (see the reply chain in #connect).
+    const ws = this.#client;
+    if (!ws) return;
+    if (ws.pendingReplies === 0) {
+      this.#disconnect(reason, CLOSE_REMOTE_OFF, { notice: true, starting, stopping });
+    } else {
+      this.#deferredClose = { ws, reason, starting, stopping };
+    }
+  }
+
   #bidiCommand(method, params, timeoutMs = BIDI_COMMAND_TIMEOUT_MS) {
-    if (!this.#bidi) return Promise.reject(new LoaderError("E_STOPPED", "BiDi session is not running"));
+    if (!this.#bidi) return Promise.reject(new LoaderError("E_BIDI_LOST", "BiDi session is not running"));
     const id = this.#bidiNextId++;
     const { promise, resolve, reject } = Promise.withResolvers();
     let timer = null;
     const settle = {
+      method,
       resolve: value => { clearTimeout(timer); resolve(value); },
       reject: error => { clearTimeout(timer); reject(error); },
     };
@@ -792,17 +1052,34 @@ class Loader {
     });
   }
 
-  async #stopBidi(reason) {
+  // Single-flight stop (V1.1): the start catch, the external path, the teardown and bidi.stop all
+  // share one #stopPromise. Concurrent callers must never run stopAtRuntime() twice - the second call
+  // would race the first one's httpd teardown - and a shared outcome cannot contradict itself.
+  #stopBidi(reason) {
+    if (!this.#stopPromise) {
+      this.#stopPromise = this.#stopBidiNow(reason).finally(() => { this.#stopPromise = null; });
+    }
+    return this.#stopPromise;
+  }
+
+  async #stopBidiNow(reason) {
     const RA = lazy.RemoteAgent;
     let forceClosed = 0;
+    const ws = this.#bidi;
     try {
-      if (this.#bidi) {
-        // Best effort: the session may already be gone (that is often why we are stopping).
-        await this.#bidiCommand("session.end", {}, SESSION_END_TIMEOUT_MS).catch(() => {});
-        this.#bidi.close(CLOSE_DONE, "loader stop");
+      if (ws) {
+        // Self-stop discriminator (external-stop step 0): set before the close, so this socket's
+        // onClose cannot mistake our own stop for Firefox's. #bidi is nulled before the close too, so a
+        // handler that runs synchronously inside close() finds a socket that is not the current one.
+        ws.record.selfClosing = true;
+        if (!ws.closed) {
+          // Best effort: the session may already be gone (that is often why we are stopping).
+          await this.#bidiCommand("session.end", {}, SESSION_END_TIMEOUT_MS).catch(() => {});
+        }
         this.#bidi = null;
         this.#bidiSessionId = null;
         this.#bidiPort = null;
+        ws.close(CLOSE_DONE, "loader stop");
       }
       if (RA.running) {
         // Remote Agent bug: a rejected WebSocket handshake leaves its connection in httpd forever, and
@@ -819,15 +1096,20 @@ class Loader {
         const timer = setTimeout(() => onTimeout("stopAtRuntime did not finish within 10 s"), STOP_TIMEOUT_MS);
         // A rejected stopAtRuntime is a failed stop too: record it so the next start retries instead of
         // treating the half-stopped agent as another client's.
-        const failure = await Promise.race([
+        const rejected = await Promise.race([
           RA.stopAtRuntime().then(() => null, e => `stopAtRuntime failed: ${String(e?.message ?? e)}`),
           timedOut,
         ]);
         clearTimeout(timer);
+        // RemoteAgent #stop swallows httpd errors ("this function must never fail", L429-437), so a
+        // resolved stopAtRuntime() is no proof the agent is gone: an agent that is still running is a
+        // failed stop as well. Recording it is what stops the next start from blaming a rogue client
+        // (the retry path reads #lastStopError) instead of raising a false E_COMPROMISE.
+        const failure = rejected ?? (RA.running ? "stopAtRuntime resolved but Remote Agent is still running" : null);
         if (failure) {
           this.#lastStopError = failure;
           this.#writeStatus({ lastStopError: failure });
-          throw new LoaderError("E_STOPPED", failure);
+          throw new LoaderError("E_STOP_FAILED", failure);
         }
       }
       this.#lastStopError = null;
@@ -835,9 +1117,9 @@ class Loader {
       this.#emit("bidi.off", { reason });
       return { stopped: true, forceClosed };
     } finally {
-      // A half-stopped agent must never leave the dynamic start enabled for the next start (the plan
-      // requires this reset on every failure path), and a stopped one must not either.
-      Services.prefs.setBoolPref("remote.experimental.dynamicstart.enabled", false);
+      // Released only if this loader set it (V1.1 deviation 3): a `true` the user set survives, while a
+      // half-stopped agent can no longer leave the pref true for the next start.
+      this.#releasePref();
     }
   }
 
@@ -857,12 +1139,13 @@ function classifySessionNewError(e) {
 }
 
 // BiDi answers errors as {error: "<protocol error>", message: "<detail>"}, which #bidiCommand turns
-// into "<error>: <detail>".
+// into "<error>: <detail>". Only reads and screenshots go through #call, so an error that is not about
+// a tab is a read failure; a LoaderError (the socket-close codes included) passes through unchanged.
 function classifyBidiFailure(e, label) {
   if (e instanceof LoaderError) return e;
   const text = `${label} failed: ${String(e?.message ?? e)}`;
   if (/no such frame|no such node|no such (window|context)/i.test(text)) return new LoaderError("E_TAB_UNKNOWN", text);
-  return new LoaderError("E_STOPPED", text);
+  return new LoaderError("E_READ_FAILED", text);
 }
 
 export const HirozenLoader = new Loader();
