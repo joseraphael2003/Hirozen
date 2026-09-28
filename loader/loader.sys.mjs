@@ -6,9 +6,9 @@
 // JSWindowActor this module registers, page dialogs are answered through the tab's own dialog box, and
 // Zen layout runs through the window's gZen* - see .sisyphus/plans/hirozen-v2.md (Rev 2: WebDriver
 // BiDi is gone entirely - this module never starts a remote-control agent or opens a DevTools port,
-// and no Firefox prompt is involved).
+// and a read, a snapshot or a screenshot never shows a prompt: consent is the in-Zen notice below).
 //
-// V2 consent gate (§8.2): neither path shows a Firefox prompt, so this loader owns an in-Zen
+// V2 consent gate (§8.2): no method shows a Firefox prompt any more, so this loader owns an in-Zen
 // Allow/Deny notice per link (state `#consent`, default Deny, persistent while connected) before any
 // gated method runs, and omp keeps its per-action approval on top.
 //
@@ -494,7 +494,7 @@ class Loader {
   // dismissable=false: the notice must have no ✕. The 5th appendNotification argument lands on the
   // notification-message element (notificationbox.js L145-151, L178) and moz-message-bar.mjs renders
   // its dismiss button only when dismissable is true (L196): with a ✕ the user could drop the notice -
-  // and with it the only Stop button - while the session and Firefox's prompt are still up.
+  // and with it the only Stop button - while the session is still connected.
   #appendNotice(win, state) {
     const box = win.gNotificationBox;
     if (!box) return;
@@ -522,7 +522,8 @@ class Loader {
   #connect({ port, nonce, pid, cwd }) {
     this.#handshakeInFlight = true;
     this.#writeStatus({ state: "authenticating", lastHandoff: { pid: pid ?? null, cwd: cwd ?? null, at: new Date().toISOString() } });
-    // Shown before any Firefox prompt, so the user can correlate the dialog with a terminal process.
+    // Shown as soon as the link authenticates, before any Allow/Deny notice, so the user can
+    // correlate the prompt with a terminal process.
     this.#showNotice(`Hirozen: ${this.#who()} is connecting to Zen.`);
     const myChallenge = randomHex(32);
     let authed = false;
@@ -645,8 +646,12 @@ class Loader {
   #teardown(reason) {
     this.#client = null;
     // The link is gone: a pending gate has nobody to answer to, its waiters must not hang, and the
-    // grant itself dies here (a new link asks again).
-    this.#clearConsent({ rejectPending: new LoaderError("E_STOPPED", "the omp link closed while the Allow/Deny notice was up") });
+    // grant itself dies here (resetScope: a new link asks again, and nothing between this teardown and
+    // the next auth may inherit the old scope).
+    this.#clearConsent({
+      rejectPending: new LoaderError("E_STOPPED", "the omp link closed while the Allow/Deny notice was up"),
+      resetScope: true,
+    });
     this.#clearTabOpenWatchers();
     this.#writeStatus({ state: "stopping", consent: "none", consentPending: null, lastClose: reason });
     this.#hideNotice();
