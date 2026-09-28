@@ -1,7 +1,13 @@
 // Hirozen autoconfig. Firefox skips this first line.
-// Loads exactly one module, hirozen/loader.sys.mjs next to the Zen executable, and only if its SHA-256 matches.
+// Loads exactly one module, hirozen/loader.sys.mjs next to the Zen executable, and only if that
+// module and the actor pair the loader registers beside it all match their pinned SHA-256.
 (() => {
-  const EXPECTED_SHA256 = "@@LOADER_SHA256@@";
+  // [role the loader's init() expects, file under hirozen/, pinned hex]
+  const MODULES = [
+    ["loader", "loader.sys.mjs", "@@LOADER_SHA256@@"],
+    ["child", "HirozenChild.sys.mjs", "@@CHILD_SHA256@@"],
+    ["parent", "HirozenParent.sys.mjs", "@@PARENT_SHA256@@"],
+  ];
   const { classes: Cc, interfaces: Ci } = Components;
   const obs = Cc["@mozilla.org/observer-service;1"].getService(Ci.nsIObserverService);
   const dirs = Cc["@mozilla.org/file/directory_service;1"].getService(Ci.nsIProperties);
@@ -23,28 +29,36 @@
     }
   };
 
+  // Hex SHA-256 of one file in the hirozen directory; an unreadable file throws and is reported by load().
+  const hashFile = (dir, name) => {
+    const file = dir.clone();
+    file.append(name);
+    const stream = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(Ci.nsIFileInputStream);
+    stream.init(file, 0x01, 0, 0);
+    const hasher = Cc["@mozilla.org/security/hash;1"].createInstance(Ci.nsICryptoHash);
+    hasher.init(Ci.nsICryptoHash.SHA256);
+    hasher.updateFromStream(stream, 0xffffffff);
+    stream.close();
+    return Array.from(hasher.finish(false), c => c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
+  };
+
   const load = () => {
     try {
       const dir = dirs.get("GreD", Ci.nsIFile);
       dir.append("hirozen");
-      const file = dir.clone();
-      file.append("loader.sys.mjs");
-      const stream = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(Ci.nsIFileInputStream);
-      stream.init(file, 0x01, 0, 0);
-      const hasher = Cc["@mozilla.org/security/hash;1"].createInstance(Ci.nsICryptoHash);
-      hasher.init(Ci.nsICryptoHash.SHA256);
-      hasher.updateFromStream(stream, 0xffffffff);
-      stream.close();
-      const hex = Array.from(hasher.finish(false), c => c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
-      if (hex !== EXPECTED_SHA256) {
-        report(`refused: loader hash ${hex} != pinned ${EXPECTED_SHA256}`);
-        return;
+      const hashes = {};
+      for (const [role, name, pinned] of MODULES) {
+        hashes[role] = hashFile(dir, name);
+        if (hashes[role] !== pinned) {
+          report(`refused: ${name} hash ${hashes[role]} != pinned ${pinned}`);
+          return;
+        }
       }
       const io = Cc["@mozilla.org/network/io-service;1"].getService(Ci.nsIIOService);
       io.getProtocolHandler("resource").QueryInterface(Ci.nsIResProtocolHandler)
         .setSubstitution("hirozen", io.newFileURI(dir));
       const { HirozenLoader } = ChromeUtils.importESModule("resource://hirozen/loader.sys.mjs");
-      report(`loaded (sha256 ${hex}): ${HirozenLoader.init("startup", hex)}`);
+      report(`loaded (loader ${hashes.loader}): ${HirozenLoader.init("startup", hashes)}`);
     } catch (e) {
       report(`error: ${e}`);
     }

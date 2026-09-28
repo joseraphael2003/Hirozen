@@ -2,16 +2,18 @@
 //
 // Why: the autoconfig loader only runs at Zen startup. When the user does not want to restart, the
 // plugin forwards a plain-TCP `--start-debugger-server <port>` command line to the running instance
-// and evaluates loader/attach-now.js once in its parent process. The eval re-verifies the loader
-// hash, imports it as `init("attach", <hex>)`, saves both DevTools prefs back to false and closes the
-// listener last - closing it drops this connection, so the eval's reply is normally lost.
+// and evaluates loader/attach-now.js once in its parent process. The eval re-verifies the three
+// module hashes, imports the loader as `init("attach", {loader, child, parent})`, saves both DevTools
+// prefs back to false and closes the listener last - closing it drops this connection, so the eval's
+// reply is normally lost.
 //
 // Safety rules enforced here:
 //   * nothing is spawned unless prefs.js proves both DevTools prefs are on *and* the connection
 //     prompt is still enabled: with the prefs off the forwarded command line opens a stray window;
 //   * the target profile must be locked by a running Zen (parent.lock held), so the forwarded
 //     `--profile` really lands in that instance instead of starting a second one;
-//   * the installed loader must match this plugin's copy (verify()) and its hash is the pin;
+//   * the installed loader and actor modules must match this plugin's copies (verify()) and their
+//     hashes are the pins;
 //   * plain TCP on 127.0.0.1 only (never `ws:`), no shell, no `\r` in the eval source;
 //   * the whole operation is bounded by TIMEOUT_MS and every failure says how to close the listener.
 import { randomInt } from "node:crypto";
@@ -19,7 +21,7 @@ import { closeSync, existsSync, openSync, readFileSync, rmSync } from "node:fs";
 import { connect, createServer, type Socket } from "node:net";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { verify } from "./install";
+import { MODULE_PLACEHOLDERS, type ModuleHashes, verify } from "./install";
 import { HirozenError, readStatusFile, STATUS_FILE, type ZenStatus } from "./link";
 
 export type AttachOptions = {
@@ -39,10 +41,13 @@ export type AttachResult = {
   mode: "attach";
   /** The confirmed loader hash from the status file, equal to the install pin. */
   loaderSha256: string;
+  /** The confirmed actor child hash, equal to the install pin. */
+  childSha256: string;
+  /** The confirmed actor parent hash, equal to the install pin. */
+  parentSha256: string;
 };
 
 const ATTACH_SCRIPT = fileURLToPath(new URL("../loader/attach-now.js", import.meta.url));
-const SHA_PLACEHOLDER = "@@LOADER_SHA256@@";
 /** Whole-operation budget: the "Incoming Connection" prompt is the only slow part. */
 const TIMEOUT_MS = 120_000;
 const PORT_MIN = 20_000;
@@ -223,21 +228,26 @@ function liveLoaderRefusal(profileDir: string): HirozenError | null {
   );
 }
 
-/** The eval source with the install pin substituted; checked before anything is spawned. */
-function attachScript(pin: string): string {
-  if (!/^[0-9a-f]{64}$/.test(pin)) {
-    throw new HirozenError("E_CONFIG", `refusing to eval the attach script with a non-hex loader pin: ${pin}`);
-  }
+/** The eval source with all three install pins substituted; checked before anything is spawned. */
+export function attachScript(pins: ModuleHashes): string {
   // Windows checkouts and shells leak \r into strings; the eval text is JS, so it stays LF-only.
-  const source = readFileSync(ATTACH_SCRIPT, "utf8").replace(/\r\n?/g, "\n");
-  const placeholders = source.split(SHA_PLACEHOLDER).length - 1;
-  if (placeholders !== 1) {
-    throw new HirozenError(
-      "E_CONFIG",
-      `${ATTACH_SCRIPT} must contain exactly one ${SHA_PLACEHOLDER} (found ${placeholders})`,
-    );
+  let source = readFileSync(ATTACH_SCRIPT, "utf8").replace(/\r\n?/g, "\n");
+  for (const role of ["loader", "child", "parent"] as const) {
+    const pin = pins[role];
+    if (!/^[0-9a-f]{64}$/.test(pin)) {
+      throw new HirozenError("E_CONFIG", `refusing to eval the attach script with a non-hex ${role} pin: ${pin}`);
+    }
+    const placeholder = MODULE_PLACEHOLDERS[role];
+    const placeholders = source.split(placeholder).length - 1;
+    if (placeholders !== 1) {
+      throw new HirozenError(
+        "E_CONFIG",
+        `${ATTACH_SCRIPT} must contain exactly one ${placeholder} (found ${placeholders})`,
+      );
+    }
+    source = source.replace(placeholder, pin);
   }
-  return source.replace(SHA_PLACEHOLDER, pin);
+  return source;
 }
 
 /** A free loopback port in [PORT_MIN, PORT_MAX): Zen's listener must not lose the race to bind it. */
@@ -416,28 +426,39 @@ function describeStatus(seen: ZenStatus | null, reported: Record<string, unknown
   return parts.length > 0 ? ` (${parts.join("; ")})` : "";
 }
 
-/** Waits for the status the eval writes: mode attach, newer than the start, loaderSha256 === pin. */
+/** `link.ts` types the V1 status only; the loader's V2 frame adds the two actor hashes. */
+type PinnedStatus = ZenStatus & { childSha256?: unknown; parentSha256?: unknown };
+
+/** Waits for the status the eval writes: mode attach, newer than the start, all three hashes === pins. */
 async function waitForAttach(
   profileDir: string,
-  pin: string,
+  pins: ModuleHashes,
   startMs: number,
   deadline: number,
   reported: Record<string, unknown> | null,
-): Promise<string> {
+): Promise<ModuleHashes> {
   let seen: ZenStatus | null = null;
   for (;;) {
-    const status = readStatusFile(profileDir);
+    const status = readStatusFile(profileDir) as PinnedStatus | null;
     if (status) seen = status;
-    if (status?.mode === "attach" && status.loaderSha256 === pin && typeof status.updated === "string") {
+    if (
+      status?.mode === "attach" &&
+      status.loaderSha256 === pins.loader &&
+      status.childSha256 === pins.child &&
+      status.parentSha256 === pins.parent &&
+      typeof status.updated === "string"
+    ) {
       const updated = Date.parse(status.updated);
-      if (Number.isFinite(updated) && updated > startMs) return status.loaderSha256;
+      if (Number.isFinite(updated) && updated > startMs) {
+        return { loader: pins.loader, child: pins.child, parent: pins.parent };
+      }
     }
     const left = deadline - Date.now();
     if (left <= 0) {
       throw new HirozenError(
         "E_TIMEOUT",
         `attach-now timed out after ${TIMEOUT_MS / 1000} s: the loader never reported mode=attach with the ` +
-          `pinned hash (was the "Incoming Connection" prompt accepted?)${describeStatus(seen, reported)}: ` +
+          `pinned hashes (was the "Incoming Connection" prompt accepted?)${describeStatus(seen, reported)}: ` +
           LISTENER_ADVICE,
       );
     }
@@ -472,11 +493,11 @@ export async function attachNow(options: AttachOptions): Promise<AttachResult> {
   const zenExe = join(zenDir, "zen.exe");
   if (!existsSync(zenExe)) throw new HirozenError("E_CONFIG", `not a Zen install (no zen.exe): ${zenDir}`);
   const verified = verify(zenDir);
-  if (!verified.ok || !verified.installedSha) {
+  if (!verified.ok || !verified.installed) {
     throw new HirozenError("E_CONFIG", `${verified.reason}; run /hirozen-install first`);
   }
-  const pin = verified.installedSha;
-  const script = attachScript(pin);
+  const pins = verified.installed;
+  const script = attachScript(pins);
 
   const live = liveLoaderRefusal(profileDir);
   if (live) throw live;
@@ -541,6 +562,12 @@ export async function attachNow(options: AttachOptions): Promise<AttachResult> {
     );
   }
 
-  const loaderSha256 = await waitForAttach(profileDir, pin, attachStart, deadline, reported);
-  return { port, mode: "attach", loaderSha256 };
+  const hashes = await waitForAttach(profileDir, pins, attachStart, deadline, reported);
+  return {
+    port,
+    mode: "attach",
+    loaderSha256: hashes.loader,
+    childSha256: hashes.child,
+    parentSha256: hashes.parent,
+  };
 }
