@@ -1084,7 +1084,14 @@ class Loader {
     const payload = { action, ref, text, key, dy };
     // Checkpoint 4: nothing may reach the page once omp gave up (the actor call is the side effect).
     this.#checkDeadline(req);
-    const reply = await this.#queryAct(wg, payload, browser);
+    let reply;
+    try {
+      reply = await this.#queryAct(wg, payload, browser);
+    } finally {
+      // The act is over however it ended: start the re-homing grace (a no-op when #collectOpened below
+      // already did) so a popup the act opened is still re-homed and the watcher's listeners go away.
+      this.#armGrace(watcher);
+    }
     const opened = await this.#collectOpened(watcher);
     return { ...reply, tabKey, opened };
   }
@@ -1129,6 +1136,9 @@ class Loader {
       return { ok: true, tabKey, url: landed.url, title: tab.label ?? "", opened: await this.#collectOpened(watcher) };
     } finally {
       dialog.cancel();
+      // Same as #act: a navigate that timed out or hit a dialog still ends its watch on the tab (a
+      // no-op once #collectOpened awaited the grace itself).
+      this.#armGrace(watcher);
     }
   }
 
@@ -1293,6 +1303,7 @@ class Loader {
     }
     const state = {
       win,
+      box,
       agentTab: tab,
       spaceId,
       previousSelected: win.gBrowser?.selectedTab ?? null,
@@ -1303,12 +1314,22 @@ class Loader {
       openedTabs: [], // the tab elements a popup created; keys are resolved once the grace is over
       done: null,
       finish: null,
-      timer: null,
+      timer: null, // armed by #armGrace once the act is over, never before it
     };
     state.done = new Promise(resolve => { state.finish = resolve; });
-    state.timer = setTimeout(() => this.#unwatchAgentTabOpens(win, box, state), TAB_OPEN_GRACE_MS);
     box.states.push(state);
     return state;
+  }
+
+  // Starts the 1 s re-homing grace for a watcher: called the moment the act/navigate it belongs to is
+  // over (success or failure), never when the watcher is created. Arming it up front ended the grace
+  // before a slow act finished - a navigate that waits seconds for its load, or a window.open the page
+  // calls after an await (still inside the click's transient activation) - so that popup was neither
+  // moved into the agent space nor reported, and could keep the selection and switch the user's space
+  // (plan: re-homing covers the act "and for 1 s after").
+  #armGrace(state) {
+    if (!state || state.timer !== null) return;
+    state.timer = setTimeout(() => this.#unwatchAgentTabOpens(state.win, state.box, state), TAB_OPEN_GRACE_MS);
   }
 
   #onAgentTabOpen(box, event) {
@@ -1324,7 +1345,9 @@ class Loader {
       // still reports it so omp can react.
     }
     state.openedTabs.push(opened);
-    this.#restoreUserView(state);
+    // Only a popup that actually took the selection has a view to put back: a background popup leaves
+    // the user where they are, and #restoreUserView acts only on a re-homed popup as the selection.
+    if (win.gBrowser?.selectedTab === opened) this.#restoreUserView(state, opened);
   }
 
   // Puts the user's view back after a popup was re-homed: the popup must not stay selected, and the
@@ -1334,18 +1357,18 @@ class Loader {
   // so the space is checked here as well and restored with the same call Zen's own onLocationChange
   // makes, and only ever to the space captured before the act. Called when the popup appears, on every
   // TabSelect inside the grace (capture, before Zen reacts), and one last time when the grace ends.
+  //
+  // Only a popup *this act* re-homed may be undone, so `blamed` - the tab a TabSelect is about, or with
+  // none the tab selected right now - must be one of `openedTabs`. A selection or a space switch the act
+  // did not cause (the user clicking any other tab, an agent-space tab included, or switching spaces
+  // during the grace) is the user's own view and is never put back: "Your view stays yours".
   #restoreUserView(state, selected = null) {
     if (state.restoring) return;
     const win = state.win;
     const previous = state.previousSelected;
     if (!win || !previous || previous.closed) return;
-    // TabSelect also fires for the user's own clicks: only a selection this act is responsible for (a
-    // popup it re-homed, or a tab of the agent space) is put back; anything else is the user's to make.
-    if (selected && selected !== previous) {
-      const isOpened = state.openedTabs.includes(selected);
-      const inAgentSpace = selected.getAttribute?.("zen-workspace-id") === state.spaceId;
-      if (!isOpened && !inAgentSpace) return;
-    }
+    const blamed = selected && !selected.closed ? selected : (win.gBrowser?.selectedTab ?? null);
+    if (!blamed || !state.openedTabs.includes(blamed)) return;
     state.restoring = true;
     try {
       if (win.gBrowser?.selectedTab !== previous) {
@@ -1355,7 +1378,9 @@ class Loader {
           // The previous tab went away in the same breath: there is nothing left to restore.
         }
       }
-      // The space: only the user's own, only when the re-homed popup moved Zen off it.
+      // The space: only the user's own, only when the re-homed popup moved Zen off it. The popup being
+      // the selection is what makes the move the popup's doing - a space switch the user made selects
+      // one of their own tabs, so this code never runs for it.
       const active = win.gZenWorkspaces?.activeWorkspace;
       if (state.userSpaceId && active && active !== state.userSpaceId) {
         try {
@@ -1370,8 +1395,9 @@ class Loader {
     }
   }
 
-  // Waits out the 1 s grace so a popup that only reaches the parent after the actor answered is still
-  // re-homed and reported, then returns the tab keys that were opened by the acted-on tab.
+  // Ends the act's watch: starts the 1 s grace (if a failure path has not already) so a popup that only
+  // reaches the parent after the action returned is still re-homed and reported, then returns the tab
+  // keys that were opened by the acted-on tab.
   // A tabKey is Zen's window-sync id: `tab.id`, assigned by ZenWindowSync.mjs's TabOpen handler
   // (`on_TabOpen`, shipped L1368-1379: `if (!tab.id) tab.id = this.#newTabSyncId`). Live QA showed that
   // assignment can land *after* addTab/moveTabToWorkspace returned (zen.open answered an empty key
@@ -1402,6 +1428,8 @@ class Loader {
 
   async #collectOpened(state) {
     if (!state) return [];
+    // The grace starts here, when the action has returned (see #armGrace).
+    this.#armGrace(state);
     await state.done;
     const keys = [];
     for (const tab of state.openedTabs) {
@@ -1414,8 +1442,10 @@ class Loader {
 
   #unwatchAgentTabOpens(win, box, state) {
     clearTimeout(state.timer);
-    // One last look before the grace ends: Zen's own space switch for the popup may have landed while
-    // the timer was running.
+    state.timer = null;
+    // One last look before the grace ends: Zen's own space switch for a re-homed popup may have landed
+    // while the timer was running, and that switch re-selects the popup - which is exactly what lets
+    // #restoreUserView act (see there: nobody else's selection is ever put back).
     this.#restoreUserView(state);
     const index = box.states.indexOf(state);
     if (index >= 0) box.states.splice(index, 1);
