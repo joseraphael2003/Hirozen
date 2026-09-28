@@ -55,6 +55,8 @@ const AUTH_TIMEOUT_MS = 10_000;
 const BIDI_COMMAND_TIMEOUT_MS = 60_000;
 const SESSION_END_TIMEOUT_MS = 5_000;
 const STOP_TIMEOUT_MS = 10_000;
+const STOP_SETTLE_TIMEOUT_MS = 5_000;
+const STOP_SETTLE_POLL_MS = 100;
 const HEARTBEAT_PING_MS = 5_000;
 const HEARTBEAT_REAP_MS = 1_000;
 const HEARTBEAT_TIMEOUT_MS = 15_000;
@@ -767,7 +769,11 @@ class Loader {
     if (!this.#startPromise) {
       this.#startPromise = this.#startBidi().then(
         result => {
-          this.#writeStatus({ lastStartError: null });
+          // A start that reached a session proves the agent is ours and running cleanly: both failure
+          // records of earlier attempts are stale now (same rule for #lastStopError, so a transient
+          // concurrent-stop record cannot outlive the session that followed it).
+          this.#lastStopError = null;
+          this.#writeStatus({ lastStartError: null, lastStopError: null });
           return result;
         },
         e => {
@@ -1102,10 +1108,18 @@ class Loader {
         ]);
         clearTimeout(timer);
         // RemoteAgent #stop swallows httpd errors ("this function must never fail", L429-437), so a
-        // resolved stopAtRuntime() is no proof the agent is gone: an agent that is still running is a
+        // resolved stopAtRuntime() is no proof the agent is gone; an agent that is still running is a
         // failed stop as well. Recording it is what stops the next start from blaming a rogue client
         // (the retry path reads #lastStopError) instead of raising a false E_COMPROMISE.
-        const failure = rejected ?? (RA.running ? "stopAtRuntime resolved but Remote Agent is still running" : null);
+        //
+        // "Still running" is not failure by itself, though: Firefox's own banner stop (Disconnect /
+        // Turn off / Disable) calls stopAtRuntime() first and is already inside #stop() when our
+        // socket closes and we call stop too. There the second httpd stop() throws - its _socket is
+        // already null (httpd L606-614) - and #stop's catch swallows it, so OUR call resolves early
+        // while #server is still up and running (= !!#server && !#server.isStopped(), L142-144) stays
+        // true until that stop finishes asynchronously. So give an in-flight stop a bounded chance to
+        // settle before calling it a failure.
+        const failure = rejected ?? (RA.running ? await this.#waitForStopSettle() : null);
         if (failure) {
           this.#lastStopError = failure;
           this.#writeStatus({ lastStopError: failure });
@@ -1121,6 +1135,18 @@ class Loader {
       // half-stopped agent can no longer leave the pref true for the next start.
       this.#releasePref();
     }
+  }
+
+  // Waits, bounded, for a stop that was already in progress elsewhere (Firefox's own banner stop) to
+  // finish, so a concurrent stop is not recorded as our failure. Returns null as soon as the agent is
+  // gone, or the reason it still is not.
+  async #waitForStopSettle() {
+    const deadline = Date.now() + STOP_SETTLE_TIMEOUT_MS;
+    while (lazy.RemoteAgent.running) {
+      if (Date.now() >= deadline) return "stopAtRuntime resolved but Remote Agent is still running";
+      await new Promise(resolve => setTimeout(resolve, STOP_SETTLE_POLL_MS));
+    }
+    return null;
   }
 
   #emit(name, data) {
