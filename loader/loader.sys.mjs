@@ -1118,12 +1118,16 @@ class Loader {
     this.#checkDeadline(req);
     const watcher = this.#watchAgentTabOpens(tab, browser);
     const before = browser.currentURI.spec;
+    // The document the load starts from: a same-URL load (reload, navigate to the URL already shown,
+    // a redirect back to it) proves itself by replacing this window global.
+    const beforeWg = browser.browsingContext?.currentWindowGlobal ?? null;
     const dialog = this.#dialogRace(browser);
     try {
       this.#checkDeadline(req);
       browser.fixupAndLoadURIString(url, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });
       const landed = await this.#waitForLoad(tabKey, browser, {
         previous: before,
+        previousWg: beforeWg,
         bound: NAVIGATE_TIMEOUT_MS,
         what: `browser.act navigate to ${url} (tab ${tabKey})`,
         dialog,
@@ -1144,13 +1148,24 @@ class Loader {
 
   // ---------------------------------------------------------------- loads
 
-  // The load test navigate and zen.open share: the browser is not loading a document any more, and its
-  // URL moved off the one the load started from (the pre-navigation URL for navigate, about:blank for
-  // a tab this loader just opened).
-  #loadLanded(browser, previous) {
+  // The load test navigate and zen.open share: the browser is not loading a document any more and the
+  // load itself can be seen to have happened. A URL string comparison alone is not enough - a reload, a
+  // navigate to the URL the tab already shows and a redirect back to it all leave `currentURI.spec`
+  // exactly as it was, so a load that worked would poll to E_TIMEOUT ("did not finish loading") - and
+  // neither is `isLoadingDocument` alone, because a wait can start after a fast load already ended.
+  //
+  // Three signals, any one of them enough:
+  //  - the spec moved off `previous` (navigate to a different URL, zen.open leaving about:blank);
+  //  - the browsing context's currentWindowGlobal is not the one the load started from (`previousWg`):
+  //    a cross-document load replaces the document, so a new (or no) window global proves the load;
+  //  - this wait watched the browser load (`sawLoading`) and it has now stopped.
+  #loadLanded(browser, previous, previousWg, sawLoading) {
     if (browser.webProgress?.isLoadingDocument === true) return null;
     const spec = browser.currentURI.spec;
-    return spec === previous ? null : spec;
+    if (spec !== previous) return spec;
+    const wg = browser.browsingContext?.currentWindowGlobal ?? null;
+    if (previousWg && wg !== previousWg) return spec;
+    return sawLoading ? spec : null;
   }
 
   // Waits, bounded, for a load this loader started to land, polling every NAVIGATE_POLL_MS. Returns
@@ -1158,10 +1173,12 @@ class Loader {
   // page that answers with a prompt never finishes loading. `what` names the operation in the timeout,
   // which must tell omp what already exists (E_DEADLINE promises "nothing was done"; a load wait is
   // after the side effect, so only its own bound may fail).
-  async #waitForLoad(tabKey, browser, { previous, bound, what, dialog = null }) {
+  async #waitForLoad(tabKey, browser, { previous, previousWg = null, bound, what, dialog = null }) {
     const started = Date.now();
+    let sawLoading = false;
     for (;;) {
-      const landed = this.#loadLanded(browser, previous);
+      if (browser.webProgress?.isLoadingDocument === true) sawLoading = true;
+      const landed = this.#loadLanded(browser, previous, previousWg, sawLoading);
       if (landed) return { url: landed };
       if (Date.now() - started > bound) {
         throw new LoaderError("E_TIMEOUT", `${what} did not finish loading within ${bound} ms`);
