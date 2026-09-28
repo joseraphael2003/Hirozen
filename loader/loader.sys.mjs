@@ -81,6 +81,8 @@ const AGENT_SPACE_TIMEOUT_MS = 5_000;
 const AGENT_SPACE_POLL_MS = 100;
 const GLANCE_TIMEOUT_MS = 10_000;
 const TAB_OPEN_GRACE_MS = 1_000; // popups from an agent-space tab are re-homed for 1 s after the act
+const TAB_KEY_TIMEOUT_MS = 2_000; // a freshly opened tab's Zen sync id may land after addTab returns
+const TAB_KEY_POLL_MS = 50;
 const DEFERRED_CLOSE_MS = 5_000; // an external stop closes even if replies are still owed
 const XHTML_NS = "http://www.w3.org/1999/xhtml";
 // The only privileged pages a navigate may leave: an empty tab has no content to protect, and the
@@ -1383,7 +1385,7 @@ class Loader {
       agentTab: tab,
       spaceId,
       previousSelected: win.gBrowser?.selectedTab ?? null,
-      opened: [],
+      openedTabs: [], // the tab elements a popup created; keys are resolved once the grace is over
       done: null,
       finish: null,
       timer: null,
@@ -1413,15 +1415,49 @@ class Loader {
         // The previous tab went away in the same breath: there is nothing to restore.
       }
     }
-    if (opened.id) state.opened.push(opened.id);
+    state.openedTabs.push(opened);
   }
 
   // Waits out the 1 s grace so a popup that only reaches the parent after the actor answered is still
   // re-homed and reported, then returns the tab keys that were opened by the acted-on tab.
+  // A tabKey is Zen's window-sync id: `tab.id`, assigned by ZenWindowSync.mjs's TabOpen handler
+  // (`on_TabOpen`, shipped L1368-1379: `if (!tab.id) tab.id = this.#newTabSyncId`). Live QA showed that
+  // assignment can land *after* addTab/moveTabToWorkspace returned (zen.open answered an empty key
+  // while zen_tabs listed the tab with its id a moment later), and "" is not caught by `??`. So every
+  // key this loader mints for a tab it just opened is waited for, bounded, never guessed.
+  // The bound is deliberately not the request deadline: by the time this runs the tab exists, and
+  // E_DEADLINE promises "nothing was done", which would be untrue.
+  async #waitForTabKey(tab) {
+    const started = Date.now();
+    for (;;) {
+      if (tab?.id) return tab.id;
+      if (Date.now() - started > TAB_KEY_TIMEOUT_MS) {
+        throw new LoaderError("E_TIMEOUT", `the tab was opened, but Zen did not assign its key within ${TAB_KEY_TIMEOUT_MS} ms; list tabs with zen_tabs`);
+      }
+      await pageSleep(TAB_KEY_POLL_MS);
+    }
+  }
+
+  // The same wait, for a popup the act already proved opened: a key that never appears must not turn a
+  // successful act into a failure, so that tab is simply left out of `opened`.
+  async #tabKeyOrNull(tab) {
+    try {
+      return await this.#waitForTabKey(tab);
+    } catch {
+      return null;
+    }
+  }
+
   async #collectOpened(state) {
     if (!state) return [];
     await state.done;
-    return state.opened;
+    const keys = [];
+    for (const tab of state.openedTabs) {
+      if (tab.closed) continue;
+      const key = await this.#tabKeyOrNull(tab);
+      if (key) keys.push(key);
+    }
+    return keys;
   }
 
   #unwatchAgentTabOpens(win, box, state) {
@@ -1536,7 +1572,7 @@ class Loader {
       inBackground: true,
     });
     win.gZenWorkspaces.moveTabToWorkspace(tab, spaceId);
-    return { tabKey: tab.id ?? null, spaceId };
+    return { tabKey: await this.#waitForTabKey(tab), spaceId };
   }
 
   async #zenMove(params, req) {
@@ -1674,7 +1710,7 @@ class Loader {
     if (!tab) {
       throw new LoaderError("E_LAYOUT_REFUSED", `Zen refused to open a glance for ${url}`);
     }
-    return { tabKey: tab.id ?? null };
+    return { tabKey: await this.#waitForTabKey(tab) };
   }
 
 
