@@ -1112,30 +1112,54 @@ class Loader {
     const watcher = this.#watchAgentTabOpens(tab, browser);
     const before = browser.currentURI.spec;
     const dialog = this.#dialogRace(browser);
-    const started = Date.now();
     try {
       this.#checkDeadline(req);
       browser.fixupAndLoadURIString(url, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });
-      for (;;) {
-        const spec = browser.currentURI.spec;
-        if (browser.webProgress?.isLoadingDocument !== true && spec !== before) {
-          return { ok: true, tabKey, url: spec, title: tab.label ?? "", opened: await this.#collectOpened(watcher) };
-        }
-        if (Date.now() - started > NAVIGATE_TIMEOUT_MS) {
-          throw new LoaderError("E_TIMEOUT", `browser.act navigate waited ${NAVIGATE_TIMEOUT_MS} ms for tab ${tabKey} to load ${url}`);
-        }
-        // A page that answers with a dialog instead of loading (beforeunload, an alert during load):
-        // the same race act uses, so omp gets the dialog facts rather than a timeout.
-        const winner = await Promise.race([
-          pageSleep(NAVIGATE_POLL_MS),
-          dialog.promise.then(info => ({ info })),
-        ]);
-        if (winner?.info) {
-          return { ok: true, tabKey, dialog: winner.info, opened: await this.#collectOpened(watcher) };
-        }
+      const landed = await this.#waitForLoad(tabKey, browser, {
+        previous: before,
+        bound: NAVIGATE_TIMEOUT_MS,
+        what: `browser.act navigate to ${url} (tab ${tabKey})`,
+        dialog,
+      });
+      // A page that answered with a dialog instead of loading (beforeunload, an alert during load):
+      // omp gets the dialog facts rather than a timeout.
+      if (landed.dialog) {
+        return { ok: true, tabKey, dialog: landed.dialog, opened: await this.#collectOpened(watcher) };
       }
+      return { ok: true, tabKey, url: landed.url, title: tab.label ?? "", opened: await this.#collectOpened(watcher) };
     } finally {
       dialog.cancel();
+    }
+  }
+
+  // ---------------------------------------------------------------- loads
+
+  // The load test navigate and zen.open share: the browser is not loading a document any more, and its
+  // URL moved off the one the load started from (the pre-navigation URL for navigate, about:blank for
+  // a tab this loader just opened).
+  #loadLanded(browser, previous) {
+    if (browser.webProgress?.isLoadingDocument === true) return null;
+    const spec = browser.currentURI.spec;
+    return spec === previous ? null : spec;
+  }
+
+  // Waits, bounded, for a load this loader started to land, polling every NAVIGATE_POLL_MS. Returns
+  // {url} - or {dialog} early when `dialog` (navigate's common-dialog race) fires instead, because a
+  // page that answers with a prompt never finishes loading. `what` names the operation in the timeout,
+  // which must tell omp what already exists (E_DEADLINE promises "nothing was done"; a load wait is
+  // after the side effect, so only its own bound may fail).
+  async #waitForLoad(tabKey, browser, { previous, bound, what, dialog = null }) {
+    const started = Date.now();
+    for (;;) {
+      const landed = this.#loadLanded(browser, previous);
+      if (landed) return { url: landed };
+      if (Date.now() - started > bound) {
+        throw new LoaderError("E_TIMEOUT", `${what} did not finish loading within ${bound} ms`);
+      }
+      const winner = dialog
+        ? await Promise.race([pageSleep(NAVIGATE_POLL_MS), dialog.promise.then(info => ({ dialog: info }))])
+        : await pageSleep(NAVIGATE_POLL_MS);
+      if (winner?.dialog) return { dialog: winner.dialog };
     }
   }
 
@@ -1480,6 +1504,7 @@ class Loader {
   }
 
   async #zenOpen(params, req) {
+    const started = Date.now();
     const url = params?.url;
     let scheme = null;
     try {
@@ -1504,7 +1529,20 @@ class Loader {
       inBackground: true,
     });
     win.gZenWorkspaces.moveTabToWorkspace(tab, spaceId);
-    return { tabKey: await this.#waitForTabKey(tab), spaceId };
+    const tabKey = await this.#waitForTabKey(tab);
+    // The tab exists now, so E_DEADLINE ("nothing was done") would be a lie: only the load wait's own
+    // bound may fail from here on. The bound is what is left of the plugin's 15 s budget - zen.open's
+    // worst case is the agent-space wait (5 s) + the tab-key wait (2 s) + this load, and NAVIGATE's
+    // 12 s is the whole budget the plugin gives a load, so the load gets 12 s minus what already went.
+    const bound = Math.max(1_000, NAVIGATE_TIMEOUT_MS - (Date.now() - started));
+    const landed = await this.#waitForLoad(tabKey, tab.linkedBrowser, {
+      // A brand-new tab starts on about:blank (live QA saw exactly that) and only an http(s) load may
+      // leave it, so about:blank is the "before" here just as the pre-navigation URL is for navigate.
+      previous: "about:blank",
+      bound,
+      what: `zen.open's page ${url} (tab ${tabKey}, already open in the "${AGENT_SPACE_NAME}" space and still usable)`,
+    });
+    return { tabKey, spaceId, url: landed.url, title: tab.label ?? "" };
   }
 
   async #zenMove(params, req) {
