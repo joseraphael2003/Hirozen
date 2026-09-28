@@ -1376,15 +1376,25 @@ class Loader {
     if (!win || !spaceId || tab.getAttribute("zen-workspace-id") !== spaceId) return null;
     let box = this.#tabOpenWatchers.get(win);
     if (!box) {
-      box = { win, states: [], handler: null };
+      box = { win, states: [], handler: null, selectHandler: null };
       box.handler = event => this.#onAgentTabOpen(box, event);
+      // Capture phase: this runs before Zen's own TabSelect listener (ZenSpaceManager onLocationChange
+      // is a bubble listener), so a popup that steals the selection can be put back before Zen starts
+      // switching the user's space.
+      box.selectHandler = event => { for (const state of box.states) this.#restoreUserView(state, event?.target ?? null); };
       win.addEventListener("TabOpen", box.handler, true);
+      win.addEventListener("TabSelect", box.selectHandler, true);
       this.#tabOpenWatchers.set(win, box);
     }
     const state = {
+      win,
       agentTab: tab,
       spaceId,
       previousSelected: win.gBrowser?.selectedTab ?? null,
+      // The space the user was looking at: Zen switches spaces on TabSelect (ZenSpaceManager
+      // onLocationChange -> changeWorkspace), and that switch can land after our re-selection.
+      userSpaceId: win.gZenWorkspaces?.activeWorkspace ?? null,
+      restoring: false,
       openedTabs: [], // the tab elements a popup created; keys are resolved once the grace is over
       done: null,
       finish: null,
@@ -1408,14 +1418,51 @@ class Loader {
       // Zen refused the move (a pinned/essential tab): the tab stays where it opened, and the reply
       // still reports it so omp can react.
     }
-    if (opened.selected && state.previousSelected && !state.previousSelected.closed) {
-      try {
-        win.gBrowser.selectedTab = state.previousSelected;
-      } catch {
-        // The previous tab went away in the same breath: there is nothing to restore.
-      }
-    }
     state.openedTabs.push(opened);
+    this.#restoreUserView(state);
+  }
+
+  // Puts the user's view back after a popup was re-homed: the popup must not stay selected, and the
+  // space must stay the one the user was in (plan: "the user's space never changes"). The selection is
+  // the primary lever - Zen switches spaces on TabSelect, exactly as it does when the user clicks a tab
+  // of another space - but a switch Zen already started for the popup can land after our re-selection,
+  // so the space is checked here as well and restored with the same call Zen's own onLocationChange
+  // makes, and only ever to the space captured before the act. Called when the popup appears, on every
+  // TabSelect inside the grace (capture, before Zen reacts), and one last time when the grace ends.
+  #restoreUserView(state, selected = null) {
+    if (state.restoring) return;
+    const win = state.win;
+    const previous = state.previousSelected;
+    if (!win || !previous || previous.closed) return;
+    // TabSelect also fires for the user's own clicks: only a selection this act is responsible for (a
+    // popup it re-homed, or a tab of the agent space) is put back; anything else is the user's to make.
+    if (selected && selected !== previous) {
+      const isOpened = state.openedTabs.includes(selected);
+      const inAgentSpace = selected.getAttribute?.("zen-workspace-id") === state.spaceId;
+      if (!isOpened && !inAgentSpace) return;
+    }
+    state.restoring = true;
+    try {
+      if (win.gBrowser?.selectedTab !== previous) {
+        try {
+          win.gBrowser.selectedTab = previous;
+        } catch {
+          // The previous tab went away in the same breath: there is nothing left to restore.
+        }
+      }
+      // The space: only the user's own, only when the re-homed popup moved Zen off it.
+      const active = win.gZenWorkspaces?.activeWorkspace;
+      if (state.userSpaceId && active && active !== state.userSpaceId) {
+        try {
+          const space = win.gZenWorkspaces.getWorkspaceFromId?.(state.userSpaceId) ?? null;
+          if (space) win.gZenWorkspaces.changeWorkspace?.(space);
+        } catch {
+          // A Zen that refuses the switch leaves the user where they are; nothing else to try here.
+        }
+      }
+    } finally {
+      state.restoring = false;
+    }
   }
 
   // Waits out the 1 s grace so a popup that only reaches the parent after the actor answered is still
@@ -1462,12 +1509,16 @@ class Loader {
 
   #unwatchAgentTabOpens(win, box, state) {
     clearTimeout(state.timer);
+    // One last look before the grace ends: Zen's own space switch for the popup may have landed while
+    // the timer was running.
+    this.#restoreUserView(state);
     const index = box.states.indexOf(state);
     if (index >= 0) box.states.splice(index, 1);
     state.finish();
     if (!box.states.length) {
       try {
         win.removeEventListener("TabOpen", box.handler, true);
+        win.removeEventListener("TabSelect", box.selectHandler, true);
       } catch {
         // The window is gone; its listeners went with it.
       }
