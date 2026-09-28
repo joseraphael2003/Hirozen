@@ -12,6 +12,8 @@ const READY_FRAME: ReadyFrame = {
   type: "ready",
   loaderVersion: "1.0.0-test",
   loaderSha256: "0".repeat(64),
+  childSha256: "1".repeat(64),
+  parentSha256: "2".repeat(64),
   zenVersion: "1.22.3b",
   platformVersion: "142.0",
   zenPid: 4242,

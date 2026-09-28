@@ -6,7 +6,7 @@
 // third connect, which `findOwner` refused with E_IN_USE naming omp's own pid.
 //
 // The host is a stub `pi`/`ctx` (pattern: temp/t6-smoke.ts); a real WebSocket client plays the loader.
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, expect, spyOn, test } from "bun:test";
 import { createHmac, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,9 +18,12 @@ import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/
 
 import hirozen from "../src/index";
 import { install, sha256File } from "../src/install";
+import { ZenLink } from "../src/link";
 
-/** `loader/loader.sys.mjs` as this checkout hashes it: the sha the plugin accepts in `ready`. */
+/** The three loader modules as this checkout hashes them: the shas the plugin accepts in `ready`. */
 const LOADER_SHA = sha256File(fileURLToPath(new URL("../loader/loader.sys.mjs", import.meta.url)));
+const CHILD_SOURCE = fileURLToPath(new URL("../loader/HirozenChild.sys.mjs", import.meta.url));
+const PARENT_SOURCE = fileURLToPath(new URL("../loader/HirozenParent.sys.mjs", import.meta.url));
 
 const hmacHex = (key: string, message: string) => createHmac("sha256", key).update(message).digest("hex");
 
@@ -96,6 +99,8 @@ class FakeLoader {
       type: "ready",
       loaderVersion: "1.0.0-test",
       loaderSha256,
+      childSha256: sha256File(CHILD_SOURCE),
+      parentSha256: sha256File(PARENT_SOURCE),
       zenVersion: "1.22.3b",
       platformVersion: "156.0.1",
       zenPid: process.pid,
@@ -173,14 +178,23 @@ type Host = {
   pi: ExtensionAPI;
   ctx: ExtensionContext;
   notifications: string[];
-  tools: Map<string, { execute: (...args: unknown[]) => Promise<AgentToolResult<unknown>> }>;
+  tools: Map<string, StubTool>;
+  commands: Map<string, { handler: (args: string, ctx: ExtensionContext) => unknown }>;
   events: Map<string, (event: unknown, ctx: ExtensionContext) => unknown>;
+};
+
+/** What the stub keeps from a registered tool: the handler plus the approval surface omp reads. */
+type StubTool = {
+  execute: (...args: unknown[]) => Promise<AgentToolResult<unknown>>;
+  approval?: unknown;
+  formatApprovalDetails?: (args: unknown) => string | string[] | undefined;
 };
 
 /** A stub host: the real schema builder, captured registrations, recorded notifications. */
 function makeHost(cwd: string): Host {
   const notifications: string[] = [];
-  const tools = new Map<string, { execute: (...args: unknown[]) => Promise<AgentToolResult<unknown>> }>();
+  const tools = new Map<string, StubTool>();
+  const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => unknown }>();
   const events = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
 
   const ctx = {
@@ -198,13 +212,15 @@ function makeHost(cwd: string): Host {
     on: (name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => {
       events.set(name, handler);
     },
-    registerTool: (tool: { name: string; execute: (...args: unknown[]) => Promise<AgentToolResult<unknown>> }) => {
+    registerTool: (tool: { name: string } & StubTool) => {
       tools.set(tool.name, tool);
     },
-    registerCommand: () => undefined,
+    registerCommand: (name: string, options: { handler: (args: string, ctx: ExtensionContext) => unknown }) => {
+      commands.set(name, options);
+    },
   } as unknown as ExtensionAPI;
 
-  return { pi, ctx, notifications, tools, events };
+  return { pi, ctx, notifications, tools, commands, events };
 }
 
 async function callTool(host: Host, name: string, params: unknown = {}): Promise<AgentToolResult<unknown>> {
@@ -213,8 +229,37 @@ async function callTool(host: Host, name: string, params: unknown = {}): Promise
   return tool.execute("call-1", params, undefined, undefined, host.ctx);
 }
 
+/** Runs a registered command, i.e. what the user types as `/hirozen-connect`. */
+async function runCommand(host: Host, name: string, args = ""): Promise<void> {
+  const command = host.commands.get(name);
+  if (!command) throw new Error(`command ${name} is not registered`);
+  await command.handler(args, host.ctx);
+}
+
+/**
+ * Poll for a condition the plugin reaches on its own async path (link events, notifications)
+ * instead of waiting a guessed duration. Fake timers would break the WebSocket round trips this
+ * loop is waiting for, so the poll interval is real; it is only how often the condition is re-checked.
+ */
+async function waitFor(condition: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("condition was never met");
+    const sleep = Promise.withResolvers<void>();
+    setTimeout(sleep.resolve, 5);
+    await sleep.promise;
+  }
+}
+
 function textOf(result: AgentToolResult<unknown>): string {
   return result.content.map(item => (item.type === "text" ? item.text : `<${item.type}>`)).join("\n");
+}
+
+/** The absolute deadline a request frame carries: the loader checks it before it acts on anything. */
+function frameDeadline(frame: Frame): number {
+  const deadline = frame.deadline;
+  if (typeof deadline !== "number") throw new Error("the request frame carries no numeric deadline");
+  return deadline;
 }
 
 /** Fires the session_shutdown handler the plugin registers with its first successful link. */
@@ -342,4 +387,102 @@ test("a call in flight when a sticky stop closes the link gets that stop's text"
   expect(textOf(later)).toBe(text);
 
   await started;
+}, 30_000);
+
+test("the act budget tracks the gate scope, the terminal hint mirrors consent, and the details name the ref", async () => {
+  // The previous test left a sticky stop and a live link behind; /hirozen-connect is the documented
+  // way out of the stop, and the status record it wrote must go before a fresh loader offers a handoff.
+  await runCommand(host, "hirozen-connect");
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+
+  // Bun's spyOn calls through by default, so the real call still sends the frame; the spy only
+  // records what the plugin asked for (method + budget), which is what the loader's deadline is cut from.
+  const callSpy = spyOn(ZenLink.prototype, "call");
+
+  try {
+    const loader = new FakeLoader(profileDir);
+    const started = loader.start().catch(() => undefined); // reported by the assertions, not as an unhandled rejection
+
+    // 1. Tracked scope is "none", so the first act call carries the extra 125 s the loader needs to
+    //    wait for the user's answer in Zen (base 15 s + 125 s).
+    const firstCall = callTool(host, "browser_act", { tabKey: TAB_KEY, action: "click", ref: "ab12.e1" });
+    const firstRequest = await loader.nextRequest();
+    expect(firstRequest.method).toBe("browser.act");
+    expect(callSpy.mock.calls.map(call => ({ method: call[0], timeoutMs: call[2]?.timeoutMs }))).toEqual([
+      { method: "browser.act", timeoutMs: 140_000 },
+    ]);
+    // The frame carries the absolute deadline the loader checks before it acts, not just the budget.
+    expect(Math.abs(frameDeadline(firstRequest) - (Date.now() + 140_000))).toBeLessThan(5_000);
+
+    // 2. The gate prompt reaches the terminal while the call is still pending.
+    loader.send({ type: "event", name: "consent.pending", data: { scope: "act" } });
+    await waitFor(() => host.notifications.some(message => message.includes("click Allow in Zen")));
+    const hint = host.notifications.find(message => message.includes("click Allow in Zen")) ?? "";
+    expect(hint).toContain("read and act on pages");
+
+    // 3. Allow, then answer the pending call. The reply frame is queued behind the event frame, so
+    //    awaiting the call proves the granted scope was applied before the next call is made.
+    loader.send({ type: "event", name: "consent.granted", data: { scope: "act" } });
+    loader.reply(firstRequest, { ok: true, url: "https://example.com/", title: "Example Domain" });
+    expect(textOf(await firstCall)).toContain("https://example.com/");
+
+    // 4. With act granted, the next act call needs no person-wait: base 15 s only.
+    const secondCall = callTool(host, "browser_act", { tabKey: TAB_KEY, action: "click", ref: "ab12.e1" });
+    const secondRequest = await loader.nextRequest();
+    expect(callSpy.mock.calls[1]?.[2]?.timeoutMs).toBe(15_000);
+    expect(frameDeadline(secondRequest) - Date.now()).toBeLessThanOrEqual(15_000);
+    loader.reply(secondRequest, { ok: true, url: "https://example.com/", title: "Example Domain" });
+    expect((await secondCall).isError).not.toBe(true);
+
+    // 5. A snapshot names the elements the approval prompt has to describe.
+    const snapshot = callTool(host, "browser_snapshot", { tabKey: TAB_KEY });
+    const snapshotRequest = await loader.nextRequest();
+    expect(snapshotRequest.method).toBe("browser.snapshot");
+    loader.reply(snapshotRequest, {
+      url: "https://example.com/form",
+      title: "Fixture form",
+      elements: [
+        {
+          ref: "ab12.e1",
+          role: "button",
+          name: "Save changes",
+          tag: "button",
+          rect: { x: 10, y: 20, width: 80, height: 30 },
+        },
+      ],
+      truncated: false,
+    });
+    const snapshotResult = await snapshot;
+    expect(snapshotResult.isError).not.toBe(true);
+    expect(textOf(snapshotResult)).toContain("ab12.e1");
+
+    // 6. The prompt details: the tab it acts on, the action, and the element behind the ref.
+    const tool = host.tools.get("browser_act");
+    if (!tool) throw new Error("browser_act is not registered");
+    const args = { tabKey: TAB_KEY, action: "click", ref: "ab12.e1" };
+    const details = tool.formatApprovalDetails?.(args);
+    const lines = Array.isArray(details) ? details.join("\n") : String(details ?? "");
+    expect(lines).toContain("Fixture form");
+    expect(lines).toContain("https://example.com/form");
+    expect(lines).toContain("click");
+    expect(lines).toContain('button "Save changes"');
+    // A ref the last snapshot did not name is echoed as-is instead of being called a role.
+    const unknown = tool.formatApprovalDetails?.({ tabKey: TAB_KEY, action: "click", ref: "zz99.e7" });
+    expect(Array.isArray(unknown) ? unknown.join("\n") : String(unknown)).toContain("ref zz99.e7");
+
+    // 7. The approval itself is a per-call decision: exec tier, always prompting.
+    const approval = tool.approval;
+    const decision = typeof approval === "function" ? approval(args) : approval;
+    expect(decision).toMatchObject({ tier: "exec", policy: "prompt" });
+    if (!decision || typeof decision !== "object" || !("reason" in decision)) {
+      throw new Error("the approval decision carries no reason");
+    }
+    expect(typeof decision.reason).toBe("string");
+    expect(decision.reason).not.toBe("");
+
+    await shutdown(host);
+    await started;
+  } finally {
+    callSpy.mockRestore();
+  }
 }, 30_000);

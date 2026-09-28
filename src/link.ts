@@ -8,11 +8,13 @@
 //        omp    -> {type:"challenge", challenge}
 //        loader -> {type:"auth", mac: HMAC(nonce, "loader:"+challenge), challenge: <loader's own>}
 //        omp    -> {type:"auth", mac: HMAC(nonce, "omp:"+loaderChallenge)}
-//        loader -> {type:"ready", loaderVersion, loaderSha256, zenVersion, platformVersion, zenPid}
-//   4. Requests {id, method, params} are answered with {id, result} or {id, error: {code, message}};
-//      loader events arrive as {type: "event", name, data}; the loader's 5 s liveness frame
-//      {type: "ping", t} is answered with {type: "pong", t}, and any frame type this link does not
-//      know is ignored.
+//        loader -> {type:"ready", loaderVersion, loaderSha256, childSha256, parentSha256, zenVersion,
+//                   platformVersion, zenPid}
+//   4. Requests {id, method, params, deadline} are answered with {id, result} or
+//      {id, error: {code, message}}; `deadline` is the absolute epoch ms after which the loader must
+//      not act on the request at all (see CALL_TIMEOUT_MS); loader events arrive as
+//      {type: "event", name, data}; the loader's 5 s liveness frame {type: "ping", t} is answered with
+//      {type: "pong", t}, and any frame type this link does not know is ignored.
 //   5. Exactly one authenticated connection: any further upgrade is closed with 4009, a pre-auth message
 //      that is not auth with 4002, a bad proof with 4003, Zen's Stop button with 4010, remote control
 //      turned off in Zen with 4011 ("external disconnect", or "disabled permanently" when the user
@@ -37,7 +39,12 @@ const PATH = "/hirozen";
 const HANDOFF_TTL_MS = 60_000;
 /** How long connect() waits for the loader's `ready` frame by default. */
 const CONNECT_TIMEOUT_MS = 90_000;
-/** Default per-command budget; the extension lowers it once BiDi runs (see the wire contract). */
+/**
+ * Default per-command budget when the caller names none. The extension always names one: base work
+ * time plus 125 s for every answer a person still owes (the Hirozen Allow/Deny notice, Firefox's
+ * remote-control dialog). Budget and deadline are the same fact from two sides - this timer ends the
+ * wait locally, and the deadline travels in the frame so the loader refuses to act once it passed.
+ */
 const CALL_TIMEOUT_MS = 150_000;
 
 /**
@@ -45,12 +52,16 @@ const CALL_TIMEOUT_MS = 150_000;
  * `E_AUTH` (the peer failed the loader proof / sent a pre-auth message that is not auth),
  * `E_UNKNOWN` (a reply that does not match the contract), `E_TIMEOUT`, `E_STOPPED`.
  *
- * The loader's V1.1 codes travel the same way: `E_BIDI_LOST` (the BiDi session died mid-call),
- * `E_READ_FAILED` (no usable page data), `E_STOP_FAILED` (its own stop left the agent running),
- * `E_INTERNAL` (an unexpected loader exception) and `E_DISABLED_IN_ZEN` (remote control was disabled
- * permanently in Zen). A close that ends an authenticated link carries no error code: 4010 (Zen's
- * Stop button), 4011 (remote control turned off in Zen, sticky) and 4012 (heartbeat reap, not sticky)
- * arrive as a LinkCloseInfo instead - see stopKindOf.
+ * The loader's own codes travel the same way: `E_DENIED` (the Hirozen Allow/Deny notice was denied or
+ * unanswered), `E_DEADLINE` (omp's budget passed before the loader acted; nothing was done),
+ * `E_REF_STALE` (the element ref came from an older document), `E_NOT_INTERACTABLE` (disabled,
+ * zero-size, or a file-input mismatch), `E_BAD_PARAMS`, `E_LAYOUT_REFUSED` (Zen refused the layout
+ * change), `E_NO_DIALOG`, `E_ACTOR` (the actor is not registered in Zen), `E_READ_FAILED` (no usable
+ * page data), `E_BIDI_LOST` (the BiDi session died mid-call, upload/dialog only), `E_PORT_BUSY`,
+ * `E_COMPROMISE`, `E_DISABLED_IN_ZEN`, `E_SYSTEM_ACCESS`, `E_STOP_FAILED` and `E_INTERNAL`.
+ * A close that ends an authenticated link carries no error code: 4010 (Zen's Stop button), 4011
+ * (remote control turned off in Zen, sticky) and 4012 (heartbeat reap, not sticky) arrive as a
+ * LinkCloseInfo instead - see stopKindOf.
  */
 export class HirozenError extends Error {
   readonly code: string;
@@ -69,7 +80,10 @@ export class HirozenError extends Error {
 export type ReadyFrame = {
   type: "ready";
   loaderVersion: string;
+  /** sha256 of the installed loader module, child actor and parent actor the loader is running. */
   loaderSha256: string;
+  childSha256: string;
+  parentSha256: string;
   zenVersion: string;
   platformVersion: string;
   zenPid: number;
@@ -87,13 +101,21 @@ export type HandoffFile = {
 /** `hirozen-status.json` as written by the loader (every field optional: it may be read mid-write). */
 export type ZenStatus = {
   version?: string;
+  /** sha256 of the three modules the running loader is executing. */
   loaderSha256?: string;
+  childSha256?: string;
+  parentSha256?: string;
   zenPid?: number;
   state?: "dormant" | "authenticating" | "connected" | "stopping";
   mode?: "startup" | "attach";
   updated?: string;
   lastHandoff?: { pid?: number; cwd?: string; at?: string };
   bidi?: { state?: "off" | "starting" | "running"; port?: number; sessionId?: string };
+  /** The Hirozen gate's granted scope, and what a pending Allow/Deny notice is asking for. */
+  consent?: "none" | "read" | "act";
+  consentPending?: null | "read" | "act";
+  /** The actor registration failure, if any; it is not cleared by a BiDi start. */
+  actorError?: { code?: string; message?: string; at?: string };
   lastClose?: string;
   lastStopError?: string;
   /** The last failed BiDi start, kept so a refused call explains itself later. */
@@ -126,7 +148,10 @@ export type ConnectOptions = {
 };
 
 export type CallOptions = {
-  /** Command budget. Default 150 s (the loader's own upload/start window). */
+  /**
+   * Command budget in ms: base work time plus every answer a person still owes. Default 150 s. It
+   * ends the local wait and, cut from the same value, the `deadline` the loader honours.
+   */
   timeoutMs?: number;
   /** Cancels the call; the loader keeps working on it (a retry joins its single-flight start). */
   signal?: AbortSignal;
@@ -368,6 +393,9 @@ export class ZenLink {
 
     const timeoutMs = options.timeoutMs ?? CALL_TIMEOUT_MS;
     const id = this.#nextId++;
+    // Same instant as the local timer, sent along: a frame can sit in a pending gate or a BiDi start
+    // for minutes, and the loader must not act on it after omp has already given up.
+    const deadline = Date.now() + timeoutMs;
     const { promise, resolve, reject } = Promise.withResolvers<T>();
     const timer = setTimeout(() => {
       this.#take(id)?.reject(new HirozenError("E_TIMEOUT", `${method} timed out after ${timeoutMs} ms`));
@@ -382,7 +410,7 @@ export class ZenLink {
       timer,
       cleanup: () => signal?.removeEventListener("abort", onAbort),
     });
-    socket.send(JSON.stringify({ id, method, params }));
+    socket.send(JSON.stringify({ id, method, params, deadline }));
     return promise;
   }
 

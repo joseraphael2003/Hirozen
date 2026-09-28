@@ -1,4 +1,10 @@
-// Hirozen omp extension: read-only Zen browser tools over the Hirozen loader link (blob: src/link.ts).
+// Hirozen omp extension: Zen browser tools over the Hirozen loader link (blob: src/link.ts).
+//
+// V2 is loader-first: reads, screenshots, snapshots, page input and Zen layout run through the
+// loader's own JSWindowActor and gZen* code, so nothing here starts WebDriver BiDi except
+// browser_upload and browser_dialog. Consent comes from the loader's in-Zen Allow/Deny gate; this
+// plugin mirrors the scope it reports into each call's budget and into a terminal hint ("click Allow
+// in Zen"), which is the only sign in omp while a person still has to answer in Zen.
 //
 // The factory body registers only (tools, commands, lifecycle handlers): omp also loads extensions
 // during `omp plugin install` validation and re-runs the factory inside every subagent, so load time
@@ -6,28 +12,43 @@
 // which is also the only instance that registers the session_shutdown teardown.
 //
 // Every tool checks in the plan's fixed order: root/UI -> sticky stop -> config -> connect.
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 
 import { attachNow } from "./attach";
 import { type VerifyResult, install, sha256File, verify } from "./install";
-import { HirozenError, type LinkCloseInfo, type LoaderEvent, type StopKind, ZenLink, readStatusFile } from "./link";
+import {
+  HirozenError,
+  type LinkCloseInfo,
+  type LoaderEvent,
+  type ReadyFrame,
+  type StopKind,
+  ZenLink,
+  readStatusFile,
+} from "./link";
 
-/** `loader/loader.sys.mjs` in this checkout: the hash install() pins and the running loader must report. */
+/** The three loader modules in this checkout: the hashes install() pins and the running loader reports. */
 const LOADER_SOURCE = fileURLToPath(new URL("../loader/loader.sys.mjs", import.meta.url));
+const CHILD_SOURCE = fileURLToPath(new URL("../loader/HirozenChild.sys.mjs", import.meta.url));
+const PARENT_SOURCE = fileURLToPath(new URL("../loader/HirozenParent.sys.mjs", import.meta.url));
 
-// BiDi is started by the loader on the first browser.* call; the Zen "Allow remote control?" prompt
-// has no timeout of its own, so consent deserves a long budget and every command after it a short one.
-const CONSENT_TIMEOUT_MS = 150_000;
-const RUNNING_TIMEOUT_MS = 15_000;
-/** Repeat the "click Allow" notice while the dialog is still unanswered. */
+// A call's budget is the work it does plus 125 s for every answer a person still owes in Zen: the
+// Hirozen Allow/Deny notice (the loader gives it 120 s) and Firefox's own remote-control dialog,
+// which has no timeout at all. The same instant travels to the loader as an absolute deadline, so an
+// answer that arrives too late never turns into an action omp has already given up on.
+const BASE_BUDGET_MS = 15_000;
+/** Upload marks, locates, sets and unmarks: four bounded steps plus margin. */
+const UPLOAD_BUDGET_MS = 45_000;
+const PERSON_WAIT_MS = 125_000;
+/** Repeat a "a person still has to answer in Zen" notice while they have not. */
 const CONSENT_REPEAT_MS = 60_000;
 
+/** Only the on-demand BiDi path (upload/dialog) still shows Firefox's dialog. */
 const CONSENT_NOTICE =
-  'Zen is showing the "Allow remote control?" dialog — click Allow so omp can read this Zen session.';
+  'Zen is showing the "Allow remote control?" dialog — click Allow so omp can upload files or answer page dialogs.';
 
 /** Per-kind wording of a sticky stop; the tool refusal, the notice and /hirozen-status all use it. */
 const STOP_TEXT: Record<StopKind, string> = {
@@ -51,16 +72,28 @@ const PLUGIN_CODES: Record<string, true> = {
 
 /** Plain-English gloss per loader code, followed by the loader's own message. */
 const CODE_TEXT: Record<string, string> = {
+  E_ACTOR:
+    "the Hirozen actor is not registered in Zen, so no page action can run; restart Zen after /hirozen-install",
+  E_BAD_PARAMS: "the call's parameters were not usable (see the message)",
   E_BIDI_LOST: "the remote-control (BiDi) session was lost mid-call — the socket or the browser session went away",
   E_COMPROMISE: "another debugger had already started remote control in Zen; Hirozen stopped it and refused to continue",
-  E_DENIED: "the remote-control prompt was denied in Zen",
+  E_DEADLINE:
+    "omp gave up before Zen answered, so nothing was done; retry when the person at Zen is ready (this is not a page failure)",
+  E_DENIED: "the prompt in Zen was denied - Hirozen's Allow/Deny notice, or Firefox's remote-control dialog",
   E_DISABLED_IN_ZEN:
-    "remote control was disabled permanently in Zen; re-enable remote.experimental.dynamicstart.enabled in about:config to use browser_* again",
+    "remote control was disabled permanently in Zen; re-enable remote.experimental.dynamicstart.enabled in about:config to use browser_upload / browser_dialog",
   E_INTERNAL: "the Zen loader hit an unexpected internal error",
+  E_LAYOUT_REFUSED:
+    "Zen refused that layout change; splits never include the selected tab or a pinned/essential/hidden tab, and the space must exist",
+  E_NO_DIALOG: "that tab has no page dialog open, so there is nothing to answer",
+  E_NOT_INTERACTABLE:
+    "that element cannot take this action (disabled, zero-size, not a file input, or a file input that takes fewer files)",
   E_PORT_BUSY: "127.0.0.1:9222 cannot be bound - the port is in use by another program or reserved by Windows (check `netsh int ipv4 show excludedportrange protocol=tcp`); Zen was left untouched",
   E_PRIVATE: "that tab is in a private window, which Hirozen never touches",
-  E_PRIVILEGED_PAGE: "that tab is a privileged page, which Hirozen refuses to read",
+  E_PRIVILEGED_PAGE: "that tab is a privileged page, which Hirozen never reads or acts on",
   E_READ_FAILED: "the loader returned no usable page data (the page may still be loading, crashed or reloading)",
+  E_REF_STALE:
+    "that element reference is from an older page (or the element is gone); take a fresh browser_snapshot and retry",
   E_STOP_FAILED: "Hirozen's own remote-control stop failed; the session may still be up in Zen",
   E_STOPPED: "the loader dropped the session (fail-closed); retry, or run /hirozen-connect",
   E_SYSTEM_ACCESS: "MOZ_REMOTE_ALLOW_SYSTEM_ACCESS is set; Hirozen refuses to start remote control with system access",
@@ -88,9 +121,58 @@ type ZenWindow = { activeSpace: string | null; spaces: ZenSpace[]; tabs: ZenTab[
 type ZenSpaceWindow = { activeSpace: string | null; spaces: ZenSpace[] };
 type ZenRead = { tabKey: string; url: string; title: string; text: string; truncated: boolean };
 type ZenScreenshot = { tabKey: string; mimeType: string; data: string };
+/** One element of a `browser.snapshot`; `ref` is the handle `browser_act` takes. */
+type ZenElement = {
+  ref: string;
+  role: string;
+  name: string;
+  tag: string;
+  rect: { x: number; y: number; width: number; height: number };
+};
+type ZenSnapshot = { url: string; title: string; elements: ZenElement[]; truncated: boolean };
+/**
+ * What an act/upload/dialog call reports: the page it ended on, a page dialog it ran into (the agent
+ * then uses browser_dialog), and any tab a popup opened that the loader re-homed into the agent space.
+ */
+type ZenActResult = {
+  ok?: boolean;
+  url?: string;
+  title?: string;
+  dialog?: { type?: string; message?: string };
+  opened?: string[];
+};
+type ZenOpen = { tabKey: string; spaceId: string };
+type ZenSplit = { groupId?: string };
+type ZenGlance = { tabKey: string };
+
+/**
+ * The parsed arguments of the V2 tools. omp validates every call against the tool's `parameters`
+ * before it runs, so these are the schemas' output shapes, named here for the approval plumbing.
+ */
+type TabParams = { tabKey: string };
+type UrlParams = { url: string };
+type ActParams = {
+  tabKey: string;
+  action: string;
+  ref?: string;
+  text?: string;
+  key?: string;
+  dy?: number;
+  url?: string;
+};
+type UploadParams = { tabKey: string; ref: string; paths: string[] };
+type DialogParams = { tabKey: string; accept: boolean; text?: string };
+type MoveParams = { tabKey: string; spaceId: string };
+type SplitParams = { tabKeys: string[]; layout: string };
 
 /** A tool-visible failure: the contract's code plus text the model can read. */
 type Failure = { code: string; text: string; details?: Record<string, unknown> };
+
+/** The gate scope the loader reported for this link, and what a pending notice is asking for. */
+type GateScope = "none" | "read" | "act";
+
+/** A person has to answer something in Zen before the call can proceed. */
+type PersonWait = "gate" | "bidi";
 
 // ---------------------------------------------------------------------------------------------
 // Link lifecycle (module state is per process, which is where the root session lives)
@@ -107,7 +189,16 @@ let connectPromise: Promise<ZenLink> | null = null;
  */
 let connectGen = 0;
 let bidiPhase: "off" | "starting" | "running" = "off";
+/** Cancels the armed repeat of whichever person-wait notice is showing. */
 let consentRepeat: (() => void) | null = null;
+/** The scope the loader granted this link; the budget for a call depends on it. Reset with the link. */
+let consentScope: GateScope = "none";
+/** What the pending Allow/Deny notice asks for, or null when nothing waits on a person. */
+let consentPending: "read" | "act" | null = null;
+/** Per-tabKey title/URL the plugin last saw, so an approval prompt can name the tab it acts on. */
+const knownTabs = new Map<string, { title: string; url: string }>();
+/** Per-tabKey elements of the last browser_snapshot, so a prompt can name the ref it acts on. */
+const snapshotRefs = new Map<string, Map<string, { role: string; name: string }>>();
 /** Set by an in-Zen stop (close 4010/4011); only /hirozen-connect and /hirozen-attach clear it. */
 let stopKind: StopKind | null = null;
 let teardownHooked = false;
@@ -117,11 +208,19 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** The readable half of an error: plugin codes keep their message, loader codes get a gloss first. */
-function describeError(error: unknown): Failure {
+/**
+ * The readable half of an error: plugin codes keep their message, loader codes get a gloss first.
+ * `firefoxDialog` marks the calls that may be waiting for Firefox's remote-control dialog (upload and
+ * dialog, and only while BiDi is not running): a timeout there is that dialog still being open, which
+ * is something the user can fix, not a browser failure.
+ */
+function describeError(error: unknown, firefoxDialog = false): Failure {
   if (!(error instanceof HirozenError)) return { code: "E_UNKNOWN", text: messageOf(error) };
   const { code, message } = error;
   const details = error.pid === undefined ? undefined : { pid: error.pid };
+  if (firefoxDialog && code === "E_TIMEOUT") {
+    return { code, text: 'the Zen "Allow remote control?" dialog is still open; answer it, then retry', details };
+  }
   if (PLUGIN_CODES[code] === true) {
     if (code === "E_AUTH") {
       return { code, text: `another program answered the handoff; not the Hirozen loader — ${message}`, details };
@@ -184,39 +283,78 @@ function clearConsentNotice(): void {
   consentRepeat = null;
 }
 
-function notifyConsent(ctx: ExtensionContext, repeated: boolean): void {
-  ctx.ui.notify(`Hirozen: ${repeated ? "still waiting — " : ""}${CONSENT_NOTICE}`, "warning");
-}
-
-/** BiDi left "off": the consent dialog is being shown for the first time, so tell the user. */
-function announceConsent(): void {
-  const ctx = linkCtx;
-  if (!ctx) return;
-  notifyConsent(ctx, false);
-  armConsentRepeat(ctx);
+/** The terminal half of a person-wait: the Hirozen gate prompt, or Firefox's remote-control dialog. */
+function notifyPersonWait(ctx: ExtensionContext, what: PersonWait, repeated: boolean): void {
+  const prefix = `Hirozen: ${repeated ? "still waiting — " : ""}`;
+  if (what === "gate") {
+    const scope = consentPending ?? "read";
+    ctx.ui.notify(
+      `${prefix}click Allow in Zen to let omp ${scope === "act" ? "read and act on pages" : "read pages"} (Deny refuses).`,
+      "warning",
+    );
+    return;
+  }
+  ctx.ui.notify(`${prefix}${CONSENT_NOTICE}`, "warning");
 }
 
 /**
- * Remind again every CONSENT_REPEAT_MS for as long as the dialog is unanswered. A start that failed
- * (E_DENIED and friends) reaches the extension as `bidi.off`, and `bidi.running` means consent was
- * granted: either one clears the reminder.
+ * Remind again every CONSENT_REPEAT_MS for as long as the person has not answered. The predicate is
+ * re-checked when the timer fires, so `consent.granted`/`consent.denied` (or BiDi landing) end the
+ * repeat without racing this timer; both waits share the single slot because BiDi only starts after
+ * the act scope was granted, so the two can never overlap.
  */
-function armConsentRepeat(ctx: ExtensionContext): void {
-  clearConsentNotice();
+function armPersonWaitNotice(ctx: ExtensionContext, what: PersonWait): void {
+  consentRepeat?.();
   consentRepeat = scheduleOnce(ctx, CONSENT_REPEAT_MS, () => {
     consentRepeat = null;
-    if (bidiPhase !== "starting") return;
-    notifyConsent(ctx, true);
-    armConsentRepeat(ctx);
+    const stillWaiting = what === "gate" ? consentPending !== null : bidiPhase === "starting";
+    if (!stillWaiting) return;
+    notifyPersonWait(ctx, what, true);
+    armPersonWaitNotice(ctx, what);
   });
 }
 
-/** The loader emits `bidi.starting` again for every call that joins the pending start: notify once. */
+/** A person has to answer something in Zen before a call can proceed: say what, then remind. */
+function announcePersonWait(what: PersonWait): void {
+  const ctx = linkCtx;
+  if (!ctx) return;
+  notifyPersonWait(ctx, what, false);
+  armPersonWaitNotice(ctx, what);
+}
+
+/** The `scope` of a `consent.*` event, or null when the loader sent something this plugin cannot use. */
+function eventScope(data: unknown): "read" | "act" | null {
+  if (!data || typeof data !== "object" || !("scope" in data)) return null;
+  const scope = data.scope;
+  return scope === "read" || scope === "act" ? scope : null;
+}
+
+/** Loader events: the consent gate (whose scope drives every budget) plus the BiDi phase. */
 function handleLoaderEvent(event: LoaderEvent): void {
+  if (event.name === "consent.pending") {
+    // The loader upgrades a pending read prompt in place, so this also fires for an act upgrade.
+    consentPending = eventScope(event.data) ?? "read";
+    announcePersonWait("gate");
+    return;
+  }
+  if (event.name === "consent.granted") {
+    const scope = eventScope(event.data);
+    if (scope === null) return;
+    consentScope = scope;
+    consentPending = null;
+    clearConsentNotice();
+    return;
+  }
+  if (event.name === "consent.denied") {
+    consentPending = null;
+    clearConsentNotice();
+    if (linkCtx) linkCtx.ui.notify("Hirozen: denied in Zen.", "warning");
+    return;
+  }
   if (event.name === "bidi.starting") {
     if (bidiPhase !== "starting") {
       bidiPhase = "starting";
-      announceConsent();
+      announcePersonWait("bidi");
     }
     return;
   }
@@ -237,6 +375,12 @@ function releaseLink(): void {
   linkCtx = null;
   connectPromise = null;
   bidiPhase = "off";
+  // The gate belongs to the loader, which clears it with the link: a new link starts at "none" and
+  // must ask again. The caches describe what that link last saw, so they go with it.
+  consentScope = "none";
+  consentPending = null;
+  knownTabs.clear();
+  snapshotRefs.clear();
   clearConsentNotice();
 }
 
@@ -260,6 +404,31 @@ function shutdownLink(): void {
   current?.close();
 }
 
+/**
+ * The `ready` frame names the three modules the loader is running. Every one of them has to be this
+ * checkout's copy: a loader newer than its actor (or the reverse) is the V1 stale-loader failure, one
+ * module at a time. Returns the problem, or null when all three match.
+ */
+function staleLoader(ready: ReadyFrame): string | null {
+  const modules: [name: string, source: string, reported: string | undefined][] = [
+    ["loader.sys.mjs", LOADER_SOURCE, ready.loaderSha256],
+    ["HirozenChild.sys.mjs", CHILD_SOURCE, ready.childSha256],
+    ["HirozenParent.sys.mjs", PARENT_SOURCE, ready.parentSha256],
+  ];
+  for (const [name, source, reported] of modules) {
+    let sha: string;
+    try {
+      sha = sha256File(source);
+    } catch (error) {
+      return `cannot hash the plugin ${name} at ${source} (${messageOf(error)})`;
+    }
+    if (reported !== sha) {
+      return `the running ${name} reports sha256 ${reported ?? "(nothing)"}, this plugin ships ${sha}`;
+    }
+  }
+  return null;
+}
+
 /** Verify the installed copy, connect single-flight, then check the identity the loader reported. */
 function ensureLink(pi: ExtensionAPI, ctx: ExtensionContext, config: HirozenConfig): Promise<ZenLink> {
   if (link) return Promise.resolve(link);
@@ -276,22 +445,10 @@ function ensureLink(pi: ExtensionAPI, ctx: ExtensionContext, config: HirozenConf
       // one releases nothing.
       const fresh = new ZenLink({ onEvent: handleLoaderEvent, onClose: info => handleLinkClose(fresh, info) });
       const ready = await fresh.connect(config.profileDir);
-      let sourceSha: string;
-      try {
-        sourceSha = sha256File(LOADER_SOURCE);
-      } catch (error) {
+      const stale = staleLoader(ready);
+      if (stale !== null) {
         fresh.close();
-        throw new HirozenError(
-          "E_STALE_LOADER",
-          `cannot hash the plugin loader at ${LOADER_SOURCE} (${messageOf(error)}); run /hirozen-install, restart Zen`,
-        );
-      }
-      if (ready.loaderSha256 !== sourceSha) {
-        fresh.close();
-        throw new HirozenError(
-          "E_STALE_LOADER",
-          `the running loader reports sha256 ${ready.loaderSha256}, this plugin ships ${sourceSha}; run /hirozen-install, restart Zen`,
-        );
+        throw new HirozenError("E_STALE_LOADER", `${stale}; run /hirozen-install, restart Zen`);
       }
       if (generation !== connectGen) {
         // session_shutdown, or a newer attempt, ran while this one was connecting: this link was never
@@ -433,7 +590,7 @@ function renderInventory(windows: ZenWindow[]): string {
     }
   });
   lines.push(
-    'Pass a tabKey to browser_read / browser_screenshot. "lazy" tabs have no document yet and tabs in a non-active space are unreachable: Hirozen never loads, activates or switches anything.',
+    'Pass a tabKey to browser_read, browser_screenshot, browser_snapshot, browser_act, browser_upload and the zen_* layout tools. "lazy" tabs have no document yet and tabs in a non-active space are unreachable except the Hirozen Agent space: Hirozen never loads or activates anything.',
   );
   return lines.join("\n");
 }
@@ -455,12 +612,70 @@ function renderSpaces(windows: ZenSpaceWindow[]): string {
 // Tools
 // ---------------------------------------------------------------------------------------------
 
+/** How much of a URL the header echoes: a `data:` URL can be tens of thousands of characters long. */
+const URL_HEADER_CAP = 300;
+
+/** `# <title>\n<url>` with the URL capped, so one page cannot flood the terminal. */
+function pageHeader(url: string, title: string): string {
+  const shown = url.length > URL_HEADER_CAP ? `${url.slice(0, URL_HEADER_CAP)}…` : url;
+  return `# ${title}\n${shown}`;
+}
+
+/** How strong a granted scope is; a call waits for a person while its own requirement is above it. */
+const SCOPE_RANK: Record<GateScope, number> = { none: 0, read: 1, act: 2 };
+
+/**
+ * The omp-side budget for one call: base work time plus 125 s for every answer a person still owes -
+ * the Hirozen Allow/Deny notice whenever the granted scope is below what the call needs, and
+ * Firefox's remote-control dialog when upload/dialog has to start BiDi first. The loader receives the
+ * same instant as an absolute deadline and refuses to act once it passed, so a late answer never turns
+ * into an action omp has already given up on.
+ */
+function callBudget(needs: "read" | "act", baseMs = BASE_BUDGET_MS, startsBidi = false): number {
+  let budget = baseMs;
+  if (SCOPE_RANK[consentScope] < SCOPE_RANK[needs]) budget += PERSON_WAIT_MS;
+  if (startsBidi && bidiPhase !== "running") budget += PERSON_WAIT_MS;
+  return budget;
+}
+
+/** Remember what a page call just reported, so a later approval prompt can name that tab. */
+function rememberTab(tabKey: string, page: { title?: string; url?: string }): void {
+  if (typeof page.title !== "string" && typeof page.url !== "string") return;
+  const known = knownTabs.get(tabKey);
+  knownTabs.set(tabKey, { title: page.title ?? known?.title ?? "", url: page.url ?? known?.url ?? "" });
+}
+
+/** The tab an approval prompt acts on: `<title> — <url>`, or `unknown tab` before zen_tabs saw it. */
+function describeTab(tabKey: string): string {
+  const known = knownTabs.get(tabKey);
+  if (!known) return `unknown tab (${tabKey})`;
+  return `${known.title} — ${known.url}`;
+}
+
+/** `role "name"` for a ref the tab's last snapshot named, or `ref <ref>` when it did not. */
+function describeRef(tabKey: string, ref: string | undefined): string | null {
+  if (!ref) return null;
+  const element = snapshotRefs.get(tabKey)?.get(ref);
+  if (!element) return `ref ${ref}`;
+  return `${element.role} "${element.name}"`;
+}
+
+/** A timeout while Firefox's own dialog may still be open is something the user can fix, not a failure. */
+function failCall(error: unknown, firefoxDialog: boolean): AgentToolResult<unknown> {
+  return fail(describeError(error, firefoxDialog));
+}
+
 async function runZenTabs(pi: ExtensionAPI, ctx: ExtensionContext, signal?: AbortSignal): Promise<AgentToolResult<unknown>> {
   const access = await requireLink(pi, ctx);
   if ("failure" in access) return fail(access.failure);
   try {
     const windows = await access.link.call<ZenWindow[]>("zen.inventory", {}, { signal });
     const tabCount = windows.reduce((count, window) => count + window.tabs.length, 0);
+    // The inventory is the plugin's tab directory: an approval prompt for a tabKey it named can show
+    // the tab's title and URL even before any page tool ran on it.
+    for (const window of windows) {
+      for (const tab of window.tabs) rememberTab(tab.tabKey, { title: tab.title, url: tab.url });
+    }
     return {
       content: [{ type: "text", text: renderInventory(windows) }],
       details: { windowCount: windows.length, tabCount, windows },
@@ -484,25 +699,9 @@ async function runZenSpaces(pi: ExtensionAPI, ctx: ExtensionContext, signal?: Ab
   }
 }
 
-/** A timeout while BiDi was off/starting is the consent dialog still being open, not a failure. */
-function failCall(error: unknown, consentBudget: boolean): AgentToolResult<unknown> {
-  const described = describeError(error);
-  if (described.code === "E_TIMEOUT" && consentBudget) {
-    return fail({
-      code: "E_TIMEOUT",
-      text: 'the Zen "Allow remote control?" dialog is still open; answer it, then retry',
-    });
-  }
-  return fail(described);
-}
-
-/** How much of a URL the header echoes: a `data:` URL can be tens of thousands of characters long. */
-const URL_HEADER_CAP = 300;
-
-/** `# <title>\n<url>\n\n<text>` with the URL capped, so one page cannot flood the terminal. */
+/** `# <title>\n<url>\n\n<text>`; the header is capped so one page cannot flood the terminal. */
 function renderRead(page: ZenRead): string {
-  const url = page.url.length > URL_HEADER_CAP ? `${page.url.slice(0, URL_HEADER_CAP)}…` : page.url;
-  return `# ${page.title}\n${url}\n\n${page.text}`;
+  return `${pageHeader(page.url, page.title)}\n\n${page.text}`;
 }
 
 async function runBrowserRead(
@@ -513,16 +712,15 @@ async function runBrowserRead(
 ): Promise<AgentToolResult<unknown>> {
   const access = await requireLink(pi, ctx);
   if ("failure" in access) return fail(access.failure);
-  const consentBudget = bidiPhase !== "running";
-  const timeoutMs = consentBudget ? CONSENT_TIMEOUT_MS : RUNNING_TIMEOUT_MS;
   try {
-    const page = await access.link.call<ZenRead>("browser.read", { tabKey }, { timeoutMs, signal });
+    const page = await access.link.call<ZenRead>("browser.read", { tabKey }, { timeoutMs: callBudget("read"), signal });
+    rememberTab(tabKey, page);
     return {
       content: [{ type: "text", text: renderRead(page) }],
       details: { tabKey: page.tabKey, url: page.url, title: page.title, truncated: page.truncated, chars: page.text.length },
     };
   } catch (error) {
-    return failCall(error, consentBudget);
+    return fail(describeError(error));
   }
 }
 
@@ -534,10 +732,8 @@ async function runBrowserScreenshot(
 ): Promise<AgentToolResult<unknown>> {
   const access = await requireLink(pi, ctx);
   if ("failure" in access) return fail(access.failure);
-  const consentBudget = bidiPhase !== "running";
-  const timeoutMs = consentBudget ? CONSENT_TIMEOUT_MS : RUNNING_TIMEOUT_MS;
   try {
-    const shot = await access.link.call<ZenScreenshot>("browser.screenshot", { tabKey }, { timeoutMs, signal });
+    const shot = await access.link.call<ZenScreenshot>("browser.screenshot", { tabKey }, { timeoutMs: callBudget("read"), signal });
     if (typeof shot.data !== "string" || shot.data === "") {
       return fail({ code: "E_UNKNOWN", text: "the loader returned no image data for that tab" });
     }
@@ -549,8 +745,405 @@ async function runBrowserScreenshot(
       details: { tabKey: shot.tabKey, mimeType: "image/png", bytes: shot.data.length },
     };
   } catch (error) {
-    return failCall(error, consentBudget);
+    return fail(describeError(error));
   }
+}
+
+/** One element per line: the ref the agent acts with, then the role and name a person would see. */
+function renderSnapshot(snapshot: ZenSnapshot, elements: ZenElement[]): string {
+  const lines = [pageHeader(snapshot.url, snapshot.title), "", `${elements.length} element(s):`];
+  for (const element of elements) {
+    lines.push(`- ${element.ref} ${element.role} ${element.name === "" ? "(no name)" : `"${element.name}"`} [${element.tag}]`);
+  }
+  if (snapshot.truncated) {
+    lines.push("", "The list stops at 400 elements; scroll the page or narrow it, then snapshot again.");
+  }
+  lines.push("", "A ref belongs to the document it came from: after a navigation or reload, snapshot again.");
+  return lines.join("\n");
+}
+
+async function runBrowserSnapshot(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  tabKey: string,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  try {
+    const snapshot = await access.link.call<ZenSnapshot>("browser.snapshot", { tabKey }, { timeoutMs: callBudget("read"), signal });
+    const elements = Array.isArray(snapshot.elements) ? snapshot.elements : [];
+    rememberTab(tabKey, snapshot);
+    // The last snapshot per tab is what an approval prompt reads to turn a ref into `role "name"`.
+    snapshotRefs.set(tabKey, new Map(elements.map(element => [element.ref, { role: element.role, name: element.name }])));
+    return {
+      content: [{ type: "text", text: renderSnapshot(snapshot, elements) }],
+      details: {
+        tabKey,
+        url: snapshot.url,
+        title: snapshot.title,
+        elementCount: elements.length,
+        truncated: snapshot.truncated === true,
+      },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+
+/** What an act/upload/dialog call reports, plus anything the agent has to follow up on. */
+function renderActOutcome(verb: string, tabKey: string, result: ZenActResult): string {
+  const lines = [`${verb} in tab ${tabKey}.`];
+  if (typeof result.url === "string" || typeof result.title === "string") {
+    lines.push(pageHeader(result.url ?? "", result.title ?? ""));
+  }
+  if (result.dialog) {
+    lines.push(`A page dialog is open (${result.dialog.type ?? "dialog"}): ${result.dialog.message ?? ""}`.trimEnd());
+    lines.push("Answer it with browser_dialog.");
+  }
+  if (Array.isArray(result.opened) && result.opened.length > 0) {
+    lines.push(`Opened tab(s), moved to the Hirozen Agent space: ${result.opened.join(", ")}`);
+  }
+  return lines.join("\n");
+}
+
+async function runBrowserAct(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  params: ActParams,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  try {
+    const result = await access.link.call<ZenActResult>(
+      "browser.act",
+      {
+        tabKey: params.tabKey,
+        action: params.action,
+        ref: params.ref,
+        text: params.text,
+        key: params.key,
+        dy: params.dy,
+        url: params.url,
+      },
+      { timeoutMs: callBudget("act"), signal },
+    );
+    rememberTab(params.tabKey, result);
+    return {
+      content: [{ type: "text", text: renderActOutcome(params.action, params.tabKey, result) }],
+      details: {
+        tabKey: params.tabKey,
+        action: params.action,
+        url: result.url,
+        title: result.title,
+        dialog: result.dialog ?? null,
+        opened: result.opened ?? [],
+      },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+
+/** Files are read by Zen, not by omp: every path must be absolute and must exist here first. */
+function absoluteUploadPaths(cwd: string, paths: string[]): { ok: true; paths: string[] } | { ok: false; missing: string } {
+  const resolved: string[] = [];
+  for (const given of paths) {
+    const full = resolve(cwd, given);
+    if (!existsSync(full)) return { ok: false, missing: full };
+    resolved.push(full);
+  }
+  return { ok: true, paths: resolved };
+}
+
+async function runBrowserUpload(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  params: UploadParams,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  const resolved = absoluteUploadPaths(ctx.cwd, params.paths);
+  if (!resolved.ok) {
+    return fail({ code: "E_BAD_PARAMS", text: `no such file to upload: ${resolved.missing}` });
+  }
+  const startsBidi = bidiPhase !== "running";
+  try {
+    const result = await access.link.call<ZenActResult>(
+      "browser.upload",
+      { tabKey: params.tabKey, ref: params.ref, paths: resolved.paths },
+      { timeoutMs: callBudget("act", UPLOAD_BUDGET_MS, true), signal },
+    );
+    rememberTab(params.tabKey, result);
+    return {
+      content: [{ type: "text", text: renderActOutcome(`Uploaded ${resolved.paths.length} file(s)`, params.tabKey, result) }],
+      details: { tabKey: params.tabKey, ref: params.ref, paths: resolved.paths, url: result.url, title: result.title },
+    };
+  } catch (error) {
+    return failCall(error, startsBidi);
+  }
+}
+
+async function runBrowserDialog(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  params: DialogParams,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  const startsBidi = bidiPhase !== "running";
+  try {
+    const result = await access.link.call<ZenActResult>(
+      "browser.dialog",
+      { tabKey: params.tabKey, accept: params.accept, text: params.text },
+      { timeoutMs: callBudget("act", BASE_BUDGET_MS, true), signal },
+    );
+    rememberTab(params.tabKey, result);
+    return {
+      content: [
+        {
+          type: "text",
+          text: renderActOutcome(params.accept ? "Accepted the page dialog" : "Dismissed the page dialog", params.tabKey, result),
+        },
+      ],
+      details: { tabKey: params.tabKey, accept: params.accept, url: result.url, title: result.title },
+    };
+  } catch (error) {
+    return failCall(error, startsBidi);
+  }
+}
+
+async function runZenOpen(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  url: string,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  try {
+    const opened = await access.link.call<ZenOpen>("zen.open", { url }, { timeoutMs: callBudget("act"), signal });
+    rememberTab(opened.tabKey, { url });
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Opened ${url} in tab ${opened.tabKey}, in the "Hirozen Agent" space (space ${opened.spaceId}); the tab is in the background.`,
+        },
+      ],
+      details: { tabKey: opened.tabKey, spaceId: opened.spaceId, url },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+
+async function runZenMove(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  params: MoveParams,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  try {
+    const moved = await access.link.call<ZenOpen>("zen.move", { tabKey: params.tabKey, spaceId: params.spaceId }, { timeoutMs: callBudget("act"), signal });
+    return {
+      content: [{ type: "text", text: `Moved tab ${moved.tabKey} to space ${moved.spaceId}.` }],
+      details: { tabKey: moved.tabKey, spaceId: moved.spaceId },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+
+async function runZenSplit(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  params: SplitParams,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  try {
+    const group = await access.link.call<ZenSplit>(
+      "zen.split",
+      { tabKeys: params.tabKeys, layout: params.layout },
+      { timeoutMs: callBudget("act"), signal },
+    );
+    const tabs = params.tabKeys.join(", ");
+    const id = group.groupId === undefined ? "" : ` (group ${group.groupId})`;
+    return {
+      content: [{ type: "text", text: `Split tabs ${tabs} as ${params.layout}${id}; the selected tab was left alone.` }],
+      details: { tabKeys: params.tabKeys, layout: params.layout, groupId: group.groupId ?? null },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+
+async function runZenUnsplit(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  tabKey: string,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  try {
+    await access.link.call<ZenActResult>("zen.unsplit", { tabKey }, { timeoutMs: callBudget("act"), signal });
+    return {
+      content: [{ type: "text", text: `Removed tab ${tabKey} from its split.` }],
+      details: { tabKey },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+
+async function runZenGlance(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  url: string,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  try {
+    const glance = await access.link.call<ZenGlance>("zen.glance", { url }, { timeoutMs: callBudget("act"), signal });
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Opened ${url} in a glance (tab ${glance.tabKey}); a glance selects itself, which is the one case Hirozen takes the selected tab.`,
+        },
+      ],
+      details: { tabKey: glance.tabKey, url },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+// ---------------------------------------------------------------------------------------------
+// Approval prompts (S3: omp renders these lines under "Allow tool: <name>", even in yolo mode)
+// ---------------------------------------------------------------------------------------------
+
+/** The per-action approval omp enforces before an act-tier tool runs. */
+type ExecApproval = { tier: "exec"; policy: "prompt"; reason: string };
+
+/** The details half of the prompt, as omp reads it (`AgentTool.formatApprovalDetails`). */
+type ApprovalDetails = (args: unknown) => string[];
+
+/** Cap what a prompt echoes: typed text can be 2000 characters, and a URL can be a `data:` URL. */
+const PROMPT_TEXT_CAP = 200;
+
+function clipForPrompt(text: string): string {
+  return text.length > PROMPT_TEXT_CAP ? `${text.slice(0, PROMPT_TEXT_CAP)}… (${text.length} chars)` : text;
+}
+
+/** Every act-tier tool prompts on every call, even in omp's default yolo mode (S3). */
+function execApproval(reason: string): () => ExecApproval {
+  return () => ({ tier: "exec", policy: "prompt", reason });
+}
+
+/** The parsed arguments of a tool, recovered at the approval boundary: omp validated them against the
+ *  tool's `parameters` before the gate, and TypeScript cannot carry that type through `unknown`. */
+function approvalArgs<T>(args: unknown): T {
+  return args as T;
+}
+
+/** browser_act: the tab, the action, and the element a person would see behind the ref. */
+function actApprovalDetails(args: unknown): string[] {
+  const params = approvalArgs<ActParams>(args);
+  const target = describeRef(params.tabKey, params.ref);
+  const lines = [`tab: ${describeTab(params.tabKey)}`];
+  switch (params.action) {
+    case "click":
+      lines.push(`action: click ${target ?? "the page"}`);
+      break;
+    case "type":
+      lines.push(`action: type into ${target ?? "the page"}`, `text: ${clipForPrompt(params.text ?? "")}`);
+      break;
+    case "press":
+      lines.push(`action: press ${params.key ?? "?"}${target ? ` on ${target}` : ""}`);
+      break;
+    case "scroll":
+      lines.push(`action: ${target ? `scroll ${target} into view` : `scroll by ${params.dy ?? 0} px`}`);
+      break;
+    case "navigate":
+      lines.push(`action: navigate to ${params.url ?? "?"}`);
+      break;
+    default:
+      lines.push(`action: ${params.action}`);
+  }
+  return lines;
+}
+
+/** browser_upload: which file input, and every path Zen is about to read. */
+function uploadApprovalDetails(args: unknown): string[] {
+  const params = approvalArgs<UploadParams>(args);
+  const target = describeRef(params.tabKey, params.ref) ?? `ref ${params.ref}`;
+  return [
+    `tab: ${describeTab(params.tabKey)}`,
+    `action: set ${params.paths.length} file(s) on ${target}`,
+    ...params.paths.map(path => `file: ${path}`),
+  ];
+}
+
+/** browser_dialog: accept or dismiss, and the text a prompt dialog would receive. */
+function dialogApprovalDetails(args: unknown): string[] {
+  const params = approvalArgs<DialogParams>(args);
+  const lines = [`tab: ${describeTab(params.tabKey)}`, `action: ${params.accept ? "accept" : "dismiss"} the page dialog`];
+  if (params.text !== undefined && params.text !== "") lines.push(`text: ${clipForPrompt(params.text)}`);
+  return lines;
+}
+
+/** zen_open: the URL that lands in the agent space. */
+function openApprovalDetails(args: unknown): string[] {
+  const params = approvalArgs<UrlParams>(args);
+  return ['action: open a background tab in the "Hirozen Agent" space', `url: ${params.url}`];
+}
+
+/** zen_move: which tab, which space. */
+function moveApprovalDetails(args: unknown): string[] {
+  const params = approvalArgs<MoveParams>(args);
+  return [`tab: ${describeTab(params.tabKey)}`, `action: move to space ${params.spaceId}`];
+}
+
+/** zen_split: every tab that would end up in the layout. */
+function splitApprovalDetails(args: unknown): string[] {
+  const params = approvalArgs<SplitParams>(args);
+  const lines = [`action: split ${params.tabKeys.length} tabs as ${params.layout}`];
+  for (const tabKey of params.tabKeys) lines.push(`tab: ${describeTab(tabKey)}`);
+  return lines;
+}
+
+/** zen_unsplit: the tab leaving its split. */
+function unsplitApprovalDetails(args: unknown): string[] {
+  const params = approvalArgs<TabParams>(args);
+  return [`tab: ${describeTab(params.tabKey)}`, "action: remove from its split"];
+}
+
+/** zen_glance: the URL, and the fact that a glance takes the selected tab (the one exception). */
+function glanceApprovalDetails(args: unknown): string[] {
+  const params = approvalArgs<UrlParams>(args);
+  return ["action: open a glance over the current tab (a glance takes the selected tab)", `url: ${params.url}`];
+}
+
+/**
+ * `registerTool`'s ToolDefinition does not declare `formatApprovalDetails`, but the SDK adapts a
+ * definition into an AgentTool by forwarding every own property (`extensibility/tool-proxy.ts`), and
+ * the approval prompt reads it from there (`tools/approval.ts`; S3 verified the lines render).
+ * Spreading it in here states that in one place, and keeps the definition above it contextually typed.
+ */
+function withApprovalDetails(
+  tool: ToolDefinition,
+  formatApprovalDetails: ApprovalDetails,
+): ToolDefinition & { formatApprovalDetails: ApprovalDetails } {
+  return { ...tool, formatApprovalDetails };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -620,7 +1213,11 @@ function checkInstalled(zenDir: string): { ok: boolean; text: string } {
     return { ok: false, text: messageOf(error) };
   }
   if (!checked.ok) return { ok: false, text: checked.reason };
-  return { ok: true, text: `installed loader == plugin loader, sha256 ${checked.installedSha?.slice(0, 12)}…` };
+  const hashes = checked.installed;
+  const shown = hashes
+    ? `loader ${hashes.loader.slice(0, 12)}…, child ${hashes.child.slice(0, 12)}…, parent ${hashes.parent.slice(0, 12)}…`
+    : `sha256 ${checked.installedSha?.slice(0, 12)}…`;
+  return { ok: true, text: `installed modules == plugin modules (${shown})` };
 }
 
 /** `user_pref("name", value);` lines of a profile's prefs.js, or null when it cannot be read. */
@@ -647,15 +1244,20 @@ function renderStatusFile(profileDir: string): string {
     `mode=${status.mode ?? "?"}`,
     `zenPid=${status.zenPid ?? "?"}`,
     `bidi=${status.bidi?.state ?? "?"}${status.bidi?.port ? `:${status.bidi.port}` : ""}`,
+    `consent=${status.consent ?? "?"}${status.consentPending ? ` (asking: ${status.consentPending})` : ""}`,
     `updated=${status.updated ?? "?"}`,
   ];
   if (status.lastClose) parts.push(`lastClose=${status.lastClose}`);
   if (status.lastStopError) parts.push(`lastStopError=${status.lastStopError}`);
-  if (status.lastStartError) {
-    const { code, message, at } = status.lastStartError;
-    parts.push(`lastStartError=${code ?? "?"}${at ? ` @ ${at}` : ""}${message ? `: ${message}` : ""}`);
-  }
+  if (status.lastStartError) parts.push(formatStatusError("lastStartError", status.lastStartError));
+  if (status.actorError) parts.push(formatStatusError("actorError", status.actorError));
   return parts.join(" ");
+}
+
+/** One `name=code @ at: message` field, used for both the BiDi start error and the actor error. */
+function formatStatusError(name: string, error: { code?: string; message?: string; at?: string }): string {
+  const { code, message, at } = error;
+  return `${name}=${code ?? "?"}${at ? ` @ ${at}` : ""}${message ? `: ${message}` : ""}`;
 }
 
 const DEVTOOLS_PREFS = ["devtools.chrome.enabled", "devtools.debugger.remote-enabled", "devtools.debugger.prompt-connection"];
@@ -696,9 +1298,41 @@ async function runStatusCommand(ctx: ExtensionContext): Promise<void> {
  * does not feed that inference and the handler's `params` silently widens to `unknown`.
  */
 function toolParameters(builder: ExtensionAPI["zod"]) {
+  const tabKey = () => builder.string().describe("tabKey reported by zen_tabs");
   return {
     none: builder.object({}),
-    tabKey: builder.object({ tabKey: builder.string().describe("tabKey reported by zen_tabs") }),
+    tabKey: builder.object({ tabKey: tabKey() }),
+    act: builder.object({
+      tabKey: tabKey(),
+      action: builder.enum(["click", "type", "press", "scroll", "navigate"]).describe("what to do on the tab"),
+      ref: builder.string().optional().describe("element ref from browser_snapshot (click/type/press/scroll target)"),
+      text: builder.string().optional().describe("text to type (action=type)"),
+      key: builder
+        .string()
+        .optional()
+        .describe("key name for action=press: Enter, Tab, Escape, Backspace, arrows, PageUp, PageDown, Home, End"),
+      dy: builder.number().optional().describe("pixels to scroll down (negative up; action=scroll without a ref)"),
+      url: builder.string().optional().describe("http(s) URL to open (action=navigate)"),
+    }),
+    upload: builder.object({
+      tabKey: tabKey(),
+      ref: builder.string().describe("ref of an <input type=file> from browser_snapshot"),
+      paths: builder.array(builder.string()).describe("files to set on the input; relative paths resolve against the omp cwd"),
+    }),
+    dialog: builder.object({
+      tabKey: tabKey(),
+      accept: builder.boolean().describe("true accepts the dialog, false dismisses it"),
+      text: builder.string().optional().describe("text for a prompt() dialog"),
+    }),
+    url: builder.object({ url: builder.string().describe("http(s) URL") }),
+    move: builder.object({
+      tabKey: tabKey(),
+      spaceId: builder.string().describe("space uuid from zen_spaces"),
+    }),
+    split: builder.object({
+      tabKeys: builder.array(tabKey()).describe("2 to 4 tabKeys of the same window; never the selected tab"),
+      layout: builder.enum(["vsep", "hsep", "grid"]).describe("split layout"),
+    }),
   };
 }
 
@@ -758,6 +1392,193 @@ export default function hirozen(pi: ExtensionAPI): void {
     loadMode: "essential",
     execute: (_toolCallId, params, signal, _onUpdate, ctx) => runBrowserScreenshot(pi, ctx, params.tabKey, signal),
   });
+
+  pi.registerTool({
+    name: "browser_snapshot",
+    label: "Snapshot tab",
+    description:
+      "List the interactive elements of one Zen tab by its tabKey (links, buttons, inputs, selects, labelled controls) with a ref for each; browser_act, browser_upload and browser_dialog take those refs (read-only; the tab is never loaded or activated).",
+    parameters: parameters.tabKey,
+    approval: "read",
+    loadMode: "essential",
+    execute: (_toolCallId, params, signal, _onUpdate, ctx) => runBrowserSnapshot(pi, ctx, params.tabKey, signal),
+  });
+
+  pi.registerTool(
+    withApprovalDetails(
+      {
+        name: "browser_act",
+        label: "Act in tab",
+        description:
+          "Act on one Zen tab by its tabKey: click, type, press, scroll or navigate (navigate needs an http(s) url). Refs come from browser_snapshot. The loader's in-Zen Allow/Deny gate must have granted the act scope; every call needs your approval. Refused on privileged pages, in private windows and on tabs in an inactive space that is not the Hirozen Agent space.",
+        parameters: parameters.act,
+        approval: execApproval("browser_act changes a page in Zen (click, type, press, scroll or navigate)."),
+        loadMode: "essential",
+        execute: (
+          _toolCallId: string,
+          params: ActParams,
+          signal: AbortSignal | undefined,
+          _onUpdate: unknown,
+          ctx: ExtensionContext,
+        ) => runBrowserAct(pi, ctx, params, signal),
+      },
+      actApprovalDetails,
+    ),
+  );
+
+  pi.registerTool(
+    withApprovalDetails(
+      {
+        name: "browser_upload",
+        label: "Upload files",
+        description:
+          "Set files on an <input type=file> in one Zen tab (ref from browser_snapshot). This is one of the two tools that start WebDriver BiDi, so Firefox's own \"Allow remote control?\" dialog appears the first time. Paths must exist locally (relative paths resolve against this omp session's cwd).",
+        parameters: parameters.upload,
+        approval: execApproval("browser_upload sets files on a page's file input and starts Firefox's remote control."),
+        loadMode: "essential",
+        execute: (
+          _toolCallId: string,
+          params: UploadParams,
+          signal: AbortSignal | undefined,
+          _onUpdate: unknown,
+          ctx: ExtensionContext,
+        ) => runBrowserUpload(pi, ctx, params, signal),
+      },
+      uploadApprovalDetails,
+    ),
+  );
+
+  pi.registerTool(
+    withApprovalDetails(
+      {
+        name: "browser_dialog",
+        label: "Answer page dialog",
+        description:
+          "Answer the page dialog (alert/confirm/prompt, including beforeunload) that is open in one Zen tab - the one a browser_act reported. One of the two tools that use WebDriver BiDi (Firefox's remote-control dialog); E_NO_DIALOG means the tab has none open.",
+        parameters: parameters.dialog,
+        approval: execApproval("browser_dialog answers a page dialog in Zen and starts Firefox's remote control."),
+        loadMode: "essential",
+        execute: (
+          _toolCallId: string,
+          params: DialogParams,
+          signal: AbortSignal | undefined,
+          _onUpdate: unknown,
+          ctx: ExtensionContext,
+        ) => runBrowserDialog(pi, ctx, params, signal),
+      },
+      dialogApprovalDetails,
+    ),
+  );
+
+  pi.registerTool(
+    withApprovalDetails(
+      {
+        name: "zen_open",
+        label: "Open in agent space",
+        description:
+          'Open an http(s) URL in a new background tab in the "Hirozen Agent" space of Zen\'s most recent normal window. The user\'s space and selected tab are left alone; the returned tabKey can be read, snapshotted and acted on while that space is inactive.',
+        parameters: parameters.url,
+        approval: execApproval('zen_open opens a tab in Zen\'s "Hirozen Agent" space.'),
+        loadMode: "essential",
+        execute: (
+          _toolCallId: string,
+          params: UrlParams,
+          signal: AbortSignal | undefined,
+          _onUpdate: unknown,
+          ctx: ExtensionContext,
+        ) => runZenOpen(pi, ctx, params.url, signal),
+      },
+      openApprovalDetails,
+    ),
+  );
+
+  pi.registerTool(
+    withApprovalDetails(
+      {
+        name: "zen_move",
+        label: "Move tab",
+        description:
+          "Move a tab to another Zen space (spaceId from zen_spaces). Pinned and essential tabs are refused, and Hirozen never switches the user's space.",
+        parameters: parameters.move,
+        approval: execApproval("zen_move moves a tab between Zen spaces."),
+        loadMode: "essential",
+        execute: (
+          _toolCallId: string,
+          params: MoveParams,
+          signal: AbortSignal | undefined,
+          _onUpdate: unknown,
+          ctx: ExtensionContext,
+        ) => runZenMove(pi, ctx, params, signal),
+      },
+      moveApprovalDetails,
+    ),
+  );
+
+  pi.registerTool(
+    withApprovalDetails(
+      {
+        name: "zen_split",
+        label: "Split tabs",
+        description:
+          "Split 2 to 4 tabs of one Zen window into a vsep/hsep/grid layout. The selected tab is never included and stays selected, and pinned, essential or hidden tabs are refused.",
+        parameters: parameters.split,
+        approval: execApproval("zen_split changes Zen's tab layout."),
+        loadMode: "essential",
+        execute: (
+          _toolCallId: string,
+          params: SplitParams,
+          signal: AbortSignal | undefined,
+          _onUpdate: unknown,
+          ctx: ExtensionContext,
+        ) => runZenSplit(pi, ctx, params, signal),
+      },
+      splitApprovalDetails,
+    ),
+  );
+
+  pi.registerTool(
+    withApprovalDetails(
+      {
+        name: "zen_unsplit",
+        label: "Unsplit tab",
+        description:
+          "Remove one tab from its Zen split. Zen dissolves the whole split when fewer than three tabs remain in it.",
+        parameters: parameters.tabKey,
+        approval: execApproval("zen_unsplit removes a tab from its Zen split."),
+        loadMode: "essential",
+        execute: (
+          _toolCallId: string,
+          params: TabParams,
+          signal: AbortSignal | undefined,
+          _onUpdate: unknown,
+          ctx: ExtensionContext,
+        ) => runZenUnsplit(pi, ctx, params.tabKey, signal),
+      },
+      unsplitApprovalDetails,
+    ),
+  );
+
+  pi.registerTool(
+    withApprovalDetails(
+      {
+        name: "zen_glance",
+        label: "Glance",
+        description:
+          "Open an http(s) URL in a Zen glance over the current tab (needs a window without a glance already open). Unlike every other Hirozen tool, a glance selects itself in Zen.",
+        parameters: parameters.url,
+        approval: execApproval("zen_glance opens a Zen glance over the current tab."),
+        loadMode: "essential",
+        execute: (
+          _toolCallId: string,
+          params: UrlParams,
+          signal: AbortSignal | undefined,
+          _onUpdate: unknown,
+          ctx: ExtensionContext,
+        ) => runZenGlance(pi, ctx, params.url, signal),
+      },
+      glanceApprovalDetails,
+    ),
+  );
 
   pi.registerCommand("hirozen-install", {
     description: "Install the Hirozen loader into the Zen install directory (HIROZEN_ZEN_DIR)",
