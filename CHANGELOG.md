@@ -2,6 +2,36 @@
 
 All notable changes to Hirozen are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
+## [0.1.1] - 2026-09-28
+
+Hardening from live QA. Verified on Zen 1.22.3b (Gecko 156.0.1), Windows. The loader changed, so run `/hirozen-install` and restart Zen.
+
+### Added
+
+- **Heartbeat:** the loader pings omp every 5 s and drops a silent omp after 15 s (close 4012). This is not a sticky stop, so the next call reconnects.
+- **Firefox's own remote-control buttons are respected:**
+  - "Disconnect" and "Turn off remote control" end the session (close 4011). It stays stopped until `/hirozen-connect`, the same as Hirozen's Stop.
+  - "Disable remote control permanently" is remembered across restarts: `browser_*` return `E_DISABLED_IN_ZEN` until you re-enable `remote.experimental.dynamicstart.enabled` in about:config.
+- **More specific errors:** `E_BIDI_LOST`, `E_READ_FAILED`, `E_STOP_FAILED` and `E_INTERNAL`. `/hirozen-status` shows the last failed start (`lastStartError`).
+- The terminal reminder to answer Zen's consent dialog repeats every 60 s.
+
+### Changed
+
+- **In-Zen notice:** it has no ✕ and also appears in windows opened while it is shown.
+- **Hirozen resets `remote.experimental.dynamicstart.enabled` only if it set it,** so a value you set yourself is kept.
+
+### Fixed
+
+- omp could lock itself out with `E_IN_USE` naming its own session after a session restart during a connect.
+- The owner check briefly re-reads Zen's status before refusing, so an immediate reconnect after a drop no longer fails.
+- After Firefox's Disconnect, Hirozen no longer reports BiDi as still running or its own stop as failed.
+
+### Known issues
+
+- Firefox's "Turn off" and "Disable permanently" buttons are greyed out while the "Allow remote control?" dialog is open, so they can rarely be clicked.
+- Reconnecting within seconds of Firefox stopping a session that was still waiting for consent can report a false `E_COMPROMISE`.
+- Not yet checked on Firefox 158.0b1 (expected 2026-10-08). On newer Firefox, remote control creates a permanent red "remote-control-container".
+
 ## [0.1.0] - 2026-09-27
 
 First release: read-only access to a running Zen browser from omp. Verified on Zen 1.22.3b (Gecko 156.0.1), Windows.
@@ -28,4 +58,5 @@ First release: read-only access to a running Zen browser from omp. Verified on Z
 - Two one-off results could not be reproduced: a Deny that returned an uncaptured code, and a transient `E_IN_USE` on an immediate reconnect.
 - Not yet validated on a daily profile. Click, type, navigation and Zen layout actions are planned for V2.
 
+[0.1.1]: https://github.com/joseraphael2003/Hirozen/compare/aeb80e4...main
 [0.1.0]: https://github.com/joseraphael2003/Hirozen/commits/main
