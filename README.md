@@ -4,7 +4,7 @@ An [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) plugin that gives the o
 
 The agent can list your tabs and spaces, read page text and take screenshots of the tabs you choose. It cannot click, type or navigate yet; that is planned for V2.
 
-> **Status:** 0.1.0. Verified on Zen 1.22.3b (Gecko 156.0.1) on Windows, on a test install only. See [CHANGELOG.md](CHANGELOG.md).
+> **Status:** 0.1.2. Verified on Zen 1.22.3b (Gecko 156.0.1) on Windows, on a test install only. See [CHANGELOG.md](CHANGELOG.md).
 
 ## How it works
 
@@ -66,6 +66,7 @@ Then run `/hirozen-install` in omp and restart Zen once. Alternatively, use `/hi
 - **Visible.** While connected, every Zen window shows a notice naming the omp process, with a **Stop** button. Stop is sticky until you run `/hirozen-connect`.
 - **Private windows are never exposed.** Tabs are never loaded, activated or closed.
 - **Compromise detection.** If another client already controls Zen's Remote Agent, Hirozen stops it, warns you in Zen and refuses to continue (`E_COMPROMISE`).
+- **Firefox's own controls win.** Firefox's "Disconnect" or "Turn off remote control" ends the session until `/hirozen-connect`. "Disable remote control permanently" is remembered: `browser_*` return `E_DISABLED_IN_ZEN` until you re-enable `remote.experimental.dynamicstart.enabled` in about:config.
 - **Never kills Zen.** It checks port 9222 before starting BiDi. If the port is busy, `zen_*` keep working and `browser_*` return `E_PORT_BUSY`.
 - **Tamper check.** A modified loader is refused at Zen startup and reported by omp as `E_STALE_LOADER`.
 
@@ -97,7 +98,7 @@ Changing `loader/loader.sys.mjs` changes its hash, so run `/hirozen-install` aga
 
 ## Roadmap
 
-- **V2:** clicking, typing and navigation behind omp approvals; Zen layout actions (glance, split view, moving tabs); a fallback when port 9222 is unavailable.
+- **V2 (planned design: loader-first, BiDi on demand):** reading, screenshots and page input move into the Hirozen loader itself, so everyday use needs no port 9222 and no Firefox remote-control dialog; Hirozen shows its own Allow/Deny prompt in Zen instead. WebDriver BiDi is started only for features that need it (file uploads, network inspection, page dialogs). On top of that: clicking, typing and navigation behind omp approvals, a page element snapshot, and Zen layout actions (glance, split view, moving tabs).
 - **Later:** background research tasks in a dedicated space, and support for sites that publish WebMCP tools.
 
 ## License
