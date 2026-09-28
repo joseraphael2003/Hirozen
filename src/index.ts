@@ -1,10 +1,10 @@
 // Hirozen omp extension: Zen browser tools over the Hirozen loader link (blob: src/link.ts).
 //
-// V2 is loader-first: reads, screenshots, snapshots, page input and Zen layout run through the
-// loader's own JSWindowActor and gZen* code, so nothing here starts WebDriver BiDi except
-// browser_upload and browser_dialog. Consent comes from the loader's in-Zen Allow/Deny gate; this
-// plugin mirrors the scope it reports into each call's budget and into a terminal hint ("click Allow
-// in Zen"), which is the only sign in omp while a person still has to answer in Zen.
+// V2 is loader-first: reads, screenshots, snapshots, page input, uploads, page dialogs and Zen layout
+// all run through the loader's own JSWindowActor and gZen* code, so nothing here starts WebDriver
+// BiDi. Consent comes from the loader's in-Zen Allow/Deny gate; this plugin mirrors the scope it
+// reports into each call's budget and into a terminal hint ("click Allow in Zen"), which is the only
+// sign in omp while a person still has to answer in Zen.
 //
 // The factory body registers only (tools, commands, lifecycle handlers): omp also loads extensions
 // during `omp plugin install` validation and re-runs the factory inside every subagent, so load time
@@ -35,28 +35,18 @@ const LOADER_SOURCE = fileURLToPath(new URL("../loader/loader.sys.mjs", import.m
 const CHILD_SOURCE = fileURLToPath(new URL("../loader/HirozenChild.sys.mjs", import.meta.url));
 const PARENT_SOURCE = fileURLToPath(new URL("../loader/HirozenParent.sys.mjs", import.meta.url));
 
-// A call's budget is the work it does plus 125 s for every answer a person still owes in Zen: the
-// Hirozen Allow/Deny notice (the loader gives it 120 s) and Firefox's own remote-control dialog,
-// which has no timeout at all. The same instant travels to the loader as an absolute deadline, so an
-// answer that arrives too late never turns into an action omp has already given up on.
+// A call's budget is 15 s of base work plus 125 s while the loader's in-Zen Allow/Deny notice may
+// still be waiting for an answer (the loader gives it 120 s). The same instant travels to the loader
+// as an absolute deadline, so an answer that arrives too late never turns into an action omp has
+// already given up on.
 const BASE_BUDGET_MS = 15_000;
-/** Upload marks, locates, sets and unmarks: four bounded steps plus margin. */
-const UPLOAD_BUDGET_MS = 45_000;
 const PERSON_WAIT_MS = 125_000;
 /** Repeat a "a person still has to answer in Zen" notice while they have not. */
 const CONSENT_REPEAT_MS = 60_000;
 
-/** Only the on-demand BiDi path (upload/dialog) still shows Firefox's dialog. */
-const CONSENT_NOTICE =
-  'Zen is showing the "Allow remote control?" dialog — click Allow so omp can upload files or answer page dialogs.';
-
 /** Per-kind wording of a sticky stop; the tool refusal, the notice and /hirozen-status all use it. */
 const STOP_TEXT: Record<StopKind, string> = {
   "zen-stop": "the Hirozen session was stopped in Zen — run /hirozen-connect (or /hirozen-attach) to start a new one.",
-  "zen-disconnect":
-    "remote control was turned off in Zen (Disconnect / Turn off remote control) — run /hirozen-connect (or /hirozen-attach) to allow it again.",
-  "zen-disabled":
-    "remote control was disabled permanently in Zen; re-enable remote.experimental.dynamicstart.enabled in about:config, then run /hirozen-connect.",
 };
 
 /** Loader error codes the plugin owns; their message is already written for the user. */
@@ -75,33 +65,25 @@ const CODE_TEXT: Record<string, string> = {
   E_ACTOR:
     "the Hirozen actor is not registered in Zen, so no page action can run; restart Zen after /hirozen-install",
   E_BAD_PARAMS: "the call's parameters were not usable (see the message)",
-  E_BIDI_LOST: "the remote-control (BiDi) session was lost mid-call — the socket or the browser session went away",
-  E_COMPROMISE: "another debugger had already started remote control in Zen; Hirozen stopped it and refused to continue",
   E_DEADLINE:
     "omp gave up before Zen answered, so nothing was done; retry when the person at Zen is ready (this is not a page failure)",
-  E_DENIED: "the prompt in Zen was denied - Hirozen's Allow/Deny notice, or Firefox's remote-control dialog",
-  E_DISABLED_IN_ZEN:
-    "remote control was disabled permanently in Zen; re-enable remote.experimental.dynamicstart.enabled in about:config to use browser_upload / browser_dialog",
+  E_DENIED: "the Hirozen Allow/Deny notice in Zen was denied (or left unanswered)",
   E_INTERNAL: "the Zen loader hit an unexpected internal error",
   E_LAYOUT_REFUSED:
     "Zen refused that layout change; splits never include the selected tab or a pinned/essential/hidden tab, and the space must exist",
   E_NO_DIALOG: "that tab has no page dialog open, so there is nothing to answer",
   E_NOT_INTERACTABLE:
     "that element cannot take this action (disabled, zero-size, not a file input, or a file input that takes fewer files)",
-  E_PORT_BUSY: "127.0.0.1:9222 cannot be bound - the port is in use by another program or reserved by Windows (check `netsh int ipv4 show excludedportrange protocol=tcp`); Zen was left untouched",
   E_PRIVATE: "that tab is in a private window, which Hirozen never touches",
   E_PRIVILEGED_PAGE: "that tab is a privileged page, which Hirozen never reads or acts on",
   E_READ_FAILED: "the loader returned no usable page data (the page may still be loading, crashed or reloading)",
   E_REF_STALE:
     "that element reference is from an older page (or the element is gone); take a fresh browser_snapshot and retry",
-  E_STOP_FAILED: "Hirozen's own remote-control stop failed; the session may still be up in Zen",
   E_STOPPED: "the loader dropped the session (fail-closed); retry, or run /hirozen-connect",
-  E_SYSTEM_ACCESS: "MOZ_REMOTE_ALLOW_SYSTEM_ACCESS is set; Hirozen refuses to start remote control with system access",
   E_TAB_INACTIVE_SPACE: "that tab is in an inactive space, and Hirozen never switches spaces",
   E_TAB_UNKNOWN: "no such tab; list the tabs with zen_tabs",
   E_TAB_UNLOADED: "that tab is not loaded; open it in Zen first (Hirozen never loads tabs)",
   E_UNKNOWN_METHOD: "the installed loader does not support that method; run /hirozen-install, restart Zen",
-  E_UNSAFE_START: "the remote-control start failed Hirozen's safety assertions after the fact",
 };
 
 /** Per-window tab inventory, exactly as `zen.inventory` sends it. */
@@ -171,9 +153,6 @@ type Failure = { code: string; text: string; details?: Record<string, unknown> }
 /** The gate scope the loader reported for this link, and what a pending notice is asking for. */
 type GateScope = "none" | "read" | "act";
 
-/** A person has to answer something in Zen before the call can proceed. */
-type PersonWait = "gate" | "bidi";
-
 // ---------------------------------------------------------------------------------------------
 // Link lifecycle (module state is per process, which is where the root session lives)
 // ---------------------------------------------------------------------------------------------
@@ -188,8 +167,7 @@ let connectPromise: Promise<ZenLink> | null = null;
  * session_shutdown superseded must not touch the state a newer attempt owns (doc §15.1 B).
  */
 let connectGen = 0;
-let bidiPhase: "off" | "starting" | "running" = "off";
-/** Cancels the armed repeat of whichever person-wait notice is showing. */
+/** Cancels the armed repeat of the gate notice while it is showing. */
 let consentRepeat: (() => void) | null = null;
 /** The scope the loader granted this link; the budget for a call depends on it. Reset with the link. */
 let consentScope: GateScope = "none";
@@ -199,7 +177,7 @@ let consentPending: "read" | "act" | null = null;
 const knownTabs = new Map<string, { title: string; url: string }>();
 /** Per-tabKey elements of the last browser_snapshot, so a prompt can name the ref it acts on. */
 const snapshotRefs = new Map<string, Map<string, { role: string; name: string }>>();
-/** Set by an in-Zen stop (close 4010/4011); only /hirozen-connect and /hirozen-attach clear it. */
+/** Set by Zen's Stop button (close 4010); only /hirozen-connect and /hirozen-attach clear it. */
 let stopKind: StopKind | null = null;
 let teardownHooked = false;
 let warnedAboutBrowserMcp = false;
@@ -210,17 +188,11 @@ function messageOf(error: unknown): string {
 
 /**
  * The readable half of an error: plugin codes keep their message, loader codes get a gloss first.
- * `firefoxDialog` marks the calls that may be waiting for Firefox's remote-control dialog (upload and
- * dialog, and only while BiDi is not running): a timeout there is that dialog still being open, which
- * is something the user can fix, not a browser failure.
  */
-function describeError(error: unknown, firefoxDialog = false): Failure {
+function describeError(error: unknown): Failure {
   if (!(error instanceof HirozenError)) return { code: "E_UNKNOWN", text: messageOf(error) };
   const { code, message } = error;
   const details = error.pid === undefined ? undefined : { pid: error.pid };
-  if (firefoxDialog && code === "E_TIMEOUT") {
-    return { code, text: 'the Zen "Allow remote control?" dialog is still open; answer it, then retry', details };
-  }
   if (PLUGIN_CODES[code] === true) {
     if (code === "E_AUTH") {
       return { code, text: `another program answered the handoff; not the Hirozen loader — ${message}`, details };
@@ -283,43 +255,37 @@ function clearConsentNotice(): void {
   consentRepeat = null;
 }
 
-/** The terminal half of a person-wait: the Hirozen gate prompt, or Firefox's remote-control dialog. */
-function notifyPersonWait(ctx: ExtensionContext, what: PersonWait, repeated: boolean): void {
+/** The gate notice: the only thing in omp while a person still has to answer in Zen. */
+function notifyGateWait(ctx: ExtensionContext, repeated: boolean): void {
   const prefix = `Hirozen: ${repeated ? "still waiting — " : ""}`;
-  if (what === "gate") {
-    const scope = consentPending ?? "read";
-    ctx.ui.notify(
-      `${prefix}click Allow in Zen to let omp ${scope === "act" ? "read and act on pages" : "read pages"} (Deny refuses).`,
-      "warning",
-    );
-    return;
-  }
-  ctx.ui.notify(`${prefix}${CONSENT_NOTICE}`, "warning");
+  const scope = consentPending ?? "read";
+  ctx.ui.notify(
+    `${prefix}click Allow in Zen to let omp ${scope === "act" ? "read and act on pages" : "read pages"} (Deny refuses).`,
+    "warning",
+  );
 }
 
 /**
  * Remind again every CONSENT_REPEAT_MS for as long as the person has not answered. The predicate is
- * re-checked when the timer fires, so `consent.granted`/`consent.denied` (or BiDi landing) end the
- * repeat without racing this timer; both waits share the single slot because BiDi only starts after
- * the act scope was granted, so the two can never overlap.
+ * re-checked when the timer fires, so `consent.granted`/`consent.denied` end the repeat without
+ * racing this timer.
  */
-function armPersonWaitNotice(ctx: ExtensionContext, what: PersonWait): void {
+function armGateNotice(ctx: ExtensionContext): void {
   consentRepeat?.();
   consentRepeat = scheduleOnce(ctx, CONSENT_REPEAT_MS, () => {
     consentRepeat = null;
-    const stillWaiting = what === "gate" ? consentPending !== null : bidiPhase === "starting";
-    if (!stillWaiting) return;
-    notifyPersonWait(ctx, what, true);
-    armPersonWaitNotice(ctx, what);
+    if (consentPending === null) return;
+    notifyGateWait(ctx, true);
+    armGateNotice(ctx);
   });
 }
 
-/** A person has to answer something in Zen before a call can proceed: say what, then remind. */
-function announcePersonWait(what: PersonWait): void {
+/** A person has to answer the Hirozen gate in Zen before a call can proceed: say what, then remind. */
+function announceGateWait(): void {
   const ctx = linkCtx;
   if (!ctx) return;
-  notifyPersonWait(ctx, what, false);
-  armPersonWaitNotice(ctx, what);
+  notifyGateWait(ctx, false);
+  armGateNotice(ctx);
 }
 
 /** The `scope` of a `consent.*` event, or null when the loader sent something this plugin cannot use. */
@@ -329,12 +295,12 @@ function eventScope(data: unknown): "read" | "act" | null {
   return scope === "read" || scope === "act" ? scope : null;
 }
 
-/** Loader events: the consent gate (whose scope drives every budget) plus the BiDi phase. */
+/** Loader events: the consent gate, whose scope drives every call's budget. */
 function handleLoaderEvent(event: LoaderEvent): void {
   if (event.name === "consent.pending") {
     // The loader upgrades a pending read prompt in place, so this also fires for an act upgrade.
     consentPending = eventScope(event.data) ?? "read";
-    announcePersonWait("gate");
+    announceGateWait();
     return;
   }
   if (event.name === "consent.granted") {
@@ -349,23 +315,6 @@ function handleLoaderEvent(event: LoaderEvent): void {
     consentPending = null;
     clearConsentNotice();
     if (linkCtx) linkCtx.ui.notify("Hirozen: denied in Zen.", "warning");
-    return;
-  }
-  if (event.name === "bidi.starting") {
-    if (bidiPhase !== "starting") {
-      bidiPhase = "starting";
-      announcePersonWait("bidi");
-    }
-    return;
-  }
-  if (event.name === "bidi.running") {
-    bidiPhase = "running";
-    clearConsentNotice();
-    return;
-  }
-  if (event.name === "bidi.off") {
-    bidiPhase = "off";
-    clearConsentNotice();
   }
 }
 
@@ -374,7 +323,6 @@ function releaseLink(): void {
   link = null;
   linkCtx = null;
   connectPromise = null;
-  bidiPhase = "off";
   // The gate belongs to the loader, which clears it with the link: a new link starts at "none" and
   // must ask again. The caches describe what that link last saw, so they go with it.
   consentScope = "none";
@@ -625,17 +573,13 @@ function pageHeader(url: string, title: string): string {
 const SCOPE_RANK: Record<GateScope, number> = { none: 0, read: 1, act: 2 };
 
 /**
- * The omp-side budget for one call: base work time plus 125 s for every answer a person still owes -
- * the Hirozen Allow/Deny notice whenever the granted scope is below what the call needs, and
- * Firefox's remote-control dialog when upload/dialog has to start BiDi first. The loader receives the
- * same instant as an absolute deadline and refuses to act once it passed, so a late answer never turns
- * into an action omp has already given up on.
+ * The omp-side budget for one call: 15 s of base work plus 125 s while the Hirozen Allow/Deny notice
+ * may still be waiting for an answer, which is whenever the granted scope is below what the call
+ * needs. The loader receives the same instant as an absolute deadline and refuses to act once it
+ * passed, so a late answer never turns into an action omp has already given up on.
  */
-function callBudget(needs: "read" | "act", baseMs = BASE_BUDGET_MS, startsBidi = false): number {
-  let budget = baseMs;
-  if (SCOPE_RANK[consentScope] < SCOPE_RANK[needs]) budget += PERSON_WAIT_MS;
-  if (startsBidi && bidiPhase !== "running") budget += PERSON_WAIT_MS;
-  return budget;
+function callBudget(needs: "read" | "act"): number {
+  return SCOPE_RANK[consentScope] < SCOPE_RANK[needs] ? BASE_BUDGET_MS + PERSON_WAIT_MS : BASE_BUDGET_MS;
 }
 
 /** Remember what a page call just reported, so a later approval prompt can name that tab. */
@@ -658,11 +602,6 @@ function describeRef(tabKey: string, ref: string | undefined): string | null {
   const element = snapshotRefs.get(tabKey)?.get(ref);
   if (!element) return `ref ${ref}`;
   return `${element.role} "${element.name}"`;
-}
-
-/** A timeout while Firefox's own dialog may still be open is something the user can fix, not a failure. */
-function failCall(error: unknown, firefoxDialog: boolean): AgentToolResult<unknown> {
-  return fail(describeError(error, firefoxDialog));
 }
 
 async function runZenTabs(pi: ExtensionAPI, ctx: ExtensionContext, signal?: AbortSignal): Promise<AgentToolResult<unknown>> {
@@ -869,12 +808,11 @@ async function runBrowserUpload(
   if (!resolved.ok) {
     return fail({ code: "E_BAD_PARAMS", text: `no such file to upload: ${resolved.missing}` });
   }
-  const startsBidi = bidiPhase !== "running";
   try {
     const result = await access.link.call<ZenActResult>(
       "browser.upload",
       { tabKey: params.tabKey, ref: params.ref, paths: resolved.paths },
-      { timeoutMs: callBudget("act", UPLOAD_BUDGET_MS, true), signal },
+      { timeoutMs: callBudget("act"), signal },
     );
     rememberTab(params.tabKey, result);
     return {
@@ -882,7 +820,7 @@ async function runBrowserUpload(
       details: { tabKey: params.tabKey, ref: params.ref, paths: resolved.paths, url: result.url, title: result.title },
     };
   } catch (error) {
-    return failCall(error, startsBidi);
+    return fail(describeError(error));
   }
 }
 
@@ -894,12 +832,11 @@ async function runBrowserDialog(
 ): Promise<AgentToolResult<unknown>> {
   const access = await requireLink(pi, ctx);
   if ("failure" in access) return fail(access.failure);
-  const startsBidi = bidiPhase !== "running";
   try {
     const result = await access.link.call<ZenActResult>(
       "browser.dialog",
       { tabKey: params.tabKey, accept: params.accept, text: params.text },
-      { timeoutMs: callBudget("act", BASE_BUDGET_MS, true), signal },
+      { timeoutMs: callBudget("act"), signal },
     );
     rememberTab(params.tabKey, result);
     return {
@@ -912,7 +849,7 @@ async function runBrowserDialog(
       details: { tabKey: params.tabKey, accept: params.accept, url: result.url, title: result.title },
     };
   } catch (error) {
-    return failCall(error, startsBidi);
+    return fail(describeError(error));
   }
 }
 
@@ -1243,18 +1180,15 @@ function renderStatusFile(profileDir: string): string {
     `state=${status.state ?? "?"}`,
     `mode=${status.mode ?? "?"}`,
     `zenPid=${status.zenPid ?? "?"}`,
-    `bidi=${status.bidi?.state ?? "?"}${status.bidi?.port ? `:${status.bidi.port}` : ""}`,
     `consent=${status.consent ?? "?"}${status.consentPending ? ` (asking: ${status.consentPending})` : ""}`,
     `updated=${status.updated ?? "?"}`,
   ];
   if (status.lastClose) parts.push(`lastClose=${status.lastClose}`);
-  if (status.lastStopError) parts.push(`lastStopError=${status.lastStopError}`);
-  if (status.lastStartError) parts.push(formatStatusError("lastStartError", status.lastStartError));
   if (status.actorError) parts.push(formatStatusError("actorError", status.actorError));
   return parts.join(" ");
 }
 
-/** One `name=code @ at: message` field, used for both the BiDi start error and the actor error. */
+/** One `name=code @ at: message` field, used for the actor error. */
 function formatStatusError(name: string, error: { code?: string; message?: string; at?: string }): string {
   const { code, message, at } = error;
   return `${name}=${code ?? "?"}${at ? ` @ ${at}` : ""}${message ? `: ${message}` : ""}`;
@@ -1397,7 +1331,7 @@ export default function hirozen(pi: ExtensionAPI): void {
     name: "browser_snapshot",
     label: "Snapshot tab",
     description:
-      "List the interactive elements of one Zen tab by its tabKey (links, buttons, inputs, selects, labelled controls) with a ref for each; browser_act, browser_upload and browser_dialog take those refs (read-only; the tab is never loaded or activated).",
+      "List the interactive elements of one Zen tab by its tabKey (links, buttons, inputs, selects, labelled controls) with a ref for each; browser_act and browser_upload take those refs (read-only; the tab is never loaded or activated).",
     parameters: parameters.tabKey,
     approval: "read",
     loadMode: "essential",
@@ -1432,9 +1366,9 @@ export default function hirozen(pi: ExtensionAPI): void {
         name: "browser_upload",
         label: "Upload files",
         description:
-          "Set files on an <input type=file> in one Zen tab (ref from browser_snapshot). This is one of the two tools that start WebDriver BiDi, so Firefox's own \"Allow remote control?\" dialog appears the first time. Paths must exist locally (relative paths resolve against this omp session's cwd).",
+          "Set files on an <input type=file> in one Zen tab (ref from browser_snapshot). The loader's in-Zen Allow/Deny gate must have granted the act scope; every call needs your approval. Paths must exist locally (relative paths resolve against this omp session's cwd).",
         parameters: parameters.upload,
-        approval: execApproval("browser_upload sets files on a page's file input and starts Firefox's remote control."),
+        approval: execApproval("browser_upload sets files on a page's file input in Zen."),
         loadMode: "essential",
         execute: (
           _toolCallId: string,
@@ -1454,9 +1388,9 @@ export default function hirozen(pi: ExtensionAPI): void {
         name: "browser_dialog",
         label: "Answer page dialog",
         description:
-          "Answer the page dialog (alert/confirm/prompt, including beforeunload) that is open in one Zen tab - the one a browser_act reported. One of the two tools that use WebDriver BiDi (Firefox's remote-control dialog); E_NO_DIALOG means the tab has none open.",
+          "Answer the page dialog (alert/confirm/prompt, including beforeunload) that is open in one Zen tab - the one a browser_act reported. accept=true answers it, accept=false dismisses it, and text fills a prompt() before accepting. E_NO_DIALOG means the tab has none open.",
         parameters: parameters.dialog,
-        approval: execApproval("browser_dialog answers a page dialog in Zen and starts Firefox's remote control."),
+        approval: execApproval("browser_dialog answers a page dialog in Zen."),
         loadMode: "essential",
         execute: (
           _toolCallId: string,
@@ -1591,7 +1525,7 @@ export default function hirozen(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("hirozen-connect", {
-    description: "Clear the Hirozen stop (Zen's Stop button, or remote control turned off in Zen)",
+    description: "Clear the Hirozen stop (Zen's Stop button)",
     handler: (_args, ctx) => runConnectCommand(ctx),
   });
 

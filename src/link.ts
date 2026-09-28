@@ -16,11 +16,10 @@
 //      {type: "event", name, data}; the loader's 5 s liveness frame {type: "ping", t} is answered with
 //      {type: "pong", t}, and any frame type this link does not know is ignored.
 //   5. Exactly one authenticated connection: any further upgrade is closed with 4009, a pre-auth message
-//      that is not auth with 4002, a bad proof with 4003, Zen's Stop button with 4010, remote control
-//      turned off in Zen with 4011 ("external disconnect", or "disabled permanently" when the user
-//      disabled it for good), and the loader's heartbeat reap with 4012.
-//   6. The close code picks the stop kind (LinkCloseInfo): 4010 and 4011 are sticky in the extension
-//      until /hirozen-connect; 4012 and every other close are not, so the next call reconnects.
+//      that is not auth with 4002, a bad proof with 4003, Zen's Stop button with 4010, and the loader's
+//      heartbeat reap with 4012.
+//   6. The close code picks the stop kind (LinkCloseInfo): 4010 is sticky in the extension until
+//      /hirozen-connect; 4012 and every other close are not, so the next call reconnects.
 //
 // The listener is loopback-only on an ephemeral port and the handoff file is deleted on every path out
 // of connect(), so a crashed session cannot leave a phantom owner behind.
@@ -41,9 +40,10 @@ const HANDOFF_TTL_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 90_000;
 /**
  * Default per-command budget when the caller names none. The extension always names one: base work
- * time plus 125 s for every answer a person still owes (the Hirozen Allow/Deny notice, Firefox's
- * remote-control dialog). Budget and deadline are the same fact from two sides - this timer ends the
- * wait locally, and the deadline travels in the frame so the loader refuses to act once it passed.
+ * time plus 125 s while the loader's in-Zen Allow/Deny notice is still waiting for an answer (the
+ * loader gives the notice 120 s). Budget and deadline are the same fact from two sides - this timer
+ * ends the wait locally, and the deadline travels in the frame so the loader refuses to act once it
+ * passed.
  */
 const CALL_TIMEOUT_MS = 150_000;
 
@@ -52,16 +52,14 @@ const CALL_TIMEOUT_MS = 150_000;
  * `E_AUTH` (the peer failed the loader proof / sent a pre-auth message that is not auth),
  * `E_UNKNOWN` (a reply that does not match the contract), `E_TIMEOUT`, `E_STOPPED`.
  *
- * The loader's own codes travel the same way: `E_DENIED` (the Hirozen Allow/Deny notice was denied or
- * unanswered), `E_DEADLINE` (omp's budget passed before the loader acted; nothing was done),
+ * The loader's own codes travel the same way: `E_DENIED` (the Hirozen Allow/Deny notice in Zen was
+ * denied or unanswered), `E_DEADLINE` (omp's budget passed before the loader acted; nothing was done),
  * `E_REF_STALE` (the element ref came from an older document), `E_NOT_INTERACTABLE` (disabled,
  * zero-size, or a file-input mismatch), `E_BAD_PARAMS`, `E_LAYOUT_REFUSED` (Zen refused the layout
  * change), `E_NO_DIALOG`, `E_ACTOR` (the actor is not registered in Zen), `E_READ_FAILED` (no usable
- * page data), `E_BIDI_LOST` (the BiDi session died mid-call, upload/dialog only), `E_PORT_BUSY`,
- * `E_COMPROMISE`, `E_DISABLED_IN_ZEN`, `E_SYSTEM_ACCESS`, `E_STOP_FAILED` and `E_INTERNAL`.
- * A close that ends an authenticated link carries no error code: 4010 (Zen's Stop button), 4011
- * (remote control turned off in Zen, sticky) and 4012 (heartbeat reap, not sticky) arrive as a
- * LinkCloseInfo instead - see stopKindOf.
+ * page data) and `E_INTERNAL`.
+ * A close that ends an authenticated link carries no error code: 4010 (Zen's Stop button, sticky) and
+ * 4012 (heartbeat reap, not sticky) arrive as a LinkCloseInfo instead - see stopKindOf.
  */
 export class HirozenError extends Error {
   readonly code: string;
@@ -110,26 +108,21 @@ export type ZenStatus = {
   mode?: "startup" | "attach";
   updated?: string;
   lastHandoff?: { pid?: number; cwd?: string; at?: string };
-  bidi?: { state?: "off" | "starting" | "running"; port?: number; sessionId?: string };
   /** The Hirozen gate's granted scope, and what a pending Allow/Deny notice is asking for. */
   consent?: "none" | "read" | "act";
   consentPending?: null | "read" | "act";
-  /** The actor registration failure, if any; it is not cleared by a BiDi start. */
+  /** The actor registration failure, if any. */
   actorError?: { code?: string; message?: string; at?: string };
   lastClose?: string;
-  lastStopError?: string;
-  /** The last failed BiDi start, kept so a refused call explains itself later. */
-  lastStartError?: { code?: string; message?: string; at?: string };
 };
 
 export type LoaderEvent = { name: string; data?: unknown };
 
 /**
- * Why a live link ended for good: Zen's Stop button (`"zen-stop"`), remote control turned off in Zen
- * (`"zen-disconnect"`, or `"zen-disabled"` when the user disabled it permanently). The extension holds
- * these three sticky until /hirozen-connect; every other close (heartbeat reap, clean close) is null.
+ * Why a live link ended for good: Zen's Stop button (`"zen-stop"`). The extension holds it sticky
+ * until /hirozen-connect; every other close (heartbeat reap, clean close) is null.
  */
-export type StopKind = "zen-stop" | "zen-disconnect" | "zen-disabled";
+export type StopKind = "zen-stop";
 
 export type LinkCloseInfo = {
   code: number;
@@ -217,14 +210,11 @@ export function readStatusFile(profileDir: string): ZenStatus | null {
 }
 
 /**
- * The sticky stop a close code means. 4010 is Zen's Stop button; 4011 is remote control turned off in
- * Zen (the loader writes `disabled permanently` in the reason when the user disabled it for good); 4012
- * is the loader's heartbeat reap, and no other close is a stop at all - the next call reconnects.
+ * The sticky stop a close code means. 4010 is Zen's Stop button; 4012 is the loader's heartbeat reap,
+ * and no other close is a stop at all - the next call reconnects.
  */
-function stopKindOf(code: number, reason: string): StopKind | null {
-  if (code === 4010) return "zen-stop";
-  if (code !== 4011) return null;
-  return /disabl/i.test(reason) ? "zen-disabled" : "zen-disconnect";
+function stopKindOf(code: number): StopKind | null {
+  return code === 4010 ? "zen-stop" : null;
 }
 
 /** `process.kill(pid, 0)` as a liveness probe; EPERM still means the process exists. */
@@ -393,8 +383,8 @@ export class ZenLink {
 
     const timeoutMs = options.timeoutMs ?? CALL_TIMEOUT_MS;
     const id = this.#nextId++;
-    // Same instant as the local timer, sent along: a frame can sit in a pending gate or a BiDi start
-    // for minutes, and the loader must not act on it after omp has already given up.
+    // Same instant as the local timer, sent along: a frame can sit in a pending Allow/Deny gate for
+    // minutes, and the loader must not act on it after omp has already given up.
     const deadline = Date.now() + timeoutMs;
     const { promise, resolve, reject } = Promise.withResolvers<T>();
     const timer = setTimeout(() => {
@@ -415,7 +405,7 @@ export class ZenLink {
   }
 
   /**
-   * Ends the session: the loader closes with 1000 and tears down BiDi; pending calls get E_STOPPED.
+   * Ends the session: the loader closes with 1000; pending calls get E_STOPPED.
    * Safe to call at any time, including before connect() and more than once.
    */
   close(): void {
@@ -517,7 +507,7 @@ export class ZenLink {
       return;
     }
     this.#teardown();
-    this.onClose?.({ code, reason, stopKind: stopKindOf(code, reason) });
+    this.onClose?.({ code, reason, stopKind: stopKindOf(code) });
   }
 
   /** Closes a connection without authenticating it: 4002 (protocol) or 4003 (bad proof). */

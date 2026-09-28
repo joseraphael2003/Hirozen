@@ -167,11 +167,6 @@ class FakeLoader {
   close(): void {
     if (this.#ws && this.#ws.readyState !== WebSocket.CLOSED) this.#ws.close();
   }
-
-  /** Closes with an explicit code/reason, so a test can play Firefox's own 4010/4011 stop. */
-  closeWith(code: number, reason: string): void {
-    if (this.#ws && this.#ws.readyState !== WebSocket.CLOSED) this.#ws.close(code, reason);
-  }
 }
 
 type Host = {
@@ -179,7 +174,6 @@ type Host = {
   ctx: ExtensionContext;
   notifications: string[];
   tools: Map<string, StubTool>;
-  commands: Map<string, { handler: (args: string, ctx: ExtensionContext) => unknown }>;
   events: Map<string, (event: unknown, ctx: ExtensionContext) => unknown>;
 };
 
@@ -194,7 +188,6 @@ type StubTool = {
 function makeHost(cwd: string): Host {
   const notifications: string[] = [];
   const tools = new Map<string, StubTool>();
-  const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => unknown }>();
   const events = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
 
   const ctx = {
@@ -215,25 +208,17 @@ function makeHost(cwd: string): Host {
     registerTool: (tool: { name: string } & StubTool) => {
       tools.set(tool.name, tool);
     },
-    registerCommand: (name: string, options: { handler: (args: string, ctx: ExtensionContext) => unknown }) => {
-      commands.set(name, options);
-    },
+    // Commands are registered by the factory; no test drives them, so the stub only accepts them.
+    registerCommand: () => undefined,
   } as unknown as ExtensionAPI;
 
-  return { pi, ctx, notifications, tools, commands, events };
+  return { pi, ctx, notifications, tools, events };
 }
 
 async function callTool(host: Host, name: string, params: unknown = {}): Promise<AgentToolResult<unknown>> {
   const tool = host.tools.get(name);
   if (!tool) throw new Error(`tool ${name} is not registered`);
   return tool.execute("call-1", params, undefined, undefined, host.ctx);
-}
-
-/** Runs a registered command, i.e. what the user types as `/hirozen-connect`. */
-async function runCommand(host: Host, name: string, args = ""): Promise<void> {
-  const command = host.commands.get(name);
-  if (!command) throw new Error(`command ${name} is not registered`);
-  await command.handler(args, host.ctx);
 }
 
 /**
@@ -357,42 +342,10 @@ test("a superseded connect cannot release the live link (orphan guard)", async (
   expect(loaderB.requests.length).toBe(2);
 }, 30_000);
 
-test("a call in flight when a sticky stop closes the link gets that stop's text", async () => {
-  // The previous test left its live link connected, and the status record it wrote still names a
-  // session for this pid: release both before a fresh loader offers a handoff.
-  await shutdown(host);
-  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
-
-  const loader = new FakeLoader(profileDir);
-  const started = loader.start();
-  const inFlight = callTool(host, "browser_read", { tabKey: TAB_KEY });
-
-  // Hold the call open: the fake loader takes the request and never answers it.
-  await loader.nextRequest();
-
-  // Firefox's own stop ("Turn off remote control") closes the link with 4011 while that call is
-  // still pending; the close is what the sticky text must describe, not a generic drop.
-  loader.closeWith(4011, "external disconnect");
-  const result = await inFlight;
-  const text = textOf(result);
-  expect(result.isError).toBe(true);
-  expect(text.startsWith("E_STOPPED")).toBe(true);
-  expect(text).toContain("turned off in Zen (Disconnect / Turn off remote control)");
-  expect(text).toContain("run /hirozen-connect");
-  // The generic gloss ("retry, or run /hirozen-connect") would advise a retry that the sticky gate
-  // refuses; the in-flight failure and the later calls must use the same per-kind text.
-  expect(text).not.toContain("fail-closed");
-  expect(text).not.toContain("retry,");
-  const later = await callTool(host, "zen_tabs");
-  expect(textOf(later)).toBe(text);
-
-  await started;
-}, 30_000);
-
 test("the act budget tracks the gate scope, the terminal hint mirrors consent, and the details name the ref", async () => {
-  // The previous test left a sticky stop and a live link behind; /hirozen-connect is the documented
-  // way out of the stop, and the status record it wrote must go before a fresh loader offers a handoff.
-  await runCommand(host, "hirozen-connect");
+  // The orphan-guard test above left its live link connected; release it, and drop the status record
+  // it wrote, before a fresh loader offers a handoff.
+  await shutdown(host);
   rmSync(join(profileDir, "hirozen-status.json"), { force: true });
 
   // Bun's spyOn calls through by default, so the real call still sends the frame; the spy only
@@ -434,7 +387,18 @@ test("the act budget tracks the gate scope, the terminal hint mirrors consent, a
     loader.reply(secondRequest, { ok: true, url: "https://example.com/", title: "Example Domain" });
     expect((await secondCall).isError).not.toBe(true);
 
-    // 5. A snapshot names the elements the approval prompt has to describe.
+    // 5. Upload has no person-wait of its own any more: no BiDi start and no four 10 s steps, so with
+    //    the act scope granted it is sent with the same base 15 s as every other tool (V1.1 sent
+    //    45 s + 125 s here).
+    writeFileSync(join(host.ctx.cwd, "form.txt"), "upload me");
+    const upload = callTool(host, "browser_upload", { tabKey: TAB_KEY, ref: "ab12.e3", paths: ["form.txt"] });
+    const uploadRequest = await loader.nextRequest();
+    expect(uploadRequest.method).toBe("browser.upload");
+    expect(callSpy.mock.calls[2]?.[2]?.timeoutMs).toBe(15_000);
+    loader.reply(uploadRequest, { ok: true, tabKey: TAB_KEY, count: 1 });
+    expect((await upload).isError).not.toBe(true);
+
+    // 6. A snapshot names the elements the approval prompt has to describe.
     const snapshot = callTool(host, "browser_snapshot", { tabKey: TAB_KEY });
     const snapshotRequest = await loader.nextRequest();
     expect(snapshotRequest.method).toBe("browser.snapshot");
@@ -456,7 +420,7 @@ test("the act budget tracks the gate scope, the terminal hint mirrors consent, a
     expect(snapshotResult.isError).not.toBe(true);
     expect(textOf(snapshotResult)).toContain("ab12.e1");
 
-    // 6. The prompt details: the tab it acts on, the action, and the element behind the ref.
+    // 7. The prompt details: the tab it acts on, the action, and the element behind the ref.
     const tool = host.tools.get("browser_act");
     if (!tool) throw new Error("browser_act is not registered");
     const args = { tabKey: TAB_KEY, action: "click", ref: "ab12.e1" };
@@ -470,7 +434,7 @@ test("the act budget tracks the gate scope, the terminal hint mirrors consent, a
     const unknown = tool.formatApprovalDetails?.({ tabKey: TAB_KEY, action: "click", ref: "zz99.e7" });
     expect(Array.isArray(unknown) ? unknown.join("\n") : String(unknown)).toContain("ref zz99.e7");
 
-    // 7. The approval itself is a per-call decision: exec tier, always prompting.
+    // 8. The approval itself is a per-call decision: exec tier, always prompting.
     const approval = tool.approval;
     const decision = typeof approval === "function" ? approval(args) : approval;
     expect(decision).toMatchObject({ tier: "exec", policy: "prompt" });

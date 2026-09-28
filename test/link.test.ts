@@ -179,20 +179,23 @@ test("correct loader proof completes the handshake", async () => {
   socket.send({ id: request.id, result: [{ windowId: 1 }] });
   expect(await inventory).toEqual([{ windowId: 1 }]);
 
-  const stop = link.call("bidi.stop", {});
+  // A loader error reply travels as a HirozenError whatever the method was.
+  const unsupported = link.call("zen.nonexistent", {});
   const refusal = await socket.next();
-  socket.send({ id: refusal.id, error: { code: "E_UNKNOWN_METHOD", message: "bidi.stop is not exposed" } });
-  const error = await stop.then(
+  expect(refusal.method).toBe("zen.nonexistent");
+  socket.send({ id: refusal.id, error: { code: "E_UNKNOWN_METHOD", message: "zen.nonexistent is not exposed" } });
+  const error = await unsupported.then(
     () => null,
     (reason: unknown) => reason,
   );
   expect(error).toBeInstanceOf(HirozenError);
   expect((error as HirozenError).code).toBe("E_UNKNOWN_METHOD");
-  expect((error as HirozenError).message).toBe("bidi.stop is not exposed");
+  expect((error as HirozenError).message).toBe("zen.nonexistent is not exposed");
 
-  socket.send({ type: "event", name: "bidi.starting", data: { phase: "start" } });
+  // Event frames are routed to onEvent as they arrive.
+  socket.send({ type: "event", name: "consent.granted", data: { scope: "read" } });
   await waitFor(() => events.length === 1);
-  expect(events[0]).toEqual({ name: "bidi.starting", data: { phase: "start" } });
+  expect(events[0]).toEqual({ name: "consent.granted", data: { scope: "read" } });
 
   expect(existsSync(join(dir, HANDOFF_FILE))).toBe(false); // consumed, never left behind
 });
@@ -270,7 +273,7 @@ test("a frame type the link does not know is ignored", async () => {
   socket.send(READY_FRAME);
   await connecting;
 
-  socket.send({ type: "bidi.running", port: 9222, note: "not a frame this link knows" });
+  socket.send({ type: "unexpected.frame", note: "not a frame this link knows" });
 
   // No error reply, and the link keeps answering: the next reply is the one for this request.
   const call = link.call("zen.inventory", {});
@@ -366,19 +369,6 @@ test("a status record owned by this omp names the pid and the ~15 s wait", async
 test("Zen's Stop button (4010) reports the zen-stop kind", async () => {
   const info = await closeInfo(4010, "stopped by user");
   expect(info).toEqual({ code: 4010, reason: "stopped by user", stopKind: "zen-stop" });
-});
-
-test("4011 is the external stop, named by its reason", async () => {
-  expect(await closeInfo(4011, "external disconnect")).toEqual({
-    code: 4011,
-    reason: "external disconnect",
-    stopKind: "zen-disconnect",
-  });
-  expect(await closeInfo(4011, "disabled permanently")).toEqual({
-    code: 4011,
-    reason: "disabled permanently",
-    stopKind: "zen-disabled",
-  });
 });
 
 test("4012 (heartbeat timeout) carries no sticky kind", async () => {
