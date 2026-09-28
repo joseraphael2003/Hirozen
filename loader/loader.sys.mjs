@@ -1457,12 +1457,18 @@ class Loader {
     }
   }
 
-  #ensureAgentSpace(win) {
+  // The shipped ZenSpaceManager.createAndSaveWorkspace is `async` (temp/extract/t2/modules/zen/
+  // ZenSpaceManager.mjs L2574) and resolves to the new workspace data (or null when workspaces are
+  // disabled), so its uuid may only be read after awaiting it. The name lookup stays first: an
+  // existing "Hirozen Agent" space is reused, never created twice.
+  async #ensureAgentSpace(win) {
     let spaceId = this.#agentSpaceIdOf(win);
     if (!spaceId) {
       // dontChange=true: creating the space must not switch the user's own space (plan).
-      const workspace = win.gZenWorkspaces?.createAndSaveWorkspace?.(AGENT_SPACE_NAME, undefined, true);
-      spaceId = workspace?.uuid ?? null;
+      const created = await win.gZenWorkspaces?.createAndSaveWorkspace?.(AGENT_SPACE_NAME, undefined, true);
+      // Either shape is accepted: the resolved workspace data, or a fresh name lookup (Zen returns
+      // null when workspaces are disabled, and an unsynced window renames the space on creation).
+      spaceId = created?.uuid ?? this.#agentSpaceIdOf(win);
     }
     if (!spaceId) {
       throw new LoaderError("E_LAYOUT_REFUSED", "Zen did not create the agent space");
@@ -1500,7 +1506,7 @@ class Loader {
     }
     await this.#gate("act", req);
     this.#checkDeadline(req);
-    const spaceId = this.#ensureAgentSpace(win);
+    const spaceId = await this.#ensureAgentSpace(win);
     await this.#waitForSpaceElement(win, spaceId);
     this.#checkDeadline(req);
     const tab = win.gBrowser.addTab(url, {
