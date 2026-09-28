@@ -33,7 +33,7 @@ const CONSENT_NOTICE =
 const STOP_TEXT: Record<StopKind, string> = {
   "zen-stop": "the Hirozen session was stopped in Zen — run /hirozen-connect (or /hirozen-attach) to start a new one.",
   "zen-disconnect":
-    "remote control was turned off in Zen (Disconnect) — run /hirozen-connect (or /hirozen-attach) to allow it again.",
+    "remote control was turned off in Zen (Disconnect / Turn off remote control) — run /hirozen-connect (or /hirozen-attach) to allow it again.",
   "zen-disabled":
     "remote control was disabled permanently in Zen; re-enable remote.experimental.dynamicstart.enabled in about:config, then run /hirozen-connect.",
 };
@@ -128,6 +128,12 @@ function describeError(error: unknown): Failure {
     }
     return { code, text: message, details };
   }
+  // A call that was in flight when Zen ended the session must read like the calls that follow it: the
+  // close that killed it (link.ts fails pending calls before onClose, and onClose runs before any
+  // rejection is observed) is the very event that set stopKind, and for a sticky stop the generic
+  // "retry" gloss is wrong advice - the retry cannot pass the gate. Non-sticky closes leave stopKind
+  // null and keep the generic gloss, where retrying is exactly what works.
+  if (code === "E_STOPPED" && stopKind !== null) return { code, text: STOP_TEXT[stopKind], details };
   const gloss = CODE_TEXT[code];
   return { code, text: gloss ? `${gloss} — ${message}` : messageOf(error), details };
 }

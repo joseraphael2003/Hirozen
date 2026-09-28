@@ -55,6 +55,8 @@ class FakeLoader {
   #handlers = new Map<string, (frame: Frame) => void>();
   #resolveClosed: (value: { code: number; reason: string }) => void;
   #stopped = false;
+  #requestQueue: Frame[] = [];
+  #requestWaiters: ((frame: Frame) => void)[] = [];
 
   constructor(
     readonly profileDir: string,
@@ -77,6 +79,15 @@ class FakeLoader {
 
   reply(frame: Frame, result: unknown): void {
     this.send({ id: frame.id, result });
+  }
+
+  /** Resolves with the next request the loader side sends, or one that already arrived. */
+  nextRequest(): Promise<Frame> {
+    const queued = this.#requestQueue.shift();
+    if (queued) return Promise.resolve(queued);
+    const { promise, resolve } = Promise.withResolvers<Frame>();
+    this.#requestWaiters.push(resolve);
+    return promise;
   }
 
   /** The `ready` frame, sent by `start()` unless `holdReady` left it for the test to release. */
@@ -135,6 +146,9 @@ class FakeLoader {
       }
       if (typeof frame.id === "number" && typeof frame.method === "string") {
         this.requests.push(frame);
+        const waiter = this.#requestWaiters.shift();
+        if (waiter) waiter(frame);
+        else this.#requestQueue.push(frame);
         if (this.#stopped) return;
         this.#handlers.get(frame.method)?.(frame);
       }
@@ -147,6 +161,11 @@ class FakeLoader {
 
   close(): void {
     if (this.#ws && this.#ws.readyState !== WebSocket.CLOSED) this.#ws.close();
+  }
+
+  /** Closes with an explicit code/reason, so a test can play Firefox's own 4010/4011 stop. */
+  closeWith(code: number, reason: string): void {
+    if (this.#ws && this.#ws.readyState !== WebSocket.CLOSED) this.#ws.close(code, reason);
   }
 }
 
@@ -291,4 +310,36 @@ test("a superseded connect cannot release the live link (orphan guard)", async (
   expect(resultC.isError).not.toBe(true);
   expect(textOf(resultC)).toContain(TAB_KEY);
   expect(loaderB.requests.length).toBe(2);
+}, 30_000);
+
+test("a call in flight when a sticky stop closes the link gets that stop's text", async () => {
+  // The previous test left its live link connected, and the status record it wrote still names a
+  // session for this pid: release both before a fresh loader offers a handoff.
+  await shutdown(host);
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+
+  const loader = new FakeLoader(profileDir);
+  const started = loader.start();
+  const inFlight = callTool(host, "browser_read", { tabKey: TAB_KEY });
+
+  // Hold the call open: the fake loader takes the request and never answers it.
+  await loader.nextRequest();
+
+  // Firefox's own stop ("Turn off remote control") closes the link with 4011 while that call is
+  // still pending; the close is what the sticky text must describe, not a generic drop.
+  loader.closeWith(4011, "external disconnect");
+  const result = await inFlight;
+  const text = textOf(result);
+  expect(result.isError).toBe(true);
+  expect(text.startsWith("E_STOPPED")).toBe(true);
+  expect(text).toContain("turned off in Zen (Disconnect / Turn off remote control)");
+  expect(text).toContain("run /hirozen-connect");
+  // The generic gloss ("retry, or run /hirozen-connect") would advise a retry that the sticky gate
+  // refuses; the in-flight failure and the later calls must use the same per-kind text.
+  expect(text).not.toContain("fail-closed");
+  expect(text).not.toContain("retry,");
+  const later = await callTool(host, "zen_tabs");
+  expect(textOf(later)).toBe(text);
+
+  await started;
 }, 30_000);

@@ -44,6 +44,13 @@ const CALL_TIMEOUT_MS = 150_000;
  * Error carrying a wire code from the loader (`{error: {code, message}}`) or a link-local one:
  * `E_AUTH` (the peer failed the loader proof / sent a pre-auth message that is not auth),
  * `E_UNKNOWN` (a reply that does not match the contract), `E_TIMEOUT`, `E_STOPPED`.
+ *
+ * The loader's V1.1 codes travel the same way: `E_BIDI_LOST` (the BiDi session died mid-call),
+ * `E_READ_FAILED` (no usable page data), `E_STOP_FAILED` (its own stop left the agent running),
+ * `E_INTERNAL` (an unexpected loader exception) and `E_DISABLED_IN_ZEN` (remote control was disabled
+ * permanently in Zen). A close that ends an authenticated link carries no error code: 4010 (Zen's
+ * Stop button), 4011 (remote control turned off in Zen, sticky) and 4012 (heartbeat reap, not sticky)
+ * arrive as a LinkCloseInfo instead - see stopKindOf.
  */
 export class HirozenError extends Error {
   readonly code: string;
