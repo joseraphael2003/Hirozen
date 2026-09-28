@@ -26,6 +26,8 @@ The agent can act in Zen. Verified on Zen 1.22.3b (Gecko 156.0.1), Windows, on a
 ### Known issues
 
 - Not yet validated on a daily profile.
+- A navigate that only adds a `#fragment` to the current URL waits 12 s and reports `E_TIMEOUT`, although the page scrolled.
+- `E_DENIED` repeats its reason; upload and dialog results do not show the page's URL or title.
 
 ## [0.1.2] - 2026-09-28
 
