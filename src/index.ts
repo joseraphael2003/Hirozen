@@ -123,7 +123,12 @@ type ZenActResult = {
   dialog?: { type?: string; message?: string };
   opened?: string[];
 };
-type ZenOpen = { tabKey: string; spaceId: string };
+/**
+ * zen.open's reply: the loader waits for the load, so `url`/`title` are where the page landed - a
+ * redirect or a normalization means they differ from the URL that was asked for. zen.move shares the
+ * shape and reports neither.
+ */
+type ZenOpen = { tabKey: string; spaceId: string; url?: string; title?: string };
 type ZenSplit = { groupId?: string };
 type ZenGlance = { tabKey: string };
 
@@ -608,7 +613,9 @@ async function runZenTabs(pi: ExtensionAPI, ctx: ExtensionContext, signal?: Abor
   const access = await requireLink(pi, ctx);
   if ("failure" in access) return fail(access.failure);
   try {
-    const windows = await access.link.call<ZenWindow[]>("zen.inventory", {}, { signal });
+    // Ungated, so no person wait: the base budget, never link.ts's 150 s default (Rev 2: every tool
+    // base 15 s, +125 s only while the Hirozen gate may prompt).
+    const windows = await access.link.call<ZenWindow[]>("zen.inventory", {}, { timeoutMs: BASE_BUDGET_MS, signal });
     const tabCount = windows.reduce((count, window) => count + window.tabs.length, 0);
     // The inventory is the plugin's tab directory: an approval prompt for a tabKey it named can show
     // the tab's title and URL even before any page tool ran on it.
@@ -628,7 +635,7 @@ async function runZenSpaces(pi: ExtensionAPI, ctx: ExtensionContext, signal?: Ab
   const access = await requireLink(pi, ctx);
   if ("failure" in access) return fail(access.failure);
   try {
-    const windows = await access.link.call<ZenSpaceWindow[]>("zen.spaces", {}, { signal });
+    const windows = await access.link.call<ZenSpaceWindow[]>("zen.spaces", {}, { timeoutMs: BASE_BUDGET_MS, signal });
     return {
       content: [{ type: "text", text: renderSpaces(windows) }],
       details: { windowCount: windows.length, windows },
@@ -863,15 +870,22 @@ async function runZenOpen(
   if ("failure" in access) return fail(access.failure);
   try {
     const opened = await access.link.call<ZenOpen>("zen.open", { url }, { timeoutMs: callBudget("act"), signal });
-    rememberTab(opened.tabKey, { url });
+    // The page may redirect: the loader reports where the load landed, and both the reply and the tab
+    // cache (which feeds the approval details of later calls on this tab) must name the page the tab
+    // actually shows, not the URL that was asked for.
+    const landed = opened.url || url;
+    rememberTab(opened.tabKey, { url: landed, title: opened.title });
     return {
       content: [
         {
           type: "text",
-          text: `Opened ${url} in tab ${opened.tabKey}, in the "Hirozen Agent" space (space ${opened.spaceId}); the tab is in the background.`,
+          text: [
+            `Opened a tab in the "Hirozen Agent" space (space ${opened.spaceId}), tab ${opened.tabKey}; it is in the background.`,
+            pageHeader(landed, opened.title ?? ""),
+          ].join("\n"),
         },
       ],
-      details: { tabKey: opened.tabKey, spaceId: opened.spaceId, url },
+      details: { tabKey: opened.tabKey, spaceId: opened.spaceId, url: landed, title: opened.title },
     };
   } catch (error) {
     return fail(describeError(error));
