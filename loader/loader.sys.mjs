@@ -843,6 +843,13 @@ class Loader {
       throw this.#refuseStart("E_SYSTEM_ACCESS", "MOZ_REMOTE_ALLOW_SYSTEM_ACCESS is set for this Zen process; refusing to open a remote-control session");
     }
 
+    // A stop that is still in flight - Firefox's own banner stop of an episode this loader adopted,
+    // or a previous link's teardown - leaves RA.running true for its whole duration (RemoteAgent #stop
+    // is async; #stopBidiNow bounds the wait). Joining it here, before the rogue check, is what keeps a
+    // /hirozen-connect landing inside that window from blaming a client for our own stop: once it
+    // settles, this start sees a stopped agent - or, if the stop failed, #lastStopError and the retry
+    // arm below. An agent still running after the shared stop had its chance stays E_COMPROMISE.
+    if (this.#stopPromise) await this.#stopPromise.catch(() => {});
     if (RA.running) {
       if (this.#lastStopError) {
         // Our own previous stop failed, so this half-stopped agent is ours: retry the bounded stop once
