@@ -10,7 +10,7 @@ The agent can act in Zen. Verified on Zen 1.22.3b (Gecko 156.0.1), Windows, on a
 
 - Tools `browser_snapshot`, `browser_act` (click, type, press, scroll, navigate), `browser_upload`, `browser_dialog`, `zen_open`, `zen_move`, `zen_split`, `zen_unsplit` and `zen_glance`. Actions ask for omp approval with the tab and target in the details.
 - Hirozen's own Allow/Deny prompt in Zen, with two levels ("read pages", "read and act on pages"), a terminal hint while it waits, and a 120 s timeout.
-- A content actor (`HirozenChild.sys.mjs`) that reads pages and synthesizes trusted input; the install pins its hash and the loader's.
+- A content actor (`HirozenChild.sys.mjs`) that reads pages and synthesizes trusted input; the install pins the loader, the actor child and the actor parent by hash.
 - A "Hirozen Agent" space for `zen_open`; popups from its tabs stay in it, and your space and selected tab are kept.
 - Per-request deadlines: the loader does nothing once omp has given up (`E_DEADLINE`).
 

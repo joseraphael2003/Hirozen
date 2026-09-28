@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "omp plugin giving the agent read-only access to a running Zen browser",
+  "description": "omp plugin that lets the agent read and act in a running Zen browser",
   "omp": {
     "extensions": ["./src/index.ts"]
   },
