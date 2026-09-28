@@ -1085,10 +1085,13 @@ class Loader {
     const { tabKey, tab, browser, wg } = this.#resolveTab(params?.tabKey);
     await this.#gate("act", req);
     this.#checkDeadline(req);
-    const watcher = this.#watchAgentTabOpens(tab, browser);
     const payload = { action, ref, text, key, dy };
     // Checkpoint 4: nothing may reach the page once omp gave up (the actor call is the side effect).
     this.#checkDeadline(req);
+    // The watch on the tab starts only after that check: created any earlier, an E_DEADLINE thrown here
+    // would leave the window with a TabOpen/TabSelect capture listener and a state nothing ever takes
+    // down (nothing reaches the try below, so neither the finally nor #collectOpened runs).
+    const watcher = this.#watchAgentTabOpens(tab, browser);
     let reply;
     try {
       reply = await this.#queryAct(wg, payload, browser);
