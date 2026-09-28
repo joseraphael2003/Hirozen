@@ -538,7 +538,7 @@ function renderInventory(windows: ZenWindow[]): string {
     }
   });
   lines.push(
-    'Pass a tabKey to browser_read, browser_screenshot, browser_snapshot, browser_act, browser_upload and the zen_* layout tools. "lazy" tabs have no document yet and tabs in a non-active space are unreachable except the Hirozen Agent space: Hirozen never loads or activates anything.',
+    'Pass a tabKey to browser_read, browser_screenshot, browser_snapshot, browser_act, browser_upload, browser_dialog and the zen_* layout tools. "lazy" tabs have no document yet and tabs in a non-active space are unreachable except the Hirozen Agent space. zen_tabs and the read tools never load or activate a tab; browser_act navigate and zen_open load pages, and zen_glance selects its glance tab.',
   );
   return lines.join("\n");
 }
