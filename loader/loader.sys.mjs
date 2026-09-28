@@ -1,13 +1,22 @@
 // Hirozen loader: dormant chrome-scope module inside Zen's parent process.
 //
 // It never listens on a port. It polls the profile for a one-shot omp handoff file, connects OUT to
-// omp, proves a shared nonce with HMAC, and from then on is Zen's only WebDriver BiDi client.
-// V1 is read-only: inventory/spaces come from chrome scope, browser.read/screenshot go through BiDi.
+// omp, proves a shared nonce with HMAC, and from then on serves one omp session: inventory/spaces come
+// from chrome scope, reads, snapshot, screenshots and page input run through the Hirozen JSWindowActor
+// this module registers (V2: no port 9222, no Firefox prompt), Zen layout through the window's gZen*,
+// and WebDriver BiDi is started on demand for the two features actors cannot provide (file uploads,
+// page dialogs) - see .sisyphus/plans/hirozen-v2.md.
 //
-// Wire & status contract (.sisyphus/plans/hirozen-v1.md and hirozen-v1.1.md, shared with the omp side
-// in src/link.ts):
-//   request {id, method, params}; success {id, result}; error {id, error: {code, message}};
-//   loader events {type: "event", name, data}. Status file: hirozen-status.json.
+// V2 consent gate (§8.2): the actor path has no Firefox prompt, so this loader owns an in-Zen
+// Allow/Deny notice per link (state `#consent`, default Deny, persistent while connected) before any
+// gated method runs, and omp keeps its per-action approval on top.
+//
+// Wire & status contract (.sisyphus/plans/hirozen-v1.md, hirozen-v1.1.md, hirozen-v2.md, shared with
+// the omp side in src/link.ts):
+//   request {id, method, params, deadline?}; success {id, result}; error {id, error: {code, message}};
+//   loader events {type: "event", name, data}. Status file: hirozen-status.json. `deadline` is omp's
+//   absolute epoch-ms budget for the request: the loader refuses with E_DEADLINE before it acts once
+//   that moment has passed (a missing/non-finite deadline means no check).
 //   loader->omp heartbeat {type: "ping", t}; omp->loader {type: "pong", t}, dropped before #handle.
 //   Close codes: 1000 done, 4002 pre-auth message, 4003 auth failed, 4010 stopped by user,
 //   4011 remote control turned off in Zen (sticky), 4012 heartbeat timeout (not sticky).
@@ -52,7 +61,6 @@ const HANDOFF_FILE = "hirozen-handoff.json";
 const STATUS_FILE = "hirozen-status.json";
 const POLL_MS = 2_000;
 const AUTH_TIMEOUT_MS = 10_000;
-const BIDI_COMMAND_TIMEOUT_MS = 60_000;
 const SESSION_END_TIMEOUT_MS = 5_000;
 const STOP_TIMEOUT_MS = 10_000;
 const STOP_SETTLE_TIMEOUT_MS = 5_000;
@@ -62,8 +70,22 @@ const HEARTBEAT_REAP_MS = 1_000;
 const HEARTBEAT_TIMEOUT_MS = 15_000;
 const BIDI_PORT = 9222;
 const BIDI_URL = `ws://127.0.0.1:${BIDI_PORT}/session`;
-const SANDBOX = "hirozen";
-const TEXT_CAP = 40_000;
+const ACTOR_NAME = "Hirozen";
+const ACTOR_TIMEOUT_MS = 10_000;
+const ONDEMAND_BIDI_TIMEOUT_MS = 10_000; // upload/dialog commands: the V1 60 s #call default is too long
+const GATE_TIMEOUT_MS = 120_000;
+const NAVIGATE_TIMEOUT_MS = 12_000;
+const NAVIGATE_POLL_MS = 100;
+const AGENT_SPACE_NAME = "Hirozen Agent";
+const AGENT_SPACE_TIMEOUT_MS = 5_000;
+const AGENT_SPACE_POLL_MS = 100;
+const GLANCE_TIMEOUT_MS = 10_000;
+const TAB_OPEN_GRACE_MS = 1_000; // popups from an agent-space tab are re-homed for 1 s after the act
+const DEFERRED_CLOSE_MS = 5_000; // an external stop closes even if replies are still owed
+const XHTML_NS = "http://www.w3.org/1999/xhtml";
+// The only privileged pages a navigate may leave: an empty tab has no content to protect, and the
+// agent needs to reach the web from one (plan: navigate's exemption from E_PRIVILEGED_PAGE).
+const ABOUT_NAVIGABLE = ["about:blank", "about:newtab", "about:home"];
 
 // Prefs: the dynamic-start switch Firefox's own remote-control UI drives, and the Hirozen-owned
 // memory of "Disable remote control permanently" (set on that reason, cleared only when the user
@@ -190,6 +212,23 @@ function isPrivateWindow(w) {
   return lazy.PrivateBrowsingUtils.isWindowPrivate(w);
 }
 
+// A brand-new tab the agent may navigate away from: about:blank/newtab/home, nothing else. Anything
+// under about: (about:config, about:addons, ...) stays E_PRIVILEGED_PAGE like everywhere else.
+function isNavigableAbout(spec) {
+  return ABOUT_NAVIGABLE.some(prefix => spec === prefix || spec.startsWith(`${prefix}#`) || spec.startsWith(`${prefix}?`));
+}
+
+// Upload paths travel from omp already resolved against the omp working directory (src/index.ts), so a
+// relative or empty path is a contract violation, not something to guess about (Gecko would resolve it
+// against Zen's own CWD). Windows drive/UNC paths and POSIX paths are the only accepted shapes.
+function isAbsolutePath(path) {
+  return typeof path === "string" && (/^[a-zA-Z]:[\\/]/.test(path) || path.startsWith("\\\\") || path.startsWith("/"));
+}
+
+function hexOrNull(value) {
+  return typeof value === "string" ? value : null;
+}
+
 // The windows the inventory may describe: the same shape zen.spaces returns.
 function browserWindows() {
   return allBrowserWindows().filter(w => !isPrivateWindow(w));
@@ -296,17 +335,6 @@ function isPrivilegedPage(browser) {
   );
 }
 
-// Runs in the page, in the "hirozen" BiDi sandbox realm, and returns a JSON string so the result
-// crosses the protocol as a single string value.
-const READ_FUNCTION = `() => {
-  const body = document.body;
-  const full = body ? body.innerText : "";
-  const cap = ${TEXT_CAP};
-  const omitted = full.length - cap;
-  const text = omitted > 0 ? full.slice(0, cap) + "\\n\\n[hirozen: truncated - " + omitted + " more characters]" : full;
-  return JSON.stringify({ url: document.location.href, title: document.title, text, truncated: omitted > 0 });
-}`;
-
 const SESSION_NEW_PARAMS = {
   // "ignore" keeps Zen's own prompt handling untouched: the default behaviour auto-dismisses alerts
   // in the user's tabs (UserPromptHandler.sys.mjs).
@@ -316,6 +344,9 @@ const SESSION_NEW_PARAMS = {
 class Loader {
   #started = false;
   #loaderSha256 = null;
+  #childSha256 = null;
+  #parentSha256 = null;
+  #actorError = null; // {code, message, at}: the actor did not register, so no gated method may run
   #client = null; // authenticated omp connection
   #handshakeInFlight = false; // an outgoing connection attempt is in progress
   #tearingDown = false; // a teardown is stopping BiDi; #poll must leave any new handoff to it
@@ -324,12 +355,17 @@ class Loader {
   #status = {
     version: STATUS_VERSION,
     loaderSha256: null,
+    childSha256: null,
+    parentSha256: null,
     zenPid: null,
     state: "dormant",
     mode: null,
     updated: null,
     lastHandoff: null,
     bidi: { state: "off" },
+    consent: "none",
+    consentPending: null,
+    actorError: null,
     lastClose: null,
     lastStartError: null,
     lastStopError: null,
@@ -350,26 +386,66 @@ class Loader {
   #reapTimer = null; // heartbeat reap interval
   #lastInbound = 0; // last frame (JSON) heard from omp; pongs included
   #noticeState = null; // {generation, text, warning, buttons} of the notice currently shown
+  #noticeBase = null; // {text, warning, buttons}: the base notice a BiDi line is appended to
+  #noticeLine = null; // {text, warning}: the BiDi start/stop line, never a replacement (plan)
   #noticeObserver = null; // browser-delayed-startup-finished observer while a notice is up
+  #consent = { scope: null, pending: null }; // per link; created on auth, cleared in #teardown
+  #tabOpenWatchers = new Map(); // window -> {states: [state], handler}: agent-space popup re-homing
 
-  init(mode, sha256) {
+  init(mode, hashes) {
     if (this.#started) return "already-started";
     if (mode !== "startup" && mode !== "attach") {
       throw new Error(`HirozenLoader.init: unknown mode ${mode}`);
     }
     this.#started = true;
-    this.#loaderSha256 = typeof sha256 === "string" ? sha256 : null;
+    this.#loaderSha256 = hexOrNull(hashes?.loader);
+    this.#childSha256 = hexOrNull(hashes?.child);
+    this.#parentSha256 = hexOrNull(hashes?.parent);
+    // Registration first: a failure is a status fact, and every gated method refuses with E_ACTOR
+    // until it is fixed (plan: actorError is separate from lastStartError, which BiDi clears).
+    this.#registerActor();
     this.#writeStatus({
       state: "dormant",
       mode,
       zenPid: Services.appinfo.processID,
       loaderSha256: this.#loaderSha256,
+      childSha256: this.#childSha256,
+      parentSha256: this.#parentSha256,
+      actorError: this.#actorError,
       bidi: { state: "off" },
+      consent: "none",
+      consentPending: null,
       lastClose: null,
       lastStopError: null,
     });
     this.#schedulePoll();
     return "started";
+  }
+
+  // The Hirozen actor is registered here, at init and before the first poll: attach re-init means a
+  // previous registration may exist, and registerWindowActor would throw on a duplicate name.
+  // `remoteTypes: ["web", "file"]` matters: the parent actor map matches by prefix, so "web" covers
+  // every webIsolated content process (temp/spikes/v2 S1). A failure never throws: it is recorded as
+  // actorError, and every gated method refuses with E_ACTOR.
+  #registerActor() {
+    try {
+      ChromeUtils.unregisterWindowActor(ACTOR_NAME);
+    } catch {
+      // Not registered (a fresh startup): nothing to undo.
+    }
+    try {
+      ChromeUtils.registerWindowActor(ACTOR_NAME, {
+        parent: { esModuleURI: "resource://hirozen/HirozenParent.sys.mjs" },
+        child: { esModuleURI: "resource://hirozen/HirozenChild.sys.mjs" },
+        allFrames: false,
+        includeChrome: false,
+        safeForUntrustedWebProcess: true,
+        remoteTypes: ["web", "file"],
+      });
+      this.#actorError = null;
+    } catch (e) {
+      this.#actorError = { code: "E_ACTOR", message: String(e?.message ?? e), at: new Date().toISOString() };
+    }
   }
 
   #writeStatus(patch) {
@@ -436,20 +512,47 @@ class Loader {
     this.#notices.clear();
   }
 
+  // Takes the notice off screen for good (link teardown): unlike #closeNotice, the base is dropped too,
+  // so a later #setNoticeLine cannot bring a dead link's notice back.
+  #hideNotice() {
+    this.#noticeBase = null;
+    this.#noticeLine = null;
+    this.#closeNotice();
+  }
+
   // Shown in every open non-private window, each with its own Stop button: the user may be looking at
   // any of them, and Stop has to be reachable from wherever the prompt is. A window opened while the
   // notice is up gets it too: "browser-delayed-startup-finished" is notified once per top-level
   // browser window (browser-init.js L739, the topic DevToolsStartup.sys.mjs L372-375 listens on).
   // Private windows are excluded, exactly like everywhere else.
-  #showNotice(text, { warning = false, stopButton = true } = {}) {
-    this.#closeNotice();
-    const state = {
-      generation: this.#noticeGen,
+  #showNotice(text, { warning = false, stopButton = true, buttons = null } = {}) {
+    this.#noticeBase = {
       text,
       warning,
-      buttons: stopButton
+      buttons: buttons ?? (stopButton
         ? [{ label: "Stop", callback: () => { this.#disconnect("stopped by user in Zen", CLOSE_STOPPED); return false; } }]
-        : [],
+        : []),
+    };
+    this.#renderNotice();
+  }
+
+  // The BiDi lifecycle (starting / running / refused) is a second line under whatever the base notice
+  // is: while the consent scope is act, the act notice - with the Stop button the user needs - must
+  // never be replaced by a line about uploads (plan: "appended as a second line of the act notice").
+  #setNoticeLine(text, warning = false) {
+    this.#noticeLine = text ? { text, warning } : null;
+    if (this.#noticeBase) this.#renderNotice();
+  }
+
+  #renderNotice() {
+    this.#closeNotice();
+    if (!this.#noticeBase) return;
+    const line = this.#noticeLine;
+    const state = {
+      generation: this.#noticeGen,
+      text: line ? `${this.#noticeBase.text}\n${line.text}` : this.#noticeBase.text,
+      warning: this.#noticeBase.warning || (line?.warning ?? false),
+      buttons: this.#noticeBase.buttons,
     };
     this.#noticeState = state;
     this.#noticeObserver = subject => {
@@ -526,13 +629,18 @@ class Loader {
             // A fresh authenticated connection clears the abandoned flag and joins the pending start:
             // the consent prompt stays open until the user answers it, so it can still be adopted.
             this.#abandoned = false;
+            // The consent state belongs to this link and is never inherited: the previous link's grant
+            // dies with it, so the user's Allow is asked for again (plan §8.2).
+            this.#consent = { scope: null, pending: null };
             this.#startHeartbeat();
             this.#showNotice(`Hirozen: ${this.#who()} is connected. Stop ends the session.`);
-            this.#writeStatus({ state: "connected", lastClose: null });
+            this.#writeStatus({ state: "connected", consent: "none", consentPending: null, lastClose: null });
             ws.send({
               type: "ready",
               loaderVersion: LOADER_VERSION,
               loaderSha256: this.#loaderSha256,
+              childSha256: this.#childSha256,
+              parentSha256: this.#parentSha256,
               zenVersion: Services.appinfo.version,
               platformVersion: Services.appinfo.platformVersion,
               zenPid: Services.appinfo.processID,
@@ -585,12 +693,19 @@ class Loader {
   // is for the external path, whose sticky notice may only appear once the teardown is done.
   #disconnect(reason, code, { notice = false, starting = false, stopping = null } = {}) {
     this.#stopHeartbeat();
-    this.#deferredClose = null;
+    this.#clearDeferredClose();
     const ws = this.#client;
     const done = this.#teardown(reason, { stopping });
     ws?.close(code, reason);
     if (notice) done.then(() => this.#showRemoteOffNotice(reason, starting));
     return done;
+  }
+
+  // Drops the deferred 4011 close and its 5 s guard timer, if one is armed.
+  #clearDeferredClose() {
+    const deferred = this.#deferredClose;
+    this.#deferredClose = null;
+    if (deferred?.timer) clearTimeout(deferred.timer);
   }
 
   // The one notice that survives its teardown (user decision 2026-09-28): the link is gone, so there
@@ -639,9 +754,13 @@ class Loader {
     // Held until the trailing status write: while it is set, #poll leaves a new handoff in the profile
     // instead of accepting a session whose status this teardown would immediately overwrite.
     this.#tearingDown = true;
-    this.#deferredClose = null;
+    this.#clearDeferredClose();
+    // The link is gone: a pending gate has nobody to answer to, its waiters must not hang, and the
+    // grant itself dies here (a new link asks again).
+    this.#clearConsent({ rejectPending: new LoaderError("E_STOPPED", "the omp link closed while the Allow/Deny notice was up") });
+    this.#clearTabOpenWatchers();
     try {
-      this.#writeStatus({ state: "stopping", lastClose: reason });
+      this.#writeStatus({ state: "stopping", consent: "none", consentPending: null, lastClose: reason });
       if (this.#startPromise) {
         // A consent prompt is still pending. Gecko's confirmEx cannot be dismissed from code, and
         // stopAtRuntime never waits for createSession (RemoteAgent #stop), so the start may stay pending
@@ -653,29 +772,172 @@ class Loader {
         // stopAtRuntime() would race the first one's httpd teardown.
         await (stopping ?? this.#stopBidi(reason)).catch(() => {});
       }
-      this.#closeNotice();
-      this.#writeStatus({ state: "dormant" });
+      this.#hideNotice();
+      this.#writeStatus({ state: "dormant", consent: "none", consentPending: null });
     } finally {
       this.#tearingDown = false;
     }
   }
 
+  // Clears the gate: a pending Allow/Deny notice is cancelled (its waiters get `rejectPending`), the
+  // notice returns to the pre-prompt state (or is dropped entirely when the link is going away), and
+  // the granted scope is either reset (link teardown) or left alone (prompt cancelled on its own).
+  #clearConsent({ rejectPending, resetScope = false } = {}) {
+    const pending = this.#consent.pending;
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.#consent.pending = null;
+      pending.reject(rejectPending ?? new LoaderError("E_DENIED", "the Allow/Deny notice was cancelled"));
+    }
+    if (resetScope) this.#consent.scope = null;
+  }
+
   async #handle(msg) {
+    // An external stop already armed the deferred 4011 close: nothing new may start on this link
+    // (plan: "#handle rejects new requests with E_STOPPED").
+    if (this.#deferredClose) {
+      throw new LoaderError("E_STOPPED", "remote control was turned off in Zen; the session is ending");
+    }
     const params = msg.params ?? {};
+    // Per-request budget: frames run concurrently, so the deadline travels with the call, not in a
+    // field. Checkpoint 1 of the plan: the entry check, before any prompt. `bidi.stop` is exempt - it
+    // is the way out, and refusing to stop because a budget passed would be worse than the delay.
+    const req = { deadline: Number.isFinite(msg.deadline) ? msg.deadline : null };
+    if (msg.method !== "bidi.stop") this.#checkDeadline(req);
     switch (msg.method) {
       case "zen.inventory":
         return this.#inventory();
       case "zen.spaces":
         return browserWindows().map(windowSummary);
       case "browser.read":
-        return this.#read(params);
+        return this.#read(params, req);
       case "browser.screenshot":
-        return this.#screenshot(params);
+        return this.#screenshot(params, req);
+      case "browser.snapshot":
+        return this.#snapshot(params, req);
+      case "browser.act":
+        return this.#act(params, req);
+      case "browser.upload":
+        return this.#upload(params, req);
+      case "browser.dialog":
+        return this.#dialog(params, req);
+      case "zen.open":
+        return this.#zenOpen(params, req);
+      case "zen.move":
+        return this.#zenMove(params, req);
+      case "zen.split":
+        return this.#zenSplit(params, req);
+      case "zen.unsplit":
+        return this.#zenUnsplit(params, req);
+      case "zen.glance":
+        return this.#zenGlance(params, req);
       case "bidi.stop":
         return this.#stopBidi("omp requested");
       default:
         throw new LoaderError("E_UNKNOWN_METHOD", `unknown method ${msg.method}`);
     }
+  }
+
+  // The plan's checkpoint (1)-(4): a request whose absolute deadline passed must not act. The caller
+  // checks it again after the gate (2), after #ensureBidi (3) and immediately before each side effect
+  // (4); a missing/non-finite deadline means no check at all (V1 callers send none).
+  #checkDeadline(req) {
+    if (!req || !Number.isFinite(req.deadline)) return;
+    if (Date.now() >= req.deadline) {
+      throw new LoaderError("E_DEADLINE", "omp's budget for this call passed before anything was done; nothing was changed and the call can be retried");
+    }
+  }
+
+  // ---------------------------------------------------------------- consent gate (§8.2)
+
+  // Order of strength: null < "read" < "act". A granted act covers read.
+  #scopeCovers(granted, needed) {
+    if (granted === "act") return true;
+    return granted === "read" && needed === "read";
+  }
+
+  #consentVerb(scope) {
+    return scope === "act" ? "read and act on pages" : "read pages";
+  }
+
+  // Body of the gate call: the actor must be registered (a broken install refuses loudly, and no
+  // prompt is shown for a feature that cannot work), then the current scope decides whether the user
+  // has to be asked. Joined calls wait on the one pending promise, so one answer settles them all.
+  async #gate(scope, req) {
+    if (this.#actorError) {
+      throw new LoaderError("E_ACTOR", `Hirozen's actor is not registered in Zen (${this.#actorError.message}); reinstall or fix the loader and restart Zen`);
+    }
+    if (this.#scopeCovers(this.#consent.scope, scope)) return;
+    let pending = this.#consent.pending;
+    if (pending) {
+      if (scope === "act" && pending.scope === "read") this.#upgradePrompt(pending);
+      await pending.promise;
+      return;
+    }
+    const { promise, resolve, reject } = Promise.withResolvers();
+    pending = { scope, promise, resolve, reject, timer: null };
+    this.#consent.pending = pending;
+    // 120 s is the plan's bound: no answer is a Deny (not sticky - the next call asks again). The
+    // timer is real (the loader has no clock of its own), and never restarted by an upgrade.
+    pending.timer = setTimeout(() => this.#settleConsent(pending, { granted: false, timedOut: true }), GATE_TIMEOUT_MS);
+    this.#writeStatus({ consentPending: pending.scope });
+    this.#emit("consent.pending", { scope: pending.scope });
+    this.#showConsentNotice();
+    await promise;
+  }
+
+  // An act call arriving while a read prompt is up upgrades the prompt in place: same notice, same
+  // waiter, same 120 s timer - one answer settles both.
+  #upgradePrompt(pending) {
+    if (pending.scope === "act") return;
+    pending.scope = "act";
+    this.#writeStatus({ consentPending: "act" });
+    this.#emit("consent.pending", { scope: "act" });
+    this.#showConsentNotice();
+  }
+
+  // Allow: the scope is granted to every waiter, the status is written before the event (plan: the
+  // status file must never contradict the terminal hint), and the notice becomes the persistent
+  // connected notice with the granted scope.
+  #settleConsent(pending, { granted, timedOut = false }) {
+    if (this.#consent.pending !== pending) return;
+    clearTimeout(pending.timer);
+    this.#consent.pending = null;
+    const scope = pending.scope;
+    if (granted) {
+      this.#consent.scope = scope;
+      this.#writeStatus({ consent: scope, consentPending: null });
+      this.#emit("consent.granted", { scope });
+      this.#showConsentNotice();
+      pending.resolve({ scope });
+      return;
+    }
+    // Deny or timeout: the scope goes back to what it was, so the notice returns to the one shown
+    // before the prompt, and the next call asks again.
+    this.#writeStatus({ consent: this.#consent.scope ?? "none", consentPending: null });
+    this.#emit("consent.denied", { scope });
+    this.#showConsentNotice();
+    pending.reject(new LoaderError("E_DENIED", timedOut
+      ? "the Allow/Deny notice in Zen was not answered within 120 s; the next call asks again"
+      : "the Allow/Deny notice in Zen was denied; the next call asks again"));
+  }
+
+  // The gate notice: the prompt while an answer is owed, the V1 connected notice plus the granted
+  // scope otherwise. Private windows stay excluded, as for every notice.
+  #showConsentNotice() {
+    const pending = this.#consent.pending;
+    if (pending) {
+      const scope = pending.scope;
+      this.#showNotice(`Hirozen: ${this.#who()} wants to ${this.#consentVerb(scope)} in Zen.`, {
+        buttons: [
+          { label: "Allow", callback: () => { this.#settleConsent(pending, { granted: true }); return false; } },
+          { label: "Deny", callback: () => { this.#settleConsent(pending, { granted: false }); return false; } },
+        ],
+      });
+      return;
+    }
+    const suffix = this.#consent.scope ? ` - Hirozen can ${this.#consentVerb(this.#consent.scope)}` : "";
+    this.#showNotice(`Hirozen: ${this.#who()} is connected${suffix}. Stop ends the session.`);
   }
 
   #inventory() {
@@ -688,9 +950,10 @@ class Loader {
   }
 
   // Resolves a tabKey (= Zen's window-sync tab.id, set on every tab by ZenWindowSync.sys.mjs) into the
-  // BiDi context id for that tab, resolved fresh on every call: the ids are cleared when the last
-  // session ends and follow browser.permanentKey across window-sync swaps.
-  #resolveTarget(tabKey) {
+  // tab, its browser and the actor's WindowGlobalParent. Same five codes and order as V1's
+  // #resolveTarget; the WebDriver context id is no longer resolved here (only upload/dialog need it,
+  // and only after BiDi started).
+  #resolveTab(tabKey, { forScreenshot = false, allowAbout = false } = {}) {
     if (typeof tabKey !== "string" || !tabKey) {
       throw new LoaderError("E_TAB_UNKNOWN", "a tabKey from zen.inventory is required");
     }
@@ -701,22 +964,29 @@ class Loader {
     if (entry.private) {
       throw new LoaderError("E_PRIVATE", `tab ${tabKey} lives in a private window; Hirozen never touches private windows`);
     }
-    // Checked before the loaded state: BiDi only lists the active space, so an unloaded tab in another
-    // space is unreachable for that reason, not because it is lazy.
+    // Checked before the loaded state: an unloaded tab in another space is unreachable for that
+    // reason, not because it is lazy. Deviation 3 narrows the rule: a tab in the agent space stays
+    // reachable while that space is inactive (reads, snapshot, input), but a screenshot of a hidden
+    // tab is still refused - there is nothing on screen to draw.
     if (!this.#isInActiveSpace(entry)) {
-      throw new LoaderError("E_TAB_INACTIVE_SPACE", `tab ${tabKey} is in an inactive space; Zen would have to switch spaces to reach it`);
+      const inAgentSpace = !!this.#agentSpaceIdOf(entry.window) && entry.tab.getAttribute("zen-workspace-id") === this.#agentSpaceIdOf(entry.window);
+      const exempt = inAgentSpace && (!forScreenshot || !entry.tab.hidden);
+      if (!exempt) {
+        throw new LoaderError("E_TAB_INACTIVE_SPACE", `tab ${tabKey} is in an inactive space; Zen would have to switch spaces to reach it`);
+      }
     }
     if (!entry.loaded) {
       throw new LoaderError("E_TAB_UNLOADED", `tab ${tabKey} has no docshell yet; open it in Zen first (Hirozen never loads tabs)`);
     }
-    if (isPrivilegedPage(entry.browser)) {
-      throw new LoaderError("E_PRIVILEGED_PAGE", `tab ${tabKey} is a privileged page (${entry.browser.currentURI.spec})`);
+    const spec = entry.browser.currentURI.spec;
+    if (isPrivilegedPage(entry.browser) && !(allowAbout && isNavigableAbout(spec))) {
+      throw new LoaderError("E_PRIVILEGED_PAGE", `tab ${tabKey} is a privileged page (${spec})`);
     }
-    const contextId = lazy.NavigableManager.getIdForBrowser(entry.browser);
-    if (!contextId) {
-      throw new LoaderError("E_TAB_UNKNOWN", `tab ${tabKey} has no WebDriver context id`);
+    const wg = entry.browser.browsingContext?.currentWindowGlobal ?? null;
+    if (!wg) {
+      throw new LoaderError("E_TAB_UNLOADED", `tab ${tabKey} has no live document; open it in Zen first (Hirozen never loads tabs)`);
     }
-    return { tabKey, contextId };
+    return { tabKey, tab: entry.tab, browser: entry.browser, wg };
   }
 
   // Pinned and essential tabs carry no zen-workspace-id and are visible from every space.
@@ -726,39 +996,660 @@ class Loader {
     return spaceId === entry.window.gZenWorkspaces?.activeWorkspace;
   }
 
-  async #read(params) {
-    const { tabKey, contextId } = this.#resolveTarget(params?.tabKey);
-    await this.#ensureBidi();
-    const result = await this.#call("script.callFunction", {
-      functionDeclaration: READ_FUNCTION,
-      target: { context: contextId, sandbox: SANDBOX },
-      awaitPromise: false,
-    }, "browser.read");
-    // script.callFunction answers {realm, type, result: {type, value}} or {type: "exception", ...}.
-    const value = result?.result?.value;
-    if (typeof value !== "string") {
-      const detail = result?.type === "exception"
-        ? `script exception: ${result.exceptionDetails?.text ?? "unknown"}`
-        : `unexpected result type ${result?.result?.type ?? result?.type ?? "none"}`;
-      throw new LoaderError("E_READ_FAILED", `browser.read could not read tab ${tabKey}: ${detail}`);
+  // ---------------------------------------------------------------- actor calls
+
+  // One round trip to the Hirozen content actor. `getActor` throws (or answers null) for a window
+  // global the registration does not cover - privileged pages included - which is exactly what
+  // E_PRIVILEGED_PAGE means here. AbortError/actor-destroyed is a stale ref for `act` (the document
+  // the ref came from is gone) and a read failure otherwise; a child `{error}` reply crosses as its
+  // own LoaderError; the 10 s bound is the plan's.
+  async #query(wg, name, data, { kind = "read" } = {}) {
+    let actor = null;
+    try {
+      actor = wg.getActor(ACTOR_NAME);
+    } catch {
+      actor = null;
     }
-    const page = JSON.parse(value);
-    return { tabKey, url: page.url, title: page.title, text: page.text, truncated: page.truncated };
+    if (!actor) {
+      throw new LoaderError("E_PRIVILEGED_PAGE", `Hirozen's actor is not available for this document (${name})`);
+    }
+    const query = Promise.resolve()
+      .then(() => actor.sendQuery(name, data))
+      .then(
+        reply => {
+          if (reply?.error) {
+            throw new LoaderError(reply.error.code ?? "E_INTERNAL", reply.error.message ?? `actor ${name} failed`);
+          }
+          return reply;
+        },
+        e => { throw actorFailure(e, name, kind); }
+      );
+    return this.#withTimeout(query, ACTOR_TIMEOUT_MS, new LoaderError("E_TIMEOUT", `the page actor did not answer ${name} within ${ACTOR_TIMEOUT_MS} ms`));
   }
 
-  async #screenshot(params) {
-    const { tabKey, contextId } = this.#resolveTarget(params?.tabKey);
-    await this.#ensureBidi();
-    // captureScreenshot defaults to the viewport origin and the PNG format (browsingContext.sys.mjs).
-    const result = await this.#call("browsingContext.captureScreenshot", { context: contextId }, "browser.screenshot");
-    if (typeof result?.data !== "string" || !result.data) {
-      throw new LoaderError("E_READ_FAILED", `captureScreenshot returned no image data for tab ${tabKey}`);
-    }
-    return { tabKey, mimeType: "image/png", data: result.data };
+  // A bound that never leaves its timer behind: the race is settled by whichever side finishes first.
+  #withTimeout(promise, ms, error) {
+    const { promise: timeout, resolve } = Promise.withResolvers();
+    const timer = setTimeout(() => resolve(error), ms);
+    return Promise.race([promise, timeout]).then(
+      value => { clearTimeout(timer); if (value instanceof LoaderError) throw value; return value; },
+      e => { clearTimeout(timer); throw e; }
+    );
   }
 
-  // Single-flight start: the caller assigns #startPromise synchronously, before any await, so every
-  // browser.* call either starts one session or joins the one already starting. Two concurrent starts
+  // For `act` (and navigate): the page may open a dialog instead of doing anything visible - a click
+  // on a confirm() trigger, an alert during a load. BiDi would answer userPromptOpened; with no BiDi
+  // running the loader races the same moment through the `common-dialog-loaded` observer and answers
+  // {ok:true, dialog:{type, message}}, so omp learns why the page stopped and can call browser_dialog.
+  async #queryAct(wg, data, browser) {
+    const query = this.#query(wg, "act", data, { kind: "act" });
+    const dialog = this.#dialogRace(browser);
+    try {
+      const winner = await Promise.race([query.then(reply => ({ reply })), dialog.promise.then(info => ({ info }))]);
+      if (winner.info) {
+        // The actor's answer is no longer interesting: the dialog owns the tab now. A late rejection
+        // is reported to nobody, because the race already settled this call.
+        query.catch(() => {});
+        return { ok: true, dialog: winner.info };
+      }
+      return winner.reply;
+    } finally {
+      dialog.cancel();
+    }
+  }
+
+  // Watches `common-dialog-loaded` for a dialog owned by this tab's browsing context
+  // (PromptListener matches the same `subject.args.owningBrowsingContext`) and resolves with
+  // {type, message}; the promise never settles on its own, which is why every caller races it and
+  // cancels the observer when the race is over.
+  #dialogRace(browser) {
+    let resolve = null;
+    const promise = new Promise(r => { resolve = r; });
+    const observer = {
+      observe(subject) {
+        let args = null;
+        try {
+          args = subject?.Dialog?.args ?? null;
+        } catch {
+          args = null;
+        }
+        const owning = args?.owningBrowsingContext ?? null;
+        if (!owning || !browser.browsingContext) return;
+        let same = false;
+        try {
+          same = owning === browser.browsingContext || owning.top === browser.browsingContext;
+        } catch {
+          same = false;
+        }
+        if (!same) return;
+        let message = "";
+        try {
+          message = subject.Dialog?.ui?.infoBody?.textContent ?? "";
+        } catch {
+          message = "";
+        }
+        resolve({ type: args.inPermitUnload ? "beforeunload" : (args.promptType ?? null), message });
+      },
+    };
+    Services.obs.addObserver(observer, "common-dialog-loaded");
+    return { promise, cancel: () => Services.obs.removeObserver(observer, "common-dialog-loaded") };
+  }
+
+  async #read(params, req) {
+    const { tabKey, wg } = this.#resolveTab(params?.tabKey);
+    await this.#gate("read", req);
+    this.#checkDeadline(req);
+    const reply = await this.#query(wg, "read", {});
+    const fullLength = Number.isFinite(reply?.fullLength) ? reply.fullLength : null;
+    let page;
+    try {
+      page = JSON.parse(reply?.json ?? "");
+    } catch {
+      throw new LoaderError("E_READ_FAILED", `browser.read could not read tab ${tabKey}: the page actor returned no usable JSON`);
+    }
+    const text = typeof page?.text === "string" ? page.text : "";
+    return {
+      tabKey,
+      url: page?.url ?? "",
+      title: page?.title ?? "",
+      text,
+      // The actor reports the untruncated length too, so the flag survives an extraction that no
+      // longer ships the "truncated" field.
+      truncated: page?.truncated === true || (fullLength !== null && fullLength > text.length),
+    };
+  }
+
+  // The screenshot path BiDi used (captureScreenshot = currentWindowGlobal.drawSnapshot) moved into
+  // the parent, exactly as the S4 spike ran it: the actor measures the visual viewport, drawSnapshot
+  // returns an ImageBitmap, and a chrome canvas turns it into the same PNG byte-for-byte.
+  async #screenshot(params, req) {
+    const { tabKey, tab, browser, wg } = this.#resolveTab(params?.tabKey, { forScreenshot: true });
+    await this.#gate("read", req);
+    this.#checkDeadline(req);
+    const vp = await this.#query(wg, "viewport", {});
+    const win = browser.ownerGlobal ?? tab.ownerDocument?.defaultView ?? null;
+    if (!win) {
+      throw new LoaderError("E_READ_FAILED", `browser.screenshot could not find the window that owns tab ${tabKey}`);
+    }
+    const scale = browser.browsingContext?.overrideDPPX || win.devicePixelRatio || 1;
+    const rect = new win.DOMRect(vp.x, vp.y, vp.width, vp.height);
+    const snapshot = await wg.drawSnapshot(rect, scale, "rgb(255,255,255)");
+    try {
+      const canvas = win.document.createElementNS(XHTML_NS, "canvas");
+      canvas.width = Math.round(vp.width * scale);
+      canvas.height = Math.round(vp.height * scale);
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(snapshot, 0, 0);
+      const dataUrl = canvas.toDataURL("image/png");
+      const data = dataUrl.slice(dataUrl.indexOf(",") + 1);
+      if (!data) throw new LoaderError("E_READ_FAILED", `browser.screenshot produced no image data for tab ${tabKey}`);
+      return { tabKey, mimeType: "image/png", data };
+    } finally {
+      // ImageBitmap.close is best-effort: a closed bitmap must never mask the real result.
+      try {
+        snapshot.close();
+      } catch {
+        // Nothing to do: the bitmap is collected with the canvas either way.
+      }
+    }
+  }
+
+  async #snapshot(params, req) {
+    const { tabKey, wg } = this.#resolveTab(params?.tabKey);
+    await this.#gate("read", req);
+    this.#checkDeadline(req);
+    const reply = await this.#query(wg, "snapshot", {});
+    return {
+      tabKey,
+      url: reply?.url ?? "",
+      title: reply?.title ?? "",
+      elements: Array.isArray(reply?.elements) ? reply.elements : [],
+      truncated: reply?.truncated === true,
+    };
+  }
+
+  // The dialog-owned act: `{action, ref?, text?, key?, dy?}`, validated here and forwarded to the
+  // actor as-is (the child re-checks, because the parent cannot see the DOM). Params are validated
+  // before the gate, so a malformed call never costs the user a prompt.
+  async #act(params, req) {
+    const action = params?.action;
+    const ref = params?.ref;
+    const text = params?.text;
+    const key = params?.key;
+    const dy = params?.dy;
+    const ACTIONS = ["click", "type", "press", "scroll", "navigate"];
+    if (typeof action !== "string" || !ACTIONS.includes(action)) {
+      throw new LoaderError("E_BAD_PARAMS", `browser.act needs action to be one of ${ACTIONS.join(", ")}`);
+    }
+    if (action === "click" && (typeof ref !== "string" || !ref)) {
+      throw new LoaderError("E_BAD_PARAMS", "browser.act click needs a ref from browser_snapshot");
+    }
+    if (action === "type") {
+      if (typeof ref !== "string" || !ref) throw new LoaderError("E_BAD_PARAMS", "browser.act type needs a ref from browser_snapshot");
+      if (typeof text !== "string") throw new LoaderError("E_BAD_PARAMS", "browser.act type needs text");
+      if (text.length > 2000) throw new LoaderError("E_BAD_PARAMS", "browser.act type accepts at most 2000 characters per call");
+    }
+    if (action === "press") {
+      const KEYS = ["Enter", "Tab", "Escape", "Backspace", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End"];
+      if (typeof key !== "string" || !KEYS.includes(key)) {
+        throw new LoaderError("E_BAD_PARAMS", `browser.act press needs key to be one of ${KEYS.join(", ")}`);
+      }
+      if (ref !== undefined && (typeof ref !== "string" || !ref)) {
+        throw new LoaderError("E_BAD_PARAMS", "browser.act press accepts a ref only as a non-empty string");
+      }
+    }
+    if (action === "scroll") {
+      const hasRef = typeof ref === "string" && !!ref;
+      const hasDy = Number.isInteger(dy);
+      if (hasRef === hasDy) {
+        throw new LoaderError("E_BAD_PARAMS", "browser.act scroll needs either a ref or an integer dy");
+      }
+      if (hasDy && Math.abs(dy) > 10_000) {
+        throw new LoaderError("E_BAD_PARAMS", "browser.act scroll accepts |dy| up to 10000 pixels per call");
+      }
+    }
+    if (action === "navigate") return this.#navigate(params, req);
+
+    const { tabKey, tab, browser, wg } = this.#resolveTab(params?.tabKey);
+    await this.#gate("act", req);
+    this.#checkDeadline(req);
+    const watcher = this.#watchAgentTabOpens(tab, browser);
+    const payload = { action, ref, text, key, dy };
+    // Checkpoint 4: nothing may reach the page once omp gave up (the actor call is the side effect).
+    this.#checkDeadline(req);
+    const reply = await this.#queryAct(wg, payload, browser);
+    const opened = await this.#collectOpened(watcher);
+    return { ...reply, tabKey, opened };
+  }
+
+  // navigate never reaches the child: the loader drives the load itself, with the system principal,
+  // and waits for the URL to move. about:blank/newtab/home are the only privileged pages it may
+  // leave (the plan's exemption); everything else is E_PRIVILEGED_PAGE before anything happens.
+  async #navigate(params, req) {
+    const url = params?.url;
+    if (typeof url !== "string" || !url) {
+      throw new LoaderError("E_BAD_PARAMS", "browser.act navigate needs a url");
+    }
+    let scheme = null;
+    try {
+      scheme = Services.io.newURI(url).scheme;
+    } catch {
+      scheme = null;
+    }
+    if (scheme !== "http" && scheme !== "https") {
+      throw new LoaderError("E_BAD_PARAMS", "browser.act navigate accepts http(s) URLs only");
+    }
+    const { tabKey, tab, browser } = this.#resolveTab(params?.tabKey, { allowAbout: true });
+    await this.#gate("act", req);
+    this.#checkDeadline(req);
+    const watcher = this.#watchAgentTabOpens(tab, browser);
+    const before = browser.currentURI.spec;
+    const dialog = this.#dialogRace(browser);
+    const started = Date.now();
+    try {
+      this.#checkDeadline(req);
+      browser.fixupAndLoadURIString(url, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });
+      for (;;) {
+        const spec = browser.currentURI.spec;
+        if (browser.webProgress?.isLoadingDocument !== true && spec !== before) {
+          return { ok: true, tabKey, url: spec, title: tab.label ?? "", opened: await this.#collectOpened(watcher) };
+        }
+        if (Date.now() - started > NAVIGATE_TIMEOUT_MS) {
+          throw new LoaderError("E_TIMEOUT", `browser.act navigate waited ${NAVIGATE_TIMEOUT_MS} ms for tab ${tabKey} to load ${url}`);
+        }
+        // A page that answers with a dialog instead of loading (beforeunload, an alert during load):
+        // the same race act uses, so omp gets the dialog facts rather than a timeout.
+        const winner = await Promise.race([
+          pageSleep(NAVIGATE_POLL_MS),
+          dialog.promise.then(info => ({ info })),
+        ]);
+        if (winner?.info) {
+          return { ok: true, tabKey, dialog: winner.info, opened: await this.#collectOpened(watcher) };
+        }
+      }
+    } finally {
+      dialog.cancel();
+    }
+  }
+
+  // File uploads are one of the two BiDi-on-demand features (the actor cannot set files on an input
+  // without a file picker). mark/unmark bracket the work so the node can be located by attribute and
+  // nothing is left in the DOM afterwards (plan: "no DOM attributes left behind").
+  async #upload(params, req) {
+    const ref = params?.ref;
+    const paths = params?.paths;
+    if (typeof ref !== "string" || !ref) {
+      throw new LoaderError("E_BAD_PARAMS", "browser.upload needs a ref from browser_snapshot");
+    }
+    if (!Array.isArray(paths) || paths.length === 0 || paths.some(path => !isAbsolutePath(path))) {
+      throw new LoaderError("E_BAD_PARAMS", "browser.upload needs paths as a non-empty array of absolute file paths");
+    }
+    const { tabKey, browser, wg } = this.#resolveTab(params?.tabKey);
+    await this.#gate("act", req);
+    this.#checkDeadline(req);
+    await this.#ensureBidi();
+    this.#checkDeadline(req);
+    const contextId = lazy.NavigableManager.getIdForBrowser(browser);
+    if (!contextId) {
+      throw new LoaderError("E_TAB_UNKNOWN", `tab ${tabKey} has no WebDriver context id`);
+    }
+    // Per call and selector-safe (hex): the attribute is what locateNodes looks for, and the child
+    // compares the value it was given, so a stale attribute from a crashed call can never match.
+    const nonce = randomHex(8);
+    await this.#query(wg, "mark", { ref, nonce });
+    try {
+      const located = await this.#bidiCall("browsingContext.locateNodes", {
+        context: contextId,
+        locator: { type: "css", value: `[data-hirozen-upload="${nonce}"]` },
+      }, "upload");
+      const element = { sharedId: located?.nodes?.[0]?.sharedId };
+      if (!element.sharedId) {
+        throw new LoaderError("E_REF_STALE", `the element ref is gone from tab ${tabKey}; take a fresh browser_snapshot`);
+      }
+      this.#checkDeadline(req);
+      await this.#bidiCall("input.setFiles", { context: contextId, element, files: paths }, "upload");
+      return { ok: true, tabKey, files: paths };
+    } finally {
+      // The attribute must never survive the call, whatever happened (plan: mark/unmark in finally).
+      await this.#query(wg, "unmark", { nonce }).catch(() => {});
+    }
+  }
+
+  async #dialog(params, req) {
+    const accept = params?.accept;
+    const text = params?.text;
+    if (typeof accept !== "boolean") {
+      throw new LoaderError("E_BAD_PARAMS", "browser.dialog needs accept as a boolean");
+    }
+    if (text !== undefined && typeof text !== "string") {
+      throw new LoaderError("E_BAD_PARAMS", "browser.dialog accepts text as a string only");
+    }
+    const { tabKey, browser } = this.#resolveTab(params?.tabKey);
+    await this.#gate("act", req);
+    this.#checkDeadline(req);
+    await this.#ensureBidi();
+    this.#checkDeadline(req);
+    const contextId = lazy.NavigableManager.getIdForBrowser(browser);
+    if (!contextId) {
+      throw new LoaderError("E_TAB_UNKNOWN", `tab ${tabKey} has no WebDriver context id`);
+    }
+    const command = { context: contextId, accept };
+    if (typeof text === "string") command.userText = text;
+    this.#checkDeadline(req);
+    await this.#bidiCall("browsingContext.handleUserPrompt", command, "dialog");
+    return { ok: true, tabKey, accept };
+  }
+
+  // ---------------------------------------------------------------- agent-space popups
+
+  // While an act/navigate runs on an agent-space tab (and for 1 s after), a tab that tab opens - a
+  // window.open the agent's trusted click is allowed to make - is moved into the agent space, and if
+  // it stole the selection the user's previous tab is re-selected: the user's space must not change
+  // (plan: "popups from agent-space tabs").
+  #watchAgentTabOpens(tab, browser) {
+    const win = browser.ownerGlobal ?? tab.ownerDocument?.defaultView ?? null;
+    const spaceId = win ? this.#agentSpaceIdOf(win) : null;
+    if (!win || !spaceId || tab.getAttribute("zen-workspace-id") !== spaceId) return null;
+    let box = this.#tabOpenWatchers.get(win);
+    if (!box) {
+      box = { win, states: [], handler: null };
+      box.handler = event => this.#onAgentTabOpen(box, event);
+      win.addEventListener("TabOpen", box.handler, true);
+      this.#tabOpenWatchers.set(win, box);
+    }
+    const state = {
+      agentTab: tab,
+      spaceId,
+      previousSelected: win.gBrowser?.selectedTab ?? null,
+      opened: [],
+      done: null,
+      finish: null,
+      timer: null,
+    };
+    state.done = new Promise(resolve => { state.finish = resolve; });
+    state.timer = setTimeout(() => this.#unwatchAgentTabOpens(win, box, state), TAB_OPEN_GRACE_MS);
+    box.states.push(state);
+    return state;
+  }
+
+  #onAgentTabOpen(box, event) {
+    const opened = event?.target;
+    if (!opened || !box.states.length) return;
+    const state = box.states.find(candidate => opened.openerTab === candidate.agentTab || opened.ownerTab === candidate.agentTab);
+    if (!state) return;
+    const win = box.win;
+    try {
+      win.gZenWorkspaces?.moveTabToWorkspace(opened, state.spaceId);
+    } catch {
+      // Zen refused the move (a pinned/essential tab): the tab stays where it opened, and the reply
+      // still reports it so omp can react.
+    }
+    if (opened.selected && state.previousSelected && !state.previousSelected.closed) {
+      try {
+        win.gBrowser.selectedTab = state.previousSelected;
+      } catch {
+        // The previous tab went away in the same breath: there is nothing to restore.
+      }
+    }
+    if (opened.id) state.opened.push(opened.id);
+  }
+
+  // Waits out the 1 s grace so a popup that only reaches the parent after the actor answered is still
+  // re-homed and reported, then returns the tab keys that were opened by the acted-on tab.
+  async #collectOpened(state) {
+    if (!state) return [];
+    await state.done;
+    return state.opened;
+  }
+
+  #unwatchAgentTabOpens(win, box, state) {
+    clearTimeout(state.timer);
+    const index = box.states.indexOf(state);
+    if (index >= 0) box.states.splice(index, 1);
+    state.finish();
+    if (!box.states.length) {
+      try {
+        win.removeEventListener("TabOpen", box.handler, true);
+      } catch {
+        // The window is gone; its listeners went with it.
+      }
+      this.#tabOpenWatchers.delete(win);
+    }
+  }
+
+  #clearTabOpenWatchers() {
+    for (const [win, box] of [...this.#tabOpenWatchers]) {
+      for (const state of [...box.states]) this.#unwatchAgentTabOpens(win, box, state);
+    }
+    this.#tabOpenWatchers.clear();
+  }
+
+  // ---------------------------------------------------------------- Zen layout
+
+  // The most recent non-private browser window: layout methods act on one window (its own tab copies
+  // are the ones Zen moves), and a private window is never a target.
+  #targetWindow() {
+    const recent = Services.wm.getMostRecentWindow?.("navigator:browser") ?? null;
+    if (recent && !recent.closed && !isPrivateWindow(recent)) return recent;
+    return browserWindows().find(w => !w.closed) ?? null;
+  }
+
+  // The window's tab element for a sync id: fenix-style lookups elsewhere use collectTabs(), but Zen
+  // moves a tab by the copy the target window owns.
+  #windowTab(win, tabKey) {
+    if (typeof tabKey !== "string" || !tabKey) {
+      throw new LoaderError("E_TAB_UNKNOWN", "a tabKey from zen.inventory is required");
+    }
+    const tab = windowTabs(win).find(candidate => candidate.id === tabKey);
+    if (!tab) {
+      throw new LoaderError("E_TAB_UNKNOWN", `no tab with key ${tabKey} in the target window; list tabs with zen.inventory`);
+    }
+    return tab;
+  }
+
+  // The agent space, by name: found when it exists, never created here (only zen.open creates it).
+  #agentSpaceIdOf(win) {
+    try {
+      const space = win.gZenWorkspaces?.getWorkspaces?.()?.find(candidate => candidate.name === AGENT_SPACE_NAME);
+      return space?.uuid ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  #ensureAgentSpace(win) {
+    let spaceId = this.#agentSpaceIdOf(win);
+    if (!spaceId) {
+      // dontChange=true: creating the space must not switch the user's own space (plan).
+      const workspace = win.gZenWorkspaces?.createAndSaveWorkspace?.(AGENT_SPACE_NAME, undefined, true);
+      spaceId = workspace?.uuid ?? null;
+    }
+    if (!spaceId) {
+      throw new LoaderError("E_LAYOUT_REFUSED", "Zen did not create the agent space");
+    }
+    return spaceId;
+  }
+
+  // Wait, bounded, for the space's element to exist: moveTabToWorkspace needs its container.
+  async #waitForSpaceElement(win, spaceId) {
+    const started = Date.now();
+    for (;;) {
+      const el = win.gZenWorkspaces?.workspaceElement?.(spaceId) ?? null;
+      if (el) return;
+      if (Date.now() - started > AGENT_SPACE_TIMEOUT_MS) {
+        throw new LoaderError("E_TIMEOUT", `the Zen space ${AGENT_SPACE_NAME} did not finish loading within ${AGENT_SPACE_TIMEOUT_MS} ms`);
+      }
+      await pageSleep(AGENT_SPACE_POLL_MS);
+    }
+  }
+
+  async #zenOpen(params, req) {
+    const url = params?.url;
+    let scheme = null;
+    try {
+      scheme = Services.io.newURI(url).scheme;
+    } catch {
+      scheme = null;
+    }
+    if (typeof url !== "string" || (scheme !== "http" && scheme !== "https")) {
+      throw new LoaderError("E_BAD_PARAMS", "zen.open accepts http(s) URLs only");
+    }
+    const win = this.#targetWindow();
+    if (!win) {
+      throw new LoaderError("E_TAB_UNKNOWN", "no browser window is open");
+    }
+    await this.#gate("act", req);
+    this.#checkDeadline(req);
+    const spaceId = this.#ensureAgentSpace(win);
+    await this.#waitForSpaceElement(win, spaceId);
+    this.#checkDeadline(req);
+    const tab = win.gBrowser.addTab(url, {
+      triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
+      inBackground: true,
+    });
+    win.gZenWorkspaces.moveTabToWorkspace(tab, spaceId);
+    return { tabKey: tab.id ?? null, spaceId };
+  }
+
+  async #zenMove(params, req) {
+    const spaceId = params?.spaceId;
+    if (typeof spaceId !== "string" || !spaceId) {
+      throw new LoaderError("E_BAD_PARAMS", "zen.move needs spaceId from zen.spaces");
+    }
+    const win = this.#targetWindow();
+    if (!win) {
+      throw new LoaderError("E_TAB_UNKNOWN", "no browser window is open");
+    }
+    const tab = this.#windowTab(win, params?.tabKey);
+    const tabKey = tab.id;
+    await this.#gate("act", req);
+    this.#checkDeadline(req);
+    if (!spacesOf(win).some(space => space.uuid === spaceId)) {
+      throw new LoaderError("E_LAYOUT_REFUSED", `no Zen space with id ${spaceId}`);
+    }
+    // Pinned and essential tabs live in every space and carry no zen-workspace-id: Zen would clone
+    // them instead of moving one tab, so they are refused (plan: layout safety).
+    if (tab.pinned || tab.getAttribute("zen-essential") === "true") {
+      throw new LoaderError("E_LAYOUT_REFUSED", `tab ${tabKey} is pinned or essential; Zen clones those instead of moving them`);
+    }
+    this.#checkDeadline(req);
+    win.gZenWorkspaces.moveTabToWorkspace(tab, spaceId);
+    if (tab.getAttribute("zen-workspace-id") !== spaceId) {
+      throw new LoaderError("E_LAYOUT_REFUSED", `Zen did not move tab ${tabKey} to space ${spaceId}`);
+    }
+    return { tabKey, spaceId };
+  }
+
+  async #zenSplit(params, req) {
+    const tabKeys = params?.tabKeys;
+    const layout = params?.layout;
+    if (!Array.isArray(tabKeys) || tabKeys.length < 2 || tabKeys.length > 4 || tabKeys.some(key => typeof key !== "string" || !key)) {
+      throw new LoaderError("E_BAD_PARAMS", "zen.split needs tabKeys as an array of 2 to 4 tab keys");
+    }
+    if (!["vsep", "hsep", "grid"].includes(layout)) {
+      throw new LoaderError("E_BAD_PARAMS", "zen.split needs layout to be vsep, hsep or grid");
+    }
+    const win = this.#targetWindow();
+    if (!win) {
+      throw new LoaderError("E_TAB_UNKNOWN", "no browser window is open");
+    }
+    const tabs = tabKeys.map(key => this.#windowTab(win, key));
+    await this.#gate("act", req);
+    this.#checkDeadline(req);
+    // Split view is a layout change of the space the user is looking at: never the selected tab (that
+    // would move the user's view), never a tab Zen would clone or silently drop (pinned, essential, or
+    // one in an inactive space - splitTabs filters hidden tabs out and would return undefined).
+    if (win.gBrowser.selectedTab && tabs.includes(win.gBrowser.selectedTab)) {
+      throw new LoaderError("E_LAYOUT_REFUSED", "zen.split refuses to include the selected tab; Zen would move the user's view");
+    }
+    if (tabs.some(tab => tab.pinned || tab.getAttribute("zen-essential") === "true" || tab.hidden)) {
+      throw new LoaderError("E_LAYOUT_REFUSED", "zen.split refuses pinned, essential or hidden tabs; Zen would clone or drop them");
+    }
+    this.#checkDeadline(req);
+    // -1 keeps Zen from selecting any of the tabs (the shipped splitTabs has no activate option).
+    const group = win.gZenViewSplitter.splitTabs(tabs, layout, -1);
+    if (!group) {
+      throw new LoaderError("E_LAYOUT_REFUSED", "Zen refused the split view");
+    }
+    return { groupId: group.groupId ?? null };
+  }
+
+  async #zenUnsplit(params, req) {
+    const win = this.#targetWindow();
+    if (!win) {
+      throw new LoaderError("E_TAB_UNKNOWN", "no browser window is open");
+    }
+    const tab = this.#windowTab(win, params?.tabKey);
+    await this.#gate("act", req);
+    this.#checkDeadline(req);
+    const splitter = win.gZenViewSplitter;
+    const inSplit = !!tab.group?.hasAttribute?.("split-view-group") ||
+      !!splitter?._data?.some(group => group.tabs.includes(tab));
+    if (!inSplit) {
+      throw new LoaderError("E_LAYOUT_REFUSED", `tab ${params?.tabKey} is not in a split view`);
+    }
+    this.#checkDeadline(req);
+    // changeTab:false: the tab leaves its group without the user's selection moving.
+    splitter.removeTabFromGroup(tab, undefined, { changeTab: false });
+    return { ok: true, tabKey: params?.tabKey };
+  }
+
+  async #zenGlance(params, req) {
+    const url = params?.url;
+    let scheme = null;
+    try {
+      scheme = Services.io.newURI(url).scheme;
+    } catch {
+      scheme = null;
+    }
+    if (typeof url !== "string" || (scheme !== "http" && scheme !== "https")) {
+      throw new LoaderError("E_BAD_PARAMS", "zen.glance accepts http(s) URLs only");
+    }
+    const win = this.#targetWindow();
+    if (!win) {
+      throw new LoaderError("E_TAB_UNKNOWN", "no browser window is open");
+    }
+    await this.#gate("act", req);
+    this.#checkDeadline(req);
+    const manager = win.gZenGlanceManager;
+    if (manager?.overlay?.classList?.contains("zen-glance-overlay")) {
+      throw new LoaderError("E_LAYOUT_REFUSED", "a glance is already open in this window");
+    }
+    this.#checkDeadline(req);
+    // The data contract is exact (§14): wrong coordinate keys wedge the glance, and a missing
+    // triggeringPrincipal makes it refuse silently. The 10 s bound plus the recovery below are the
+    // spike's fix for a glance that never finishes animating.
+    const opened = manager.openGlance({
+      url,
+      clientX: 400,
+      clientY: 300,
+      width: 20,
+      height: 20,
+      triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
+    });
+    let tab = null;
+    try {
+      tab = await this.#withTimeout(opened, GLANCE_TIMEOUT_MS, new LoaderError("E_TIMEOUT", `Zen's glance for ${url} did not open within ${GLANCE_TIMEOUT_MS} ms`));
+    } catch (e) {
+      if (e instanceof LoaderError && e.code === "E_TIMEOUT") {
+        // §14 recovery: a wedged animation refuses every later closeGlance, so clear the flags first.
+        try {
+          manager._animating = false;
+          manager.animatingOpen = false;
+          manager.closeGlance();
+        } catch {
+          // Nothing else can be done; the timeout is still the honest answer.
+        }
+      }
+      throw e;
+    }
+    if (!tab) {
+      throw new LoaderError("E_LAYOUT_REFUSED", `Zen refused to open a glance for ${url}`);
+    }
+    return { tabKey: tab.id ?? null };
+  }
+
+
   // would make the second bind fail and force-quit Zen. The promise is also where the failure is
   // persisted for /hirozen-status: every refusal code (#refuseStart) and every start failure lands
   // here, and a session that did start clears the record.
@@ -813,9 +1704,10 @@ class Loader {
   }
 
   async #startBidi() {
-    // Per-attempt state: a new start drops the deferred 4011 close of a previous episode, and clears
-    // the external-stop reason (it is only ever read by the catch of the start that saw it).
-    this.#deferredClose = null;
+    // Per-attempt state: a new start drops the deferred 4011 close of a previous episode (and its
+    // guard timer), and clears the external-stop reason (it is only ever read by the catch of the
+    // start that saw it).
+    this.#clearDeferredClose();
     this.#externalStop = null;
     this.#writeStatus({ bidi: { state: "starting" } });
     this.#emit("bidi.starting", {});
@@ -862,7 +1754,9 @@ class Loader {
         // Another client reached the agent first: its session would receive everything we send, and
         // only one session is possible anyway (doc §4.2 rogue-client race).
         await this.#stopBidi("Remote Agent was already running").catch(() => {});
-        this.#showNotice("Hirozen: Zen's remote agent was already running under another client and was stopped. If you did not expect that, check what else is connecting to Zen.", { warning: true, stopButton: false });
+        // The act notice stays the base (with Stop); the compromise is its warning line, and the
+        // catch below replaces this text with the refusal's own line.
+        this.#setNoticeLine("Hirozen: Zen's remote agent was already running under another client and was stopped. If you did not expect that, check what else is connecting to Zen.", true);
         throw this.#refuseStart("E_COMPROMISE", "Remote Agent was already running before Hirozen started; another client may have been controlling Zen");
       }
     }
@@ -890,7 +1784,9 @@ class Loader {
         throw new LoaderError("E_UNSAFE_START", `unsafe BiDi start: port=${port} dynamic=${RA.isDynamicStartRunning} automation=${RA.isBrowserAutomationRunning} recommendedPrefsApplied=${applied}`);
       }
       await this.#openBidiSocket();
-      this.#showNotice(`Hirozen: answer Zen's "Allow remote control?" dialog to let ${this.#who()} read Zen tabs.`);
+      // The act notice stays the base (it carries Stop and the granted scope); the BiDi lifecycle is
+      // a second line under it, never a replacement (plan §8.2).
+      this.#setNoticeLine('Hirozen: answer Zen\'s "Allow remote control?" dialog to let uploads and page dialogs work.');
       // No timer here: Gecko's consent dialog cannot be dismissed from code, so a bound would only
       // strand the start while the dialog (and the agent) stayed up. This stays joinable until answered.
       const session = await this.#bidiCommand("session.new", SESSION_NEW_PARAMS, Infinity);
@@ -907,35 +1803,38 @@ class Loader {
       }
       this.#writeStatus({ bidi: { state: "running", port, sessionId: session.sessionId } });
       this.#emit("bidi.running", { port, sessionId: session.sessionId });
-      // Consent was granted: the "answer the dialog" wording must not survive on screen.
-      this.#showNotice(`Hirozen: ${this.#who()} is connected - Hirozen can read Zen tabs. Stop ends the session.`);
+      // Consent was granted: the "answer the dialog" line must not survive on screen. The act notice
+      // beneath it stays - the user keeps its Stop button.
+      this.#setNoticeLine("Hirozen: remote control is on for uploads and page dialogs.");
       return { port, sessionId: session.sessionId };
     } catch (e) {
       // Firefox's own stop already ran the external-stop path: it stopped BiDi through the shared
       // single-flight stop, wrote bidi off / lastClose and shows the sticky notice when the teardown
       // settles. This catch reports that outcome - never E_BIDI_LOST - and adds no notice of its own.
+      this.#setNoticeLine(null);
       if (this.#externalStop) {
         throw e instanceof LoaderError ? e : new LoaderError("E_STOPPED", `remote control was turned off in Zen (${this.#externalStop})`);
       }
       // E_INTERNAL for whatever the specific classifiers cannot name: a startAtRuntime rejection and
       // every other unclassified start failure (an unsafe start and a deny keep their own codes).
       const failure = e instanceof LoaderError ? e : classifySessionNewError(e) ?? new LoaderError("E_INTERNAL", String(e?.message ?? e));
-      // Only a notice while omp is still there: an abandoned start already had its notice removed by
+      // Only a line while omp is still there: an abandoned start already had its notice removed by
       // teardown, and re-adding one would leave a Stop button on a dead link.
       const connected = this.#client !== null;
       if (failure.code === "E_COMPROMISE") {
         // A fresh WebDriverBiDi is created per startAtRuntime and the in-progress flag is set by our own
         // call, so a max-sessions failure has no legitimate cause: someone else holds a session.
         await this.#stopBidi("session refused: another session is active").catch(() => {});
-        if (connected) this.#showNotice("Hirozen: Zen refused a remote-control session because another session is already active. The remote agent was stopped; Hirozen has no control.", { warning: true, stopButton: false });
+        if (connected) this.#setNoticeLine("Hirozen: Zen refused a remote-control session because another session is already active. The remote agent was stopped; Hirozen has no remote control.", true);
       } else {
         await this.#stopBidi("BiDi start failed").catch(() => {});
         if (connected) {
           // The prompt settled (Deny) or the start died: either way the dialog is no longer the task.
-          this.#showNotice(
+          this.#setNoticeLine(
             failure.code === "E_DENIED"
-              ? 'Hirozen: the "Allow remote control?" prompt was denied in Zen - Hirozen has no control of Zen. Stop ends the session.'
-              : `Hirozen: remote control could not start (${failure.code}) - Hirozen has no control of Zen. Stop ends the session.`
+              ? 'Hirozen: the "Allow remote control?" prompt was denied in Zen - uploads and page dialogs are unavailable.'
+              : `Hirozen: remote control could not start (${failure.code}) - uploads and page dialogs are unavailable.`,
+            failure.code !== "E_DENIED"
           );
         }
       }
@@ -1023,22 +1922,35 @@ class Loader {
     // Only Disable writes dynamicstart.enabled=false before stopping, so the reason is what turns the
     // user's decision into a sticky memory a later start refuses against.
     if (reason === "disabled permanently") Services.prefs.setBoolPref(PREF_DISABLED_BY_USER, true);
+    // The session is over: a pending Allow/Deny notice is taken down and its waiters are told
+    // (plan: "a pending gate prompt is removed and its waiters get E_STOPPED"). The scope itself is
+    // cleared by the teardown that follows.
+    this.#clearConsent({ rejectPending: new LoaderError("E_STOPPED", `remote control was turned off in Zen (${reason})`) });
+    this.#showConsentNotice();
     // Step 3: the socket is already gone, so the shared stop skips session.end and goes straight to
     // stopAtRuntime(); the stop is handed to the teardown below so it is never run twice. Its rejection
     // is handled here (a failed stop is recorded in the status file, not thrown at the socket close).
     const stopping = this.#stopBidi(reason).catch(() => {});
     // Step 4: if omp is gone there is no link to close and nobody to tell; a connection that still owes
-    // replies gets its 4011 close only after the last reply (see the reply chain in #connect).
+    // replies gets its 4011 close only after the last reply (see the reply chain in #connect) - and at
+    // most DEFERRED_CLOSE_MS later, even if that reply never comes.
     const ws = this.#client;
     if (!ws) return;
     if (ws.pendingReplies === 0) {
       this.#disconnect(reason, CLOSE_REMOTE_OFF, { notice: true, starting, stopping });
     } else {
-      this.#deferredClose = { ws, reason, starting, stopping };
+      const deferred = { ws, reason, starting, stopping, timer: null };
+      deferred.timer = setTimeout(() => {
+        if (this.#deferredClose !== deferred || this.#client !== ws) return;
+        this.#disconnect(reason, CLOSE_REMOTE_OFF, { notice: true, starting, stopping });
+      }, DEFERRED_CLOSE_MS);
+      this.#deferredClose = deferred;
     }
   }
 
-  #bidiCommand(method, params, timeoutMs = BIDI_COMMAND_TIMEOUT_MS) {
+  // Every caller names its own bound: Infinity for session.new (Gecko's consent dialog cannot be
+  // dismissed from code), 5 s for session.end, the on-demand 10 s for upload/dialog.
+  #bidiCommand(method, params, timeoutMs) {
     if (!this.#bidi) return Promise.reject(new LoaderError("E_BIDI_LOST", "BiDi session is not running"));
     const id = this.#bidiNextId++;
     const { promise, resolve, reject } = Promise.withResolvers();
@@ -1059,9 +1971,11 @@ class Loader {
     return promise;
   }
 
-  #call(method, params, label) {
-    return this.#bidiCommand(method, params).catch(e => {
-      throw classifyBidiFailure(e, label);
+  // The on-demand BiDi commands (upload/dialog) are bounded at 10 s, not V1's 60 s #call default:
+  // they run while the user is waiting for a tool result, and the plan names E_TIMEOUT for them.
+  #bidiCall(method, params, kind) {
+    return this.#bidiCommand(method, params, ONDEMAND_BIDI_TIMEOUT_MS).catch(e => {
+      throw classifyOnDemandFailure(e, kind);
     });
   }
 
@@ -1172,13 +2086,42 @@ function classifySessionNewError(e) {
 }
 
 // BiDi answers errors as {error: "<protocol error>", message: "<detail>"}, which #bidiCommand turns
-// into "<error>: <detail>". Only reads and screenshots go through #call, so an error that is not about
-// a tab is a read failure; a LoaderError (the socket-close codes included) passes through unchanged.
-function classifyBidiFailure(e, label) {
+// into "<error>: <detail>". Only upload and dialog reach BiDi now, and the plan names the two mappings
+// they need: a node that went away is a stale ref (the page navigated after mark), and a file input
+// that cannot take these files is not interactable. Everything else stays E_INTERNAL - the honest code
+// for a protocol error neither the loader nor the plan can classify. A LoaderError (the socket-close
+// codes included) passes through unchanged.
+function classifyOnDemandFailure(e, kind) {
   if (e instanceof LoaderError) return e;
-  const text = `${label} failed: ${String(e?.message ?? e)}`;
-  if (/no such frame|no such node|no such (window|context)/i.test(text)) return new LoaderError("E_TAB_UNKNOWN", text);
-  return new LoaderError("E_READ_FAILED", text);
+  const text = `${kind} failed: ${String(e?.message ?? e)}`;
+  if (kind === "upload" && /no such node|no such element|no such frame|no such (window|context)/i.test(text)) {
+    return new LoaderError("E_REF_STALE", text);
+  }
+  if (kind === "upload" && /unable to set file input|unsupported operation/i.test(text)) {
+    return new LoaderError("E_NOT_INTERACTABLE", text);
+  }
+  if (kind === "dialog" && /no such alert/i.test(text)) {
+    return new LoaderError("E_NO_DIALOG", text);
+  }
+  return new LoaderError("E_INTERNAL", text);
+}
+
+// A sendQuery that dies because the document went away is a stale ref for `act` (the element the ref
+// came from is in the old document) and a read failure for everything else (plan: the E_REF_STALE /
+// E_READ_FAILED split by method). Anything else is a read failure with the real message.
+function actorFailure(e, name, kind) {
+  const text = String(e?.message ?? e);
+  const stale = e?.name === "AbortError" || /aborted|actor is dead|destroyed|no longer exists|invalid state/i.test(text);
+  if (stale) {
+    return new LoaderError(kind === "act" ? "E_REF_STALE" : "E_READ_FAILED", `${name} could not be delivered to the page: ${text}`);
+  }
+  return new LoaderError("E_READ_FAILED", `${name} failed: ${text}`);
+}
+
+// The loader's own waits (navigate polling, the agent space element): they must run on the module's
+// timer so the harness can cancel them with every other loader timer.
+function pageSleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 export const HirozenLoader = new Loader();
