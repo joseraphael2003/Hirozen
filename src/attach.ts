@@ -426,9 +426,6 @@ function describeStatus(seen: ZenStatus | null, reported: Record<string, unknown
   return parts.length > 0 ? ` (${parts.join("; ")})` : "";
 }
 
-/** `link.ts` types the V1 status only; the loader's V2 frame adds the two actor hashes. */
-type PinnedStatus = ZenStatus & { childSha256?: unknown; parentSha256?: unknown };
-
 /** Waits for the status the eval writes: mode attach, newer than the start, all three hashes === pins. */
 async function waitForAttach(
   profileDir: string,
@@ -439,7 +436,7 @@ async function waitForAttach(
 ): Promise<ModuleHashes> {
   let seen: ZenStatus | null = null;
   for (;;) {
-    const status = readStatusFile(profileDir) as PinnedStatus | null;
+    const status = readStatusFile(profileDir);
     if (status) seen = status;
     if (
       status?.mode === "attach" &&
