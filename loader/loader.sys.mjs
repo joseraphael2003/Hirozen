@@ -959,7 +959,7 @@ class Loader {
   // tab, its browser and the actor's WindowGlobalParent. Same five codes and order as V1's
   // #resolveTarget; the WebDriver context id is no longer resolved here (only upload/dialog need it,
   // and only after BiDi started).
-  #resolveTab(tabKey, { forScreenshot = false, allowAbout = false } = {}) {
+  #resolveTab(tabKey, { allowAbout = false } = {}) {
     if (typeof tabKey !== "string" || !tabKey) {
       throw new LoaderError("E_TAB_UNKNOWN", "a tabKey from zen.inventory is required");
     }
@@ -971,13 +971,14 @@ class Loader {
       throw new LoaderError("E_PRIVATE", `tab ${tabKey} lives in a private window; Hirozen never touches private windows`);
     }
     // Checked before the loaded state: an unloaded tab in another space is unreachable for that
-    // reason, not because it is lazy. Deviation 3 narrows the rule: a tab in the agent space stays
-    // reachable while that space is inactive (reads, snapshot, input), but a screenshot of a hidden
-    // tab is still refused - there is nothing on screen to draw.
+    // reason, not because it is lazy. Deviation 3 narrows the rule: every tab in the agent space stays
+    // reachable while that space is inactive - reads, snapshot, input and screenshots (drawSnapshot
+    // renders a tab of an inactive space correctly, verified live) - while every other inactive-space
+    // tab keeps E_TAB_INACTIVE_SPACE.
     if (!this.#isInActiveSpace(entry)) {
-      const inAgentSpace = !!this.#agentSpaceIdOf(entry.window) && entry.tab.getAttribute("zen-workspace-id") === this.#agentSpaceIdOf(entry.window);
-      const exempt = inAgentSpace && (!forScreenshot || !entry.tab.hidden);
-      if (!exempt) {
+      const agentSpaceId = this.#agentSpaceIdOf(entry.window);
+      const inAgentSpace = !!agentSpaceId && entry.tab.getAttribute("zen-workspace-id") === agentSpaceId;
+      if (!inAgentSpace) {
         throw new LoaderError("E_TAB_INACTIVE_SPACE", `tab ${tabKey} is in an inactive space; Zen would have to switch spaces to reach it`);
       }
     }
@@ -1129,7 +1130,7 @@ class Loader {
   // the parent, exactly as the S4 spike ran it: the actor measures the visual viewport, drawSnapshot
   // returns an ImageBitmap, and a chrome canvas turns it into the same PNG byte-for-byte.
   async #screenshot(params, req) {
-    const { tabKey, tab, browser, wg } = this.#resolveTab(params?.tabKey, { forScreenshot: true });
+    const { tabKey, tab, browser, wg } = this.#resolveTab(params?.tabKey);
     await this.#gate("read", req);
     this.#checkDeadline(req);
     const vp = await this.#query(wg, "viewport", {});
