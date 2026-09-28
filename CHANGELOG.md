@@ -2,6 +2,31 @@
 
 All notable changes to Hirozen are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
+## [0.2.0] - 2026-09-28
+
+The agent can act in Zen. Verified on Zen 1.22.3b (Gecko 156.0.1), Windows, on a test install. Three files are installed now, so run `/hirozen-install` and restart Zen.
+
+### Added
+
+- Tools `browser_snapshot`, `browser_act` (click, type, press, scroll, navigate), `browser_upload`, `browser_dialog`, `zen_open`, `zen_move`, `zen_split`, `zen_unsplit` and `zen_glance`. Actions ask for omp approval with the tab and target in the details.
+- Hirozen's own Allow/Deny prompt in Zen, with two levels ("read pages", "read and act on pages"), a terminal hint while it waits, and a 120 s timeout.
+- A content actor (`HirozenChild.sys.mjs`) that reads pages and synthesizes trusted input; the install pins its hash and the loader's.
+- A "Hirozen Agent" space for `zen_open`; popups from its tabs stay in it, and your space and selected tab are kept.
+- Per-request deadlines: the loader does nothing once omp has given up (`E_DEADLINE`).
+
+### Changed
+
+- WebDriver BiDi is no longer used. Reads, screenshots, uploads and page dialogs run inside Hirozen, so there is no port 9222, no Firefox "Allow remote control?" dialog and no remote-control banner. BiDi could not reach tabs in inactive Zen spaces.
+- Reads are consented by Hirozen's prompt instead of Firefox's dialog.
+
+### Removed
+
+- Codes `E_PORT_BUSY`, `E_COMPROMISE`, `E_DISABLED_IN_ZEN`, `E_BIDI_LOST`, `E_UNSAFE_START`, `E_SYSTEM_ACCESS`, `E_STOP_FAILED`; close code 4011; the BiDi lines in `/hirozen-status`.
+
+### Known issues
+
+- Not yet validated on a daily profile.
+
 ## [0.1.2] - 2026-09-28
 
 Follow-ups from the V1.1 final wave. Verified on Zen 1.22.3b (Gecko 156.0.1), Windows, on a test install. The loader changed, so run `/hirozen-install` and restart Zen.
@@ -73,6 +98,7 @@ First release: read-only access to a running Zen browser from omp. Verified on Z
 - Two one-off results could not be reproduced: a Deny that returned an uncaptured code, and a transient `E_IN_USE` on an immediate reconnect.
 - Not yet validated on a daily profile. Click, type, navigation and Zen layout actions are planned for V2.
 
-[0.1.2]: https://github.com/joseraphael2003/Hirozen/compare/21eaaec...main
+[0.2.0]: https://github.com/joseraphael2003/Hirozen/compare/1e071bc...main
+[0.1.2]: https://github.com/joseraphael2003/Hirozen/compare/21eaaec...1e071bc
 [0.1.1]: https://github.com/joseraphael2003/Hirozen/compare/aeb80e4...21eaaec
 [0.1.0]: https://github.com/joseraphael2003/Hirozen/commits/main
