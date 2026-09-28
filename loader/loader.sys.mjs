@@ -92,6 +92,10 @@ const ABOUT_NAVIGABLE = ["about:blank", "about:newtab", "about:home"];
 // puts dynamicstart back to true - see #startBidi).
 const PREF_DYNAMIC_START = "remote.experimental.dynamicstart.enabled";
 const PREF_DISABLED_BY_USER = "hirozen.remotecontrol.disabledByUser";
+// Firefox gates the content-process File constructor on this pref (windowglobal/input.sys.mjs
+// createFromFileName), and RemoteAgent only sets it through RecommendedPreferences - which this loader
+// refuses to apply (isBrowserAutomation:false). It is flipped for the input.setFiles command alone.
+const PREF_CREATE_IN_CHILD = "dom.file.createInChild";
 
 // Close codes (contract): 1000 done, 4002 pre-auth message, 4003 auth failed, 4010 stopped by user,
 // 4011 remote control turned off in Zen (sticky, after owed replies), 4012 heartbeat timeout.
@@ -1307,11 +1311,29 @@ class Loader {
         throw new LoaderError("E_REF_STALE", `the element ref is gone from tab ${tabKey}; take a fresh browser_snapshot`);
       }
       this.#checkDeadline(req);
-      await this.#bidiCall("input.setFiles", { context: contextId, element, files: paths }, "upload");
+      await this.#withCreateInChild(() => this.#bidiCall("input.setFiles", { context: contextId, element, files: paths }, "upload"));
       return { ok: true, tabKey, files: paths };
     } finally {
       // The attribute must never survive the call, whatever happened (plan: mark/unmark in finally).
       await this.#query(wg, "unmark", { nonce }).catch(() => {});
+    }
+  }
+
+  // input.setFiles builds its File objects in the content process, which Firefox refuses unless
+  // dom.file.createInChild is set - the pref RemoteAgent would have applied through its
+  // RecommendedPreferences, and the one thing this loader must never do (isBrowserAutomation:false is
+  // what keeps navigator.webdriver false and the automation prefs out of the profile). So the pref is
+  // raised for the setFiles command alone and put back exactly as it was: a user value is restored to
+  // that value, and no user value is cleared again. ChromeOnly API, so no page gains anything.
+  async #withCreateInChild(command) {
+    const hadUserValue = Services.prefs.prefHasUserValue(PREF_CREATE_IN_CHILD);
+    const previous = hadUserValue ? Services.prefs.getBoolPref(PREF_CREATE_IN_CHILD, false) : false;
+    Services.prefs.setBoolPref(PREF_CREATE_IN_CHILD, true);
+    try {
+      return await command();
+    } finally {
+      if (hadUserValue) Services.prefs.setBoolPref(PREF_CREATE_IN_CHILD, previous);
+      else Services.prefs.clearUserPref(PREF_CREATE_IN_CHILD);
     }
   }
 
@@ -2103,8 +2125,13 @@ function classifyOnDemandFailure(e, kind) {
   if (kind === "upload" && /no such node|no such element|no such frame|no such (window|context)/i.test(text)) {
     return new LoaderError("E_REF_STALE", text);
   }
-  if (kind === "upload" && /unable to set file input|unsupported operation/i.test(text)) {
+  if (kind === "upload" && /unable to set file input/i.test(text)) {
     return new LoaderError("E_NOT_INTERACTABLE", text);
+  }
+  // Gecko's UnsupportedOperationError for a path it cannot turn into a File (it vanished, or the
+  // plugin's existence check raced the call): the params are the problem, not the element.
+  if (kind === "upload" && /failed to add file/i.test(text)) {
+    return new LoaderError("E_BAD_PARAMS", text);
   }
   if (kind === "dialog" && /no such alert/i.test(text)) {
     return new LoaderError("E_NO_DIALOG", text);
