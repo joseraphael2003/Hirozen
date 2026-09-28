@@ -1,12 +1,12 @@
 /* Hirozen actor child: the content-process half of the loader-owned "Hirozen" JSWindowActor.
  *
- * The loader drives it with six messages and nothing else. The surface is deliberately tiny: this
+ * The loader drives it with five messages and nothing else. The surface is deliberately tiny: this
  * code runs in every content process with the system principal (doc 15.7).
  *   read     -> {json, fullLength}              the V1 page extraction, as literal module code
  *   viewport -> {x, y, width, height, dpr}      the rectangle the parent feeds to drawSnapshot
  *   snapshot -> {url, title, elements, truncated} visible interactive elements with stable refs
  *   act      -> {ok, url, title}                trusted click/type/press/scroll
- *   mark / unmark                               the upload nonce on a ref'd <input type=file>
+ *   setFiles -> {ok, count}                     File objects onto a ref'd <input type=file>
  *
  * Gecko facts this file depends on (checked against Zen 1.22.3b / Gecko 156.0.1):
  *  - A JSWindowActor child class must be named <ActorName>Child, or sendQuery never settles
@@ -68,8 +68,7 @@ const FALLBACK_CODE = {
   viewport: "E_READ_FAILED",
   snapshot: "E_READ_FAILED",
   act: "E_INTERNAL",
-  mark: "E_INTERNAL",
-  unmark: "E_INTERNAL",
+  setFiles: "E_INTERNAL",
 };
 
 // The keys `press` accepts, as WebDriver key codepoints. sendSingleKey needs the codepoint: passing
@@ -155,12 +154,10 @@ export class HirozenChild extends JSWindowActorChild {
           return this.#snapshot();
         case "act":
           return await this.#act(data);
-        case "mark":
-          return this.#mark(data);
-        case "unmark":
-          return this.#unmark(data);
+        case "setFiles":
+          return this.#setFiles(data);
         default:
-          // The loader only ever sends the six above; anything else is a bug on the parent side.
+          // The loader only ever sends the five above; anything else is a bug on the parent side.
           throw new HirozenError("E_INTERNAL", `HirozenChild: unknown message ${name}`);
       }
     } catch (e) {
@@ -294,33 +291,27 @@ export class HirozenChild extends JSWindowActorChild {
     return { ok: true, url: doc ? doc.location.href : "", title: doc ? doc.title : "" };
   }
 
-  // mark/unmark carry the upload nonce the loader locates the input by afterwards
-  // (browsingContext.locateNodes with a CSS attribute selector), so the attribute has to be gone
-  // again in the loader's finally - the page must never be left carrying a Hirozen attribute.
-  #mark(data) {
+  // The upload path, without BiDi: the loader makes the File objects in the parent process (they
+  // cross sendQuery by structured clone) and this puts them on the ref'd <input type=file> the way
+  // the shipped input.setFiles does (chrome/remote/.../modules/input.sys.mjs): validate, then
+  // mozSetFileArray plus the two bubbling events, so the page's own input/change handlers run.
+  #setFiles(data) {
     this.#window();
-    if (typeof data.nonce !== "string" || !data.nonce) {
-      throw new HirozenError("E_BAD_PARAMS", "mark needs a non-empty nonce");
+    if (!Array.isArray(data.files) || !data.files.length) {
+      throw new HirozenError("E_BAD_PARAMS", "setFiles needs a non-empty list of File objects");
     }
     const el = this.#element(data.ref);
     const type = (el.getAttribute("type") || "").toLowerCase();
-    if (el.localName !== "input" || type !== "file") {
-      throw new HirozenError("E_NOT_INTERACTABLE", "that element is not an <input type=file>");
+    if (el.localName !== "input" || type !== "file" || el.disabled) {
+      throw new HirozenError("E_NOT_INTERACTABLE", "that element is not an enabled <input type=file>");
     }
-    el.setAttribute("data-hirozen-upload", data.nonce);
-    return { ok: true };
-  }
-
-  #unmark(data) {
-    this.#window();
-    if (typeof data.nonce !== "string" || !data.nonce) {
-      throw new HirozenError("E_BAD_PARAMS", "unmark needs the nonce mark used");
+    if (data.files.length > 1 && !el.hasAttribute("multiple")) {
+      throw new HirozenError("E_NOT_INTERACTABLE", "that <input type=file> does not accept multiple files");
     }
-    for (const el of this.document.querySelectorAll("[data-hirozen-upload]")) {
-      // Compared in code, not through a selector: the nonce never has to be selector-safe.
-      if (el.getAttribute("data-hirozen-upload") === data.nonce) el.removeAttribute("data-hirozen-upload");
-    }
-    return { ok: true };
+    el.mozSetFileArray(data.files);
+    lazy.event.input(el);
+    lazy.event.change(el);
+    return { ok: true, count: data.files.length };
   }
 
   // A ref resolves against the state of the *current* document: a foreign token (the page navigated,
