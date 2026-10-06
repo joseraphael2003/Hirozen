@@ -2,6 +2,21 @@
 
 All notable changes to Hirozen are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
+## [0.2.1] - 2026-10-06
+
+Cleanup of the 0.2.0 leftovers. Verified on Zen 1.22.3b (Gecko 156.0.1), Windows, on a test install. The loader changed, so run `/hirozen-install` and restart Zen; until then tool calls return `E_STALE_LOADER`.
+
+### Fixed
+
+- `browser_act` navigate to the exact URL the tab already shows, when it has a `#fragment`, lands as soon as the page has scrolled instead of waiting 12 s and returning `E_TIMEOUT`.
+- The `E_DENIED` text no longer repeats its reason; it says what to do next.
+- `browser_upload` and `browser_dialog` results name the page (URL and title). For a dialog it is the page as it was when the dialog was answered.
+
+### Known issues
+
+- Not yet validated on a daily profile.
+- Uploading exactly the same files again fires `input` and `change`, where Firefox's own picker fires `cancel`. This is deliberate: Firefox compares only name, size and type, so an edited file of the same size would not be set.
+
 ## [0.2.0] - 2026-09-28
 
 The agent can act in Zen. Verified on Zen 1.22.3b (Gecko 156.0.1), Windows, on a test install. Three files are installed now, so run `/hirozen-install` and restart Zen.
@@ -26,7 +41,7 @@ The agent can act in Zen. Verified on Zen 1.22.3b (Gecko 156.0.1), Windows, on a
 ### Known issues
 
 - Not yet validated on a daily profile.
-- A navigate that only adds a `#fragment` to the current URL waits 12 s and reports `E_TIMEOUT`, although the page scrolled.
+- A navigate to the exact URL the tab already shows, with a `#fragment`, waits 12 s and reports `E_TIMEOUT`, although the page scrolled.
 - `E_DENIED` repeats its reason; upload and dialog results do not show the page's URL or title.
 
 ## [0.1.2] - 2026-09-28
@@ -100,7 +115,8 @@ First release: read-only access to a running Zen browser from omp. Verified on Z
 - Two one-off results could not be reproduced: a Deny that returned an uncaptured code, and a transient `E_IN_USE` on an immediate reconnect.
 - Not yet validated on a daily profile. Click, type, navigation and Zen layout actions are planned for V2.
 
-[0.2.0]: https://github.com/joseraphael2003/Hirozen/compare/1e071bc...main
+[0.2.1]: https://github.com/joseraphael2003/Hirozen/compare/d04686c...main
+[0.2.0]: https://github.com/joseraphael2003/Hirozen/compare/1e071bc...d04686c
 [0.1.2]: https://github.com/joseraphael2003/Hirozen/compare/21eaaec...1e071bc
 [0.1.1]: https://github.com/joseraphael2003/Hirozen/compare/aeb80e4...21eaaec
 [0.1.0]: https://github.com/joseraphael2003/Hirozen/commits/main

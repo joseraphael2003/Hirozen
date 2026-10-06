@@ -4,7 +4,7 @@ An [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) plugin that lets the om
 
 The agent can list your tabs and spaces, read pages, take screenshots, click, type, navigate, upload files, answer page dialogs, and arrange tabs with Zen's own layout features (spaces, split view, glance).
 
-> **Status:** 0.2.0. Verified on Zen 1.22.3b (Gecko 156.0.1) on Windows, on a test install only. See [CHANGELOG.md](CHANGELOG.md).
+> **Status:** 0.2.1. Verified on Zen 1.22.3b (Gecko 156.0.1) on Windows, on a test install only. See [CHANGELOG.md](CHANGELOG.md).
 
 ## How it works
 
@@ -85,6 +85,7 @@ bun test
 bunx tsc --noEmit
 node --check loader/loader.sys.mjs
 node --check loader/HirozenChild.sys.mjs
+node --check loader/HirozenParent.sys.mjs
 ```
 
 Changing any file in `loader/` changes its hash, so run `/hirozen-install` again afterwards.
