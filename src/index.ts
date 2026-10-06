@@ -67,7 +67,7 @@ const CODE_TEXT: Record<string, string> = {
   E_BAD_PARAMS: "the call's parameters were not usable (see the message)",
   E_DEADLINE:
     "omp gave up before Zen answered, so nothing was done; retry when the person at Zen is ready (this is not a page failure)",
-  E_DENIED: "the Hirozen Allow/Deny notice in Zen was denied (or left unanswered)",
+  E_DENIED: "nothing was done; ask the person at Zen to click Allow, then retry",
   E_INTERNAL: "the Zen loader hit an unexpected internal error",
   E_LAYOUT_REFUSED:
     "Zen refused that layout change; splits never include the selected tab or a pinned/essential/hidden tab, and the space must exist",
