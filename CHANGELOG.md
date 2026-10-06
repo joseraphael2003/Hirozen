@@ -15,7 +15,7 @@ Cleanup of the 0.2.0 leftovers. Verified on Zen 1.22.3b (Gecko 156.0.1), Windows
 ### Known issues
 
 - Not yet validated on a daily profile.
-- Uploading exactly the same files again fires `input` and `change`, where Firefox's own picker fires `cancel`. This is deliberate: Firefox compares only name, size and type, so an edited file of the same size would not be set.
+- Uploading exactly the same files again fires `input` and `change`, where Firefox's automation code (WebDriver BiDi `setFiles`) fires `cancel`. This is deliberate: that code compares only name, size and type, so an edited file of the same size would not be set.
 
 ## [0.2.0] - 2026-09-28
 
