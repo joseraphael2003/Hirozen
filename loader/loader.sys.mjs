@@ -1113,8 +1113,11 @@ class Loader {
       throw new LoaderError("E_BAD_PARAMS", "browser.act navigate needs a url");
     }
     let scheme = null;
+    let target = null;
     try {
-      scheme = Services.io.newURI(url).scheme;
+      const uri = Services.io.newURI(url);
+      scheme = uri.scheme;
+      target = uri.spec;
     } catch {
       scheme = null;
     }
@@ -1129,6 +1132,10 @@ class Loader {
     // The document the load starts from: a same-URL load (reload, navigate to the URL already shown,
     // a redirect back to it) proves itself by replacing this window global.
     const beforeWg = browser.browsingContext?.currentWindowGlobal ?? null;
+    // The URL already shown, with a #ref: Gecko scrolls the same document to the anchor - no load,
+    // no new window global and no spec change - so only "the tab shows exactly that URL and is not
+    // loading" can prove it (see #loadLanded).
+    const sameDocument = target.includes("#") && before === target ? target : null;
     const dialog = this.#dialogRace(browser);
     try {
       this.#checkDeadline(req);
@@ -1136,6 +1143,7 @@ class Loader {
       const landed = await this.#waitForLoad(tabKey, browser, {
         previous: before,
         previousWg: beforeWg,
+        sameDocument,
         bound: NAVIGATE_TIMEOUT_MS,
         what: `browser.act navigate to ${url} (tab ${tabKey})`,
         dialog,
@@ -1162,18 +1170,22 @@ class Loader {
   // exactly as it was, so a load that worked would poll to E_TIMEOUT ("did not finish loading") - and
   // neither is `isLoadingDocument` alone, because a wait can start after a fast load already ended.
   //
-  // Three signals, any one of them enough:
+  // Four signals, any one of them enough:
   //  - the spec moved off `previous` (navigate to a different URL, zen.open leaving about:blank);
   //  - the browsing context's currentWindowGlobal is not the one the load started from (`previousWg`):
   //    a cross-document load replaces the document, so a new (or no) window global proves the load;
-  //  - this wait watched the browser load (`sawLoading`) and it has now stopped.
-  #loadLanded(browser, previous, previousWg, sawLoading) {
+  //  - this wait watched the browser load (`sawLoading`) and it has now stopped;
+  //  - a same-document navigate (`sameDocument`: the exact URL already shown, with a #ref) after at
+  //    least one poll: the scroll has no load to watch, and the poll gives a real load Gecko might
+  //    start instead the time to show up as loading or as a new window global first.
+  #loadLanded(browser, previous, previousWg, sawLoading, sameDocument = null, polled = false) {
     if (browser.webProgress?.isLoadingDocument === true) return null;
     const spec = browser.currentURI.spec;
     if (spec !== previous) return spec;
     const wg = browser.browsingContext?.currentWindowGlobal ?? null;
     if (previousWg && wg !== previousWg) return spec;
-    return sawLoading ? spec : null;
+    if (sawLoading) return spec;
+    return sameDocument && polled && spec === sameDocument ? spec : null;
   }
 
   // Waits, bounded, for a load this loader started to land, polling every NAVIGATE_POLL_MS. Returns
@@ -1181,12 +1193,13 @@ class Loader {
   // page that answers with a prompt never finishes loading. `what` names the operation in the timeout,
   // which must tell omp what already exists (E_DEADLINE promises "nothing was done"; a load wait is
   // after the side effect, so only its own bound may fail).
-  async #waitForLoad(tabKey, browser, { previous, previousWg = null, bound, what, dialog = null }) {
+  async #waitForLoad(tabKey, browser, { previous, previousWg = null, sameDocument = null, bound, what, dialog = null }) {
     const started = Date.now();
     let sawLoading = false;
+    let polled = false;
     for (;;) {
       if (browser.webProgress?.isLoadingDocument === true) sawLoading = true;
-      const landed = this.#loadLanded(browser, previous, previousWg, sawLoading);
+      const landed = this.#loadLanded(browser, previous, previousWg, sawLoading, sameDocument, polled);
       if (landed) return { url: landed };
       if (Date.now() - started > bound) {
         throw new LoaderError("E_TIMEOUT", `${what} did not finish loading within ${bound} ms`);
@@ -1195,6 +1208,7 @@ class Loader {
         ? await Promise.race([pageSleep(NAVIGATE_POLL_MS), dialog.promise.then(info => ({ dialog: info }))])
         : await pageSleep(NAVIGATE_POLL_MS);
       if (winner?.dialog) return { dialog: winner.dialog };
+      polled = true;
     }
   }
 
@@ -1211,7 +1225,7 @@ class Loader {
     if (!Array.isArray(paths) || paths.length === 0 || paths.some(path => !isAbsolutePath(path))) {
       throw new LoaderError("E_BAD_PARAMS", "browser.upload needs paths as a non-empty array of absolute file paths");
     }
-    const { tabKey, wg } = this.#resolveTab(params?.tabKey);
+    const { tabKey, tab, browser, wg } = this.#resolveTab(params?.tabKey);
     await this.#gate("act", req);
     this.#checkDeadline(req);
     const files = [];
@@ -1229,7 +1243,14 @@ class Loader {
     // kind "act": a document that dies under the query means the ref's document is gone, exactly as
     // for browser.act (E_REF_STALE), while the child reports its own stale/refused cases squarely.
     const reply = await this.#query(wg, "setFiles", { ref, files }, { kind: "act" });
-    return { ok: true, tabKey, count: Number.isFinite(reply?.count) ? reply.count : files.length };
+    // url/title name the page the files were set on, as navigate and zen.open report theirs.
+    return {
+      ok: true,
+      tabKey,
+      count: Number.isFinite(reply?.count) ? reply.count : files.length,
+      url: browser.currentURI.spec,
+      title: tab.label ?? "",
+    };
   }
 
   // Answers the common prompt open in a tab, in chrome scope: the tab's own dialog box holds it
@@ -1277,7 +1298,7 @@ class Loader {
     if (text !== undefined && typeof text !== "string") {
       throw new LoaderError("E_BAD_PARAMS", "browser.dialog accepts text as a string only");
     }
-    const { tabKey, browser } = this.#resolveTab(params?.tabKey);
+    const { tabKey, tab, browser } = this.#resolveTab(params?.tabKey);
     // Looked up before the gate: prompting the user about a tab that has no dialog would be noise.
     if (!this.#findPrompt(browser)) {
       throw new LoaderError("E_NO_DIALOG", `tab ${tabKey} has no open prompt; act on the page and watch for a dialog first`);
@@ -1294,6 +1315,10 @@ class Loader {
     // Checkpoint 4: the button click (and the text write) is the side effect.
     this.#checkDeadline(req);
     if (typeof text === "string" && ui.loginTextbox) ui.loginTextbox.value = text;
+    // The page as it was when the dialog was answered: accepting a beforeunload or a confirm can start
+    // a navigation, which these fields do not follow.
+    const url = browser.currentURI.spec;
+    const title = tab.label ?? "";
     const button = accept ? ui.button0 : (ui.button1 ?? ui.button0);
     button.click();
     return {
@@ -1301,6 +1326,8 @@ class Loader {
       tabKey,
       type: args?.inPermitUnload ? "beforeunload" : (args?.promptType ?? null),
       message: ui.infoBody?.textContent ?? "",
+      url,
+      title,
     };
   }
 
