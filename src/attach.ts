@@ -66,11 +66,55 @@ const PROMPT_CONNECTION = "devtools.debugger.prompt-connection";
 /** `user_pref("name", true);` - the last assignment wins, like Gecko's prefs parser. */
 const USER_PREF = /^user_pref\("([^"\\]+)",\s*(true|false|-?\d+|"[^"]*")\);/gm;
 
-/** PowerShell one-liner listing main-process command lines (content processes carry `contentproc`). */
+/**
+ * PowerShell one-liner listing main-process rows as `ProcessId<TAB>ExecutablePath<TAB>CommandLine`.
+ * Content processes carry `contentproc` and background tasks `--backgroundtask`: neither owns a
+ * window or the profile on the command line, so the filter drops them before the rows are parsed.
+ */
 const PS_ZEN_PROCESSES =
   "Get-CimInstance Win32_Process -Filter \"Name='zen.exe'\" " +
-  "| Where-Object { $_.CommandLine -notmatch 'contentproc' } " +
-  "| ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }";
+  "| Where-Object { $_.CommandLine -notmatch 'contentproc|--backgroundtask' } " +
+  "| ForEach-Object { \"$($_.ProcessId)`t$($_.ExecutablePath)`t$($_.CommandLine)\" }";
+
+/** One main zen.exe process: its id, its executable (that folder is the install dir) and its command line. */
+export type ZenProcess = { pid: number; executablePath: string; commandLine: string };
+
+/** Parses the three-column `PS_ZEN_PROCESSES` output; a row missing a column is not a main process. */
+export function parseZenProcesses(output: string): ZenProcess[] {
+  const rows: ZenProcess[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\t(.*)\t(.*)$/.exec(line);
+    if (match) rows.push({ pid: Number(match[1]), executablePath: match[2], commandLine: match[3] });
+  }
+  return rows;
+}
+
+/** The `--profile <dir>` (or `-profile`) argument of a main zen.exe command line, or null. */
+export function profileArg(commandLine: string): string | null {
+  const match = /(?:^|\s)--?profile\s+("([^"]*)"|'([^']*)'|(\S+))/i.exec(commandLine);
+  return match?.[2] ?? match?.[3] ?? match?.[4] ?? null;
+}
+
+/** Every main zen.exe process on this machine; [] when off Windows or PowerShell/CIM is unavailable. */
+export async function listZenProcesses(): Promise<ZenProcess[]> {
+  if (process.platform !== "win32") return [];
+  let output: string;
+  try {
+    const child = Bun.spawn({
+      cmd: ["powershell", "-NoProfile", "-NonInteractive", "-Command", PS_ZEN_PROCESSES],
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      windowsHide: true,
+      timeout: 5_000,
+    });
+    output = await new Response(child.stdout).text();
+    await child.exited;
+  } catch {
+    return []; // no PowerShell/CIM available: the lock file already answered
+  }
+  return parseZenProcesses(output);
+}
 
 /** One RDP packet: `JSON.parse` at the socket boundary, every field checked where it is used. */
 type RdpPacket = Record<string, unknown>;
@@ -129,7 +173,7 @@ function pidAlive(pid: number): boolean {
 }
 
 /** Windows paths reach us quoted, with mixed separators and a trailing one: compare them canonically. */
-function normalizePath(path: string): string {
+export function normalizePath(path: string): string {
   return resolve(path).replace(/[\\/]+$/, "").toLowerCase();
 }
 
@@ -162,28 +206,9 @@ function prefsRefusal(profileDir: string): string | null {
 
 /** True when a live zen.exe process was launched with `--profile <profileDir>` (or `-profile`). */
 async function zenProcessUsesProfile(profileDir: string): Promise<boolean> {
-  if (process.platform !== "win32") return false;
-  let output: string;
-  try {
-    const child = Bun.spawn({
-      cmd: ["powershell", "-NoProfile", "-NonInteractive", "-Command", PS_ZEN_PROCESSES],
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "ignore",
-      windowsHide: true,
-      timeout: 5_000,
-    });
-    output = await new Response(child.stdout).text();
-    await child.exited;
-  } catch {
-    return false; // no PowerShell/CIM available: the lock file already answered
-  }
   const wanted = normalizePath(profileDir);
-  for (const line of output.split(/\r?\n/)) {
-    const row = /^\s*\d+\s+(.*)$/.exec(line);
-    if (!row) continue;
-    const profile = /(?:^|\s)--?profile\s+("([^"]*)"|'([^']*)'|(\S+))/i.exec(row[1]);
-    const value = profile?.[2] ?? profile?.[3] ?? profile?.[4];
+  for (const { commandLine } of await listZenProcesses()) {
+    const value = profileArg(commandLine);
     if (value && normalizePath(value) === wanted) return true;
   }
   return false;
@@ -197,7 +222,7 @@ async function zenProcessUsesProfile(profileDir: string): Promise<boolean> {
  * holds opens fine. Fallback: an explicit `--profile <dir>` on a live zen.exe - a launch that used
  * the default profile carries no `--profile`, so only the lock file covers that case.
  */
-async function profileLocked(profileDir: string): Promise<boolean> {
+export async function profileLocked(profileDir: string): Promise<boolean> {
   try {
     closeSync(openSync(join(profileDir, "parent.lock"), "r+"));
   } catch (error) {
