@@ -567,6 +567,7 @@ class Loader {
               parentSha256: this.#parentSha256,
               zenVersion: Services.appinfo.version,
               platformVersion: Services.appinfo.platformVersion,
+              zenDir: Services.dirsvc.get("GreD", Ci.nsIFile).path,
               zenPid: Services.appinfo.processID,
             });
           } else {

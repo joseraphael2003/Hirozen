@@ -9,7 +9,7 @@
 //        loader -> {type:"auth", mac: HMAC(nonce, "loader:"+challenge), challenge: <loader's own>}
 //        omp    -> {type:"auth", mac: HMAC(nonce, "omp:"+loaderChallenge)}
 //        loader -> {type:"ready", loaderVersion, loaderSha256, childSha256, parentSha256, zenVersion,
-//                   platformVersion, zenPid}
+//                   platformVersion, zenDir, zenPid}
 //   4. Requests {id, method, params, deadline} are answered with {id, result} or
 //      {id, error: {code, message}}; `deadline` is the absolute epoch ms after which the loader must
 //      not act on the request at all (see CALL_TIMEOUT_MS); loader events arrive as
@@ -84,6 +84,8 @@ export type ReadyFrame = {
   parentSha256: string;
   zenVersion: string;
   platformVersion: string;
+  /** Zen's install folder (GreD) the loader runs from; absent from loaders older than 0.2.2. */
+  zenDir?: string;
   zenPid: number;
 };
 
