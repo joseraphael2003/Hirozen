@@ -1100,10 +1100,15 @@ function withApprovalDetails(
 // Commands
 // ---------------------------------------------------------------------------------------------
 
+/** A config problem as a notice: "Hirozen: " unless the problem already starts with "Hirozen". */
+function configNotice(problem: string): string {
+  return problem.startsWith("Hirozen") ? problem : `Hirozen: ${problem}`;
+}
+
 async function runInstallCommand(ctx: ExtensionContext): Promise<void> {
   const resolved = await resolveConfig(ctx.cwd);
   if (!resolved.ok) {
-    ctx.ui.notify(`Hirozen: ${resolved.problem}`, "error");
+    ctx.ui.notify(configNotice(resolved.problem), "error");
     return;
   }
   const { zenDir } = resolved.config;
@@ -1122,7 +1127,7 @@ async function runInstallCommand(ctx: ExtensionContext): Promise<void> {
 async function runAttachCommand(ctx: ExtensionContext): Promise<void> {
   const resolved = await resolveConfig(ctx.cwd);
   if (!resolved.ok) {
-    ctx.ui.notify(`Hirozen: ${resolved.problem}`, "error");
+    ctx.ui.notify(configNotice(resolved.problem), "error");
     return;
   }
   try {
@@ -1523,7 +1528,7 @@ async function checkOnStart(ctx: ExtensionContext): Promise<void> {
   const resolved = await resolveConfig(ctx.cwd);
   if (!resolved.ok) {
     // "warning", not "info": omp renders info as a 2.4 s toast that is gone before the startup screen settles.
-    ctx.ui.notify(`Hirozen: ${resolved.problem}`, "warning");
+    ctx.ui.notify(configNotice(resolved.problem), "warning");
     return;
   }
   const zenDir = resolved.config.zenDir;
