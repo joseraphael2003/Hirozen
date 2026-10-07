@@ -228,6 +228,11 @@ test("manual paths are trimmed, unquoted, must be win32-absolute, and keep their
   expect(normalizeManualPath('  "D:\\PROGRAMS"  ')).toBe("D:\\PROGRAMS");
   expect(normalizeManualPath("'D:\\PROGRAMS\\'")).toBe("D:\\PROGRAMS");
   expect(normalizeManualPath("D:/PROGRAMS")).toBe("D:\\PROGRAMS");
+  expect(normalizeManualPath("\\\\server\\share\\Zen")).toBe("\\\\server\\share\\Zen");
+  // Drive-relative: win32.resolve would take the drive from omp's cwd, so these are refused.
+  expect(normalizeManualPath("\\PROGRAMS")).toBeNull();
+  expect(normalizeManualPath("/PROGRAMS")).toBeNull();
+  expect(normalizeManualPath("D:")).toBeNull();
   expect(normalizeManualPath("Profiles/txwpgy8w.Default (release)-1")).toBeNull();
   expect(normalizeManualPath("   ")).toBeNull();
 });

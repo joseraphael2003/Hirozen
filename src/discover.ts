@@ -72,13 +72,14 @@ export function readCompatibility(profileDir: string): { lastPlatformDir: string
 }
 
 /**
- * A path typed into setup: trimmed, unquoted, and only accepted as an absolute Windows path
- * (`win32`, since Zen installs and profiles are Windows paths). The result is stored resolved and is
- * never resolved against omp's cwd; null means "refuse this input".
+ * A path typed into setup: trimmed, unquoted, and only accepted when it is rooted - `X:\`/`X:/` or
+ * `\\server\share`. A bare `\PROGRAMS` or `D:` is drive-relative, and resolving one would silently
+ * take the drive from omp's cwd, so it is refused. The result is stored resolved and is never
+ * resolved against omp's cwd; null means "refuse this input".
  */
 export function normalizeManualPath(value: string): string | null {
   const trimmed = value.trim().replace(/^(["'])(.*)\1$/, "$2").trim();
-  if (!win32.isAbsolute(trimmed)) return null;
+  if (!/^([A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+)/.test(trimmed)) return null;
   return win32.resolve(trimmed);
 }
 
