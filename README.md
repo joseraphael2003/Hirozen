@@ -4,7 +4,7 @@ An [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) plugin that lets the om
 
 The agent can list your tabs and spaces, read pages, take screenshots, click, type, navigate, upload files, answer page dialogs, and arrange tabs with Zen's own layout features (spaces, split view, glance).
 
-> **Status:** 0.2.1. Verified on Zen 1.22.3b (Gecko 156.0.1) on Windows, on a test install only. See [CHANGELOG.md](CHANGELOG.md).
+> **Status:** 0.2.2. Verified on Zen 1.23.1b (Gecko 157.0.1) on Windows, on the everyday profile, and on a 1.22.3b test install. See [CHANGELOG.md](CHANGELOG.md).
 
 ## How it works
 
@@ -41,10 +41,11 @@ Every tool except `zen_tabs`, `zen_spaces`, `browser_read`, `browser_screenshot`
 
 | Command | Purpose |
 |---|---|
-| `/hirozen-install` | Installs or verifies the autoconfig, loader and actor in `HIROZEN_ZEN_DIR`. Restart Zen once afterwards. |
+| `/hirozen-setup` | Finds the Zen installs and profiles on this machine; you pick one and confirm, and it is saved in omp's plugin settings. `/hirozen-setup clear` forgets it. |
+| `/hirozen-install` | Installs or verifies the autoconfig, loader and actor in the configured Zen install. Restart Zen once afterwards. |
 | `/hirozen-attach` | Loads Hirozen into an already-running Zen without a restart, through a one-time debugger connection. |
 | `/hirozen-connect` | Reconnects after you pressed Stop in Zen. |
-| `/hirozen-status` | Shows install, link and consent state. |
+| `/hirozen-status` | Shows the configured Zen and where that setting came from, plus install, link and consent state. |
 
 ## Setup
 
@@ -57,16 +58,23 @@ bun install
 omp plugin link .
 ```
 
-Set both environment variables. There are no defaults:
+Then, in omp (from any folder):
+
+1. `/hirozen-setup`: pick your Zen and its profile from the list and confirm. Hirozen never guesses: nothing is saved without your confirmation, and you can enter paths manually instead.
+2. `/hirozen-install`, then restart Zen once. Alternatively, use `/hirozen-attach` to skip the restart (it needs the two DevTools remote-debugging prefs switched on temporarily, and you click OK on Zen's "Incoming Connection" prompt; the command explains how).
+
+The choice is stored in omp's plugin settings (`omp plugin config list hirozen`), per omp profile. A project's `.omp/plugin-overrides.json` can override it, and `/hirozen-status` says which one is in use.
+
+**Zen updates** replace Zen's install folder and remove Hirozen. At the next omp start Hirozen notices and offers to reinstall; restart Zen afterwards.
+
+**Overrides.** When both environment variables are set they win over the saved setting (useful for a second, test Zen):
 
 ```sh
 HIROZEN_ZEN_DIR=<folder containing zen.exe>
 HIROZEN_PROFILE=<full path to the Zen profile folder>
 ```
 
-Then run `/hirozen-install` in omp and restart Zen once. Alternatively, use `/hirozen-attach` to skip the restart (it needs the two DevTools remote-debugging prefs switched on temporarily, and you click OK on Zen's "Incoming Connection" prompt; the command explains how).
-
-> Back up your profile before trying Hirozen on your everyday Zen. It has only been validated on a separate portable install so far.
+> Back up your profile before trying Hirozen on your everyday Zen.
 
 ## Safety
 

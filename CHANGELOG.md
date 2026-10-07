@@ -2,6 +2,25 @@
 
 All notable changes to Hirozen are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
+## [0.2.2] - 2026-10-07
+
+Configure once, work from any folder. Verified on Windows with the everyday Zen 1.23.1b (Gecko 157.0.1) and a 1.22.3b test install. The loader changed, so run `/hirozen-install` and restart Zen; until then tool calls return `E_STALE_LOADER`.
+
+### Added
+
+- `/hirozen-setup` finds the Zen installs and profiles on this machine (from `profiles.ini`, each profile's `compatibility.ini`, and running Zen processes), and saves the pair you confirm in omp's plugin settings. Nothing is saved without your confirmation. `/hirozen-setup clear` forgets it.
+- After a Zen update has removed Hirozen, omp offers to reinstall it at startup. It never reinstalls without asking.
+- The loader reports Zen's install folder, and Hirozen refuses (`E_CONFIG`) a Zen that is not the configured one.
+- An "not set up — run /hirozen-setup" warning at startup, and `/hirozen-status` shows where the configuration came from (env, settings or a project override).
+
+### Changed
+
+- `HIROZEN_ZEN_DIR` and `HIROZEN_PROFILE` are now an optional override: when both are set they win over the saved setting.
+
+### Known issues
+
+- Saving the setting relies on omp's plugin settings functions, which are not yet a documented extension API.
+
 ## [0.2.1] - 2026-10-06
 
 Cleanup of the 0.2.0 leftovers. Verified on Zen 1.22.3b (Gecko 156.0.1), Windows, on a test install. The loader changed, so run `/hirozen-install` and restart Zen; until then tool calls return `E_STALE_LOADER`.
@@ -115,7 +134,8 @@ First release: read-only access to a running Zen browser from omp. Verified on Z
 - Two one-off results could not be reproduced: a Deny that returned an uncaptured code, and a transient `E_IN_USE` on an immediate reconnect.
 - Not yet validated on a daily profile. Click, type, navigation and Zen layout actions are planned for V2.
 
-[0.2.1]: https://github.com/joseraphael2003/Hirozen/compare/d04686c...main
+[0.2.2]: https://github.com/joseraphael2003/Hirozen/compare/8d35252...main
+[0.2.1]: https://github.com/joseraphael2003/Hirozen/compare/d04686c...8d35252
 [0.2.0]: https://github.com/joseraphael2003/Hirozen/compare/1e071bc...d04686c
 [0.1.2]: https://github.com/joseraphael2003/Hirozen/compare/21eaaec...1e071bc
 [0.1.1]: https://github.com/joseraphael2003/Hirozen/compare/aeb80e4...21eaaec

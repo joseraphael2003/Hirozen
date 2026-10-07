@@ -1,6 +1,6 @@
 {
   "name": "hirozen",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "omp plugin that lets the agent read and act in a running Zen browser",
