@@ -5,7 +5,17 @@
   "type": "module",
   "description": "omp plugin that lets the agent read and act in a running Zen browser",
   "omp": {
-    "extensions": ["./src/index.ts"]
+    "extensions": ["./src/index.ts"],
+    "settings": {
+      "zenDir": {
+        "type": "string",
+        "description": "Zen install directory: the folder holding zen.exe. Written by /hirozen-setup."
+      },
+      "profileDir": {
+        "type": "string",
+        "description": "Zen profile directory: the folder holding prefs.js. Written by /hirozen-setup."
+      }
+    }
   },
   "scripts": {
     "test": "bun test",
