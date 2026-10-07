@@ -1514,7 +1514,8 @@ async function offerReinstall(ctx: ExtensionContext, zenDir: string): Promise<vo
 async function checkOnStart(ctx: ExtensionContext): Promise<void> {
   const resolved = await resolveConfig(ctx.cwd);
   if (!resolved.ok) {
-    ctx.ui.notify("Hirozen: not set up — run /hirozen-setup.", "info");
+    // "warning", not "info": omp renders info as a 2.4 s toast that is gone before the startup screen settles.
+    ctx.ui.notify("Hirozen: not set up — run /hirozen-setup.", "warning");
     return;
   }
   const zenDir = resolved.config.zenDir;
