@@ -11,7 +11,7 @@ Configure once, work from any folder. Verified on Windows with the everyday Zen 
 - `/hirozen-setup` finds the Zen installs and profiles on this machine (from `profiles.ini`, each profile's `compatibility.ini`, and running Zen processes), and saves the pair you confirm in omp's plugin settings. Nothing is saved without your confirmation. `/hirozen-setup clear` forgets it.
 - After a Zen update has removed Hirozen, omp offers to reinstall it at startup. It never reinstalls without asking.
 - The loader reports Zen's install folder, and Hirozen refuses (`E_CONFIG`) a Zen that is not the configured one.
-- An "not set up — run /hirozen-setup" warning at startup, and `/hirozen-status` shows where the configuration came from (env, settings or a project override).
+- A "not set up — run /hirozen-setup" warning at startup, and `/hirozen-status` shows where the configuration came from (env, settings or a project override).
 
 ### Changed
 
