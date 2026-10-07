@@ -13,6 +13,10 @@ Configure once, work from any folder. Verified on Windows with the everyday Zen 
 - The loader reports Zen's install folder, and Hirozen refuses (`E_CONFIG`) a Zen that is not the configured one.
 - A "not set up — run /hirozen-setup" warning at startup, and `/hirozen-status` shows where the configuration came from (env, settings or a project override).
 
+### Fixed
+
+- A failed connection (for example `E_STALE_LOADER` after a Zen update) was cached until omp restarted, so tool calls kept failing even after a reinstall. The next call now retries.
+
 ### Changed
 
 - `HIROZEN_ZEN_DIR` and `HIROZEN_PROFILE` are now an optional override: when both are set they win over the saved setting.
