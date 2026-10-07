@@ -17,7 +17,7 @@ import { zod } from "@oh-my-pi/pi-coding-agent";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 import hirozen from "../src/index";
-import { install, sha256File } from "../src/install";
+import { install, sha256File, uninstall } from "../src/install";
 import { ZenLink } from "../src/link";
 
 /** The three loader modules as this checkout hashes them: the shas the plugin accepts in `ready`. */
@@ -467,5 +467,42 @@ test("a ready frame from another Zen install is refused with E_CONFIG", async ()
   expect(text).toContain(otherZen);
   expect(text).toContain(zenDir);
   expect(text).toContain("run /hirozen-setup");
+  await shutdown(host);
+}, 30_000);
+
+test("session_start warns with the real config problem, not a generic setup hint", async () => {
+  // A half-set env pair is the case the generic hint hid: the saved pair is irrelevant because env
+  // wins, so the user has to be told which variable is missing.
+  const handler = host.events.get("session_start");
+  if (!handler) throw new Error("session_start was never registered");
+  const saved = process.env.HIROZEN_PROFILE;
+  delete process.env.HIROZEN_PROFILE;
+  try {
+    const before = host.notifications.length;
+    handler({ type: "session_start" }, host.ctx);
+    await waitFor(() => host.notifications.length > before);
+    expect(host.notifications.at(-1)).toContain("HIROZEN_PROFILE is not set");
+  } finally {
+    process.env.HIROZEN_PROFILE = saved;
+  }
+}, 10_000);
+
+test("a failed connect is not cached: the next call retries after a reinstall", async () => {
+  // A Zen update wipes the loader, so verify() fails before the connect's first await. That used to
+  // cache the rejected promise (the catch cleared it, then the assignment put it back), and the
+  // reinstall the user had just accepted never took effect until omp restarted.
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+  uninstall(zenDir);
+  const wiped = await callTool(host, "zen_tabs");
+  expect(textOf(wiped).startsWith("E_STALE_LOADER")).toBe(true);
+  expect(textOf(wiped)).toContain(zenDir);
+
+  install(zenDir);
+  const loader = new FakeLoader(profileDir).on("zen.inventory", frame => loader.reply(frame, []));
+  const started = loader.start().catch(() => undefined);
+  const result = await callTool(host, "zen_tabs");
+  await started;
+  expect(result.isError).not.toBe(true);
+  expect(loader.requests.length).toBe(1);
   await shutdown(host);
 }, 30_000);

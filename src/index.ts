@@ -376,7 +376,11 @@ function ensureLink(pi: ExtensionAPI, ctx: ExtensionContext, config: HirozenConf
   if (link) return Promise.resolve(link);
   if (connectPromise) return connectPromise;
   const generation = ++connectGen;
-  const attempt = (async () => {
+  // One microtask of delay before the body runs, because the body can fail before its first await (a
+  // failed verify) and `connectPromise = attempt` below has to run before the catch clears it: run
+  // inline, the catch's clear is clobbered by that assignment, and the rejected promise stays cached
+  // so every later call replays the same error.
+  const attempt = Promise.resolve().then(async () => {
     try {
       const checked = verify(config.zenDir);
       if (!checked.ok) {
@@ -426,7 +430,7 @@ function ensureLink(pi: ExtensionAPI, ctx: ExtensionContext, config: HirozenConf
       if (generation === connectGen) connectPromise = null;
       throw error;
     }
-  })();
+  });
   connectPromise = attempt;
   return attempt;
 }
@@ -1374,18 +1378,22 @@ async function setupPair(ctx: ExtensionContext): Promise<void> {
     ctx.ui.notify(`Hirozen: ${messageOf(error)}`, "error");
     return;
   }
-  // A live link and a sticky stop belong to the old Zen: a changed pair (or the first pair ever) must
-  // not leave the tools on the old one, nor a Stop on the old Zen refusing calls for the new one.
+  const after = await resolveConfig(ctx.cwd);
+  // A live link and a sticky stop belong to the Zen the session is actually using, so compare the pair
+  // in effect before the save with the one in effect after it: a save that leaves the effective pair
+  // alone (env or a project override still pins the same Zen) must tear nothing down. Exactly one of
+  // the two being usable is a change by definition; both unusable is not.
   const changed =
-    !previous.ok ||
-    normalizePath(previous.config.zenDir) !== normalizePath(pair.zenDir) ||
-    normalizePath(previous.config.profileDir) !== normalizePath(pair.profileDir);
+    previous.ok !== after.ok ||
+    (previous.ok &&
+      after.ok &&
+      (normalizePath(previous.config.zenDir) !== normalizePath(after.config.zenDir) ||
+        normalizePath(previous.config.profileDir) !== normalizePath(after.config.profileDir)));
   if (changed) {
     shutdownLink();
     stopKind = null;
   }
 
-  const after = await resolveConfig(ctx.cwd);
   const shadowed =
     after.ok && after.overridePath !== undefined
       ? ` A project override at ${after.overridePath} shadows the saved setting(s); edit it to change what Hirozen uses here.`
@@ -1515,7 +1523,7 @@ async function checkOnStart(ctx: ExtensionContext): Promise<void> {
   const resolved = await resolveConfig(ctx.cwd);
   if (!resolved.ok) {
     // "warning", not "info": omp renders info as a 2.4 s toast that is gone before the startup screen settles.
-    ctx.ui.notify("Hirozen: not set up — run /hirozen-setup.", "warning");
+    ctx.ui.notify(`Hirozen: ${resolved.problem}`, "warning");
     return;
   }
   const zenDir = resolved.config.zenDir;
