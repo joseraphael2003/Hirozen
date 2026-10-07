@@ -63,7 +63,7 @@ class FakeLoader {
 
   constructor(
     readonly profileDir: string,
-    readonly options: { holdReady?: boolean } = {},
+    readonly options: { holdReady?: boolean; readyZenDir?: string } = {},
   ) {
     const { promise, resolve } = Promise.withResolvers<{ code: number; reason: string }>();
     this.closed = promise;
@@ -94,7 +94,7 @@ class FakeLoader {
   }
 
   /** The `ready` frame, sent by `start()` unless `holdReady` left it for the test to release. */
-  sendReady(loaderSha256 = LOADER_SHA): void {
+  sendReady(loaderSha256 = LOADER_SHA, readyZenDir: string = zenDir): void {
     this.send({
       type: "ready",
       loaderVersion: "1.0.0-test",
@@ -103,6 +103,7 @@ class FakeLoader {
       parentSha256: sha256File(PARENT_SOURCE),
       zenVersion: "1.22.3b",
       platformVersion: "156.0.1",
+      zenDir: readyZenDir,
       zenPid: process.pid,
     });
   }
@@ -146,7 +147,7 @@ class FakeLoader {
       }
       if (frame.type === "auth") {
         // The handshake is complete only now: anything sent earlier would be refused with 4002.
-        if (!this.options.holdReady) this.sendReady();
+        if (!this.options.holdReady) this.sendReady(LOADER_SHA, this.options.readyZenDir ?? zenDir);
         return;
       }
       if (typeof frame.id === "number" && typeof frame.method === "string") {
@@ -449,4 +450,22 @@ test("the act budget tracks the gate scope, the terminal hint mirrors consent, a
   } finally {
     callSpy.mockRestore();
   }
+}, 30_000);
+
+test("a ready frame from another Zen install is refused with E_CONFIG", async () => {
+  // The plan's wrong-path guard: the loader reports the install folder it runs from (GreD), so a
+  // loader that belongs to an install Hirozen is not set up for is refused before it is published.
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+  const otherZen = tempDir("hirozen-index-other-zen-");
+  // The loader runs from an install Hirozen is not set up for: its ready frame says so.
+  const loader = new FakeLoader(profileDir, { readyZenDir: otherZen });
+  const started = loader.start().catch(() => undefined);
+  const result = await callTool(host, "zen_tabs");
+  await started;
+  const text = textOf(result);
+  expect(text.startsWith("E_CONFIG")).toBe(true);
+  expect(text).toContain(otherZen);
+  expect(text).toContain(zenDir);
+  expect(text).toContain("run /hirozen-setup");
+  await shutdown(host);
 }, 30_000);

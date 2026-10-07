@@ -13,12 +13,14 @@
 //
 // Every tool checks in the plan's fixed order: root/UI -> sticky stop -> config -> connect.
 import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { AgentToolResult, ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 
-import { attachNow } from "./attach";
+import { attachNow, listZenProcesses, normalizePath, profileLocked } from "./attach";
+import { type HirozenConfig, type ResolveConfigResult, clearConfig, resolveConfig, saveConfig } from "./config";
+import { type Candidate, discoverZen, normalizeManualPath, readCompatibility } from "./discover";
 import { type VerifyResult, install, sha256File, verify } from "./install";
 import {
   HirozenError,
@@ -182,7 +184,10 @@ let consentPending: "read" | "act" | null = null;
 const knownTabs = new Map<string, { title: string; url: string }>();
 /** Per-tabKey elements of the last browser_snapshot, so a prompt can name the ref it acts on. */
 const snapshotRefs = new Map<string, Map<string, { role: string; name: string }>>();
-/** Set by Zen's Stop button (close 4010); only /hirozen-connect and /hirozen-attach clear it. */
+/**
+ * Set by Zen's Stop button (close 4010); only /hirozen-connect, /hirozen-attach and a /hirozen-setup
+ * that changes or clears the pair clear it.
+ */
 let stopKind: StopKind | null = null;
 let teardownHooked = false;
 let warnedAboutBrowserMcp = false;
@@ -224,26 +229,10 @@ function fail(failure: Failure): AgentToolResult<unknown> {
   };
 }
 
-/** Config is explicit by design: there is no default Zen directory anywhere in this plugin. */
-type HirozenConfig = { zenDir: string; profileDir: string };
+/** Config comes from `resolveConfig` alone: env (both vars) beats the pair saved by /hirozen-setup. */
 
-function readConfig(): { ok: true; config: HirozenConfig } | { ok: false; problem: string } {
-  const zenDir = (process.env.HIROZEN_ZEN_DIR ?? "").trim();
-  if (zenDir === "") {
-    return {
-      ok: false,
-      problem: "HIROZEN_ZEN_DIR is not set; set it to the Zen install directory (there is no default).",
-    };
-  }
-  const profileDir = (process.env.HIROZEN_PROFILE ?? "").trim();
-  if (profileDir === "") {
-    return {
-      ok: false,
-      problem: "HIROZEN_PROFILE is not set; set it to the Zen profile directory (there is no default).",
-    };
-  }
-  return { ok: true, config: { zenDir, profileDir } };
-}
+/** The refusal every command and tool gives when it is not the interactive root session. */
+const NO_UI_TEXT = "Hirozen needs the interactive omp session: this context has no UI, or it is a subagent.";
 
 /** One managed (or plain) timer, cancelable through the returned function. */
 function scheduleOnce(ctx: ExtensionContext, ms: number, run: () => void): () => void {
@@ -403,6 +392,17 @@ function ensureLink(pi: ExtensionAPI, ctx: ExtensionContext, config: HirozenConf
         fresh.close();
         throw new HirozenError("E_STALE_LOADER", `${stale}; run /hirozen-install, restart Zen`);
       }
+      // The loader reports the install folder it runs from (GreD). A loader left behind in another
+      // install would drive the wrong Zen while looking perfectly healthy: refuse it here, where the
+      // loader is not published yet. An older loader sends no field, and its sha already failed above.
+      if (ready.zenDir !== undefined && normalizePath(ready.zenDir) !== normalizePath(config.zenDir)) {
+        fresh.close();
+        throw new HirozenError(
+          "E_CONFIG",
+          `the running Hirozen loader belongs to ${ready.zenDir}, but Hirozen is set up for ` +
+            `${config.zenDir}; run /hirozen-setup`,
+        );
+      }
       if (generation !== connectGen) {
         // session_shutdown, or a newer attempt, ran while this one was connecting: this link was never
         // published, so it owns nothing and is closed here (a no-op close, per the instance handler).
@@ -434,15 +434,10 @@ function ensureLink(pi: ExtensionAPI, ctx: ExtensionContext, config: HirozenConf
 /** The tool check order fixed by the plan: root/UI, sticky stop, config, connect. */
 async function requireLink(pi: ExtensionAPI, ctx: ExtensionContext): Promise<{ link: ZenLink } | { failure: Failure }> {
   if (!(ctx.hasUI && ctx.agent?.kind === "main")) {
-    return {
-      failure: {
-        code: "E_NO_UI",
-        text: "Hirozen tools need the interactive omp session: this context has no UI, or it is a subagent.",
-      },
-    };
+    return { failure: { code: "E_NO_UI", text: NO_UI_TEXT } };
   }
   if (stopKind) return { failure: { code: "E_STOPPED", text: STOP_TEXT[stopKind] } };
-  const config = readConfig();
+  const config = await resolveConfig(ctx.cwd);
   if (!config.ok) return { failure: { code: "E_CONFIG", text: config.problem } };
   try {
     return { link: await ensureLink(pi, ctx, config.config) };
@@ -1102,11 +1097,12 @@ function withApprovalDetails(
 // ---------------------------------------------------------------------------------------------
 
 async function runInstallCommand(ctx: ExtensionContext): Promise<void> {
-  const zenDir = (process.env.HIROZEN_ZEN_DIR ?? "").trim();
-  if (zenDir === "") {
-    ctx.ui.notify("Hirozen: HIROZEN_ZEN_DIR is not set; set it to the Zen install directory (there is no default).", "error");
+  const resolved = await resolveConfig(ctx.cwd);
+  if (!resolved.ok) {
+    ctx.ui.notify(`Hirozen: ${resolved.problem}`, "error");
     return;
   }
+  const { zenDir } = resolved.config;
   try {
     const { loaderSha256 } = install(zenDir);
     ctx.ui.notify(
@@ -1120,17 +1116,17 @@ async function runInstallCommand(ctx: ExtensionContext): Promise<void> {
 }
 
 async function runAttachCommand(ctx: ExtensionContext): Promise<void> {
-  const config = readConfig();
-  if (!config.ok) {
-    ctx.ui.notify(`Hirozen: ${config.problem}`, "error");
+  const resolved = await resolveConfig(ctx.cwd);
+  if (!resolved.ok) {
+    ctx.ui.notify(`Hirozen: ${resolved.problem}`, "error");
     return;
   }
   try {
     // attachNow notifies right before it forwards the command line: the "Incoming Connection" prompt
     // only appears once the prefs, lock and loader-hash checks have passed, so a refusal stays silent.
     const attached = await attachNow({
-      zenDir: config.config.zenDir,
-      profileDir: config.config.profileDir,
+      zenDir: resolved.config.zenDir,
+      profileDir: resolved.config.profileDir,
       notify: message => ctx.ui.notify(`Hirozen: ${message}`, "info"),
     });
     stopKind = null;
@@ -1155,14 +1151,20 @@ async function runConnectCommand(ctx: ExtensionContext): Promise<void> {
   );
 }
 
+/** `verify()` and the read errors it can throw, in the one shape its callers classify. */
+function verifyQuietly(zenDir: string): { checked: VerifyResult } | { problem: string } {
+  try {
+    return { checked: verify(zenDir) };
+  } catch (error) {
+    return { problem: messageOf(error) };
+  }
+}
+
 /** Read-only install check shared by the session_start warning and /hirozen-status. */
 function checkInstalled(zenDir: string): { ok: boolean; text: string } {
-  let checked: VerifyResult;
-  try {
-    checked = verify(zenDir);
-  } catch (error) {
-    return { ok: false, text: messageOf(error) };
-  }
+  const outcome = verifyQuietly(zenDir);
+  if ("problem" in outcome) return { ok: false, text: outcome.problem };
+  const checked = outcome.checked;
   if (!checked.ok) return { ok: false, text: checked.reason };
   const hashes = checked.installed;
   const shown = hashes
@@ -1217,28 +1219,211 @@ function renderDevtoolsPrefs(profileDir: string): string {
 }
 
 async function runStatusCommand(ctx: ExtensionContext): Promise<void> {
-  const zenDir = (process.env.HIROZEN_ZEN_DIR ?? "").trim();
-  const profileDir = (process.env.HIROZEN_PROFILE ?? "").trim();
-  const installed = zenDir === "" ? null : checkInstalled(zenDir);
+  const resolved = await resolveConfig(ctx.cwd);
+  const zenDir = resolved.ok ? resolved.config.zenDir : "";
+  const profileDir = resolved.ok ? resolved.config.profileDir : "";
+  const installed = resolved.ok ? checkInstalled(zenDir) : null;
+  const where = resolved.ok
+    ? resolved.source === "env"
+      ? "from env"
+      : `from settings${resolved.overridePath === undefined ? "" : `; project override ${resolved.overridePath}`}`
+    : "";
   const session = stopKind
     ? `stopped (${stopKind}) — run /hirozen-connect`
     : link
       ? "connected"
       : "not connected (the first tool call connects)";
+  const unset = "not read (Hirozen is not set up)";
   const lines = [
     "Hirozen status",
-    `config: HIROZEN_ZEN_DIR=${zenDir || "(unset)"} HIROZEN_PROFILE=${profileDir || "(unset)"}`,
-    `loader: ${installed ? `${installed.ok ? "ok" : "NOT ok"} (${installed.text})` : "not checked (HIROZEN_ZEN_DIR is unset)"}`,
+    `config: ${resolved.ok ? `${zenDir} | ${profileDir} (${where})` : resolved.problem}`,
+    `loader: ${installed ? `${installed.ok ? "ok" : "NOT ok"} (${installed.text})` : "not checked (Hirozen is not set up)"}`,
     `session: ${session}`,
-    `status file: ${profileDir === "" ? "not read (HIROZEN_PROFILE is unset)" : renderStatusFile(profileDir)}`,
-    `devtools prefs: ${profileDir === "" ? "not read (HIROZEN_PROFILE is unset)" : renderDevtoolsPrefs(profileDir)}`,
+    `status file: ${profileDir === "" ? unset : renderStatusFile(profileDir)}`,
+    `devtools prefs: ${profileDir === "" ? unset : renderDevtoolsPrefs(profileDir)}`,
   ];
   ctx.ui.notify(lines.join("\n"), stopKind !== null || (installed !== null && !installed.ok) ? "warning" : "info");
 }
 
 // ---------------------------------------------------------------------------------------------
-// Extension factory: registration only
+// /hirozen-setup: propose the pairs this machine has, let the user confirm one, save it
 // ---------------------------------------------------------------------------------------------
+
+/** The label that opens manual entry; always last, so `indexOf` keeps mapping labels to candidates. */
+const MANUAL_LABEL = "Enter paths manually…";
+
+/** `<profileName> — <zenDir> (Zen <version>[, running])`, the label setup offers for one candidate. */
+function candidateLabel(candidate: Candidate): string {
+  const flags = [candidate.zenVersion ? `Zen ${candidate.zenVersion}` : "", candidate.running ? "running" : ""].filter(
+    part => part !== "",
+  );
+  return `${candidate.profileName} — ${candidate.zenDir}${flags.length > 0 ? ` (${flags.join(", ")})` : ""}`;
+}
+
+/**
+ * One label per candidate, plus the manual entry. Two candidates whose labels would read the same
+ * (same profile name and install folder) get their profile folder's basename appended, so a label
+ * `ctx.ui.select` returns maps back to exactly one candidate.
+ */
+function candidateLabels(candidates: Candidate[]): string[] {
+  const base = candidates.map(candidateLabel);
+  const counts = new Map<string, number>();
+  for (const label of base) counts.set(label, (counts.get(label) ?? 0) + 1);
+  const labels = base.map((label, index) =>
+    (counts.get(label) ?? 0) > 1 ? `${label} [${basename(candidates[index].profileDir)}]` : label,
+  );
+  return [...labels, MANUAL_LABEL];
+}
+
+/** One typed path, normalized and required to be absolute; null when the user cancelled or it was not. */
+async function askPath(ctx: ExtensionContext, title: string, what: string): Promise<string | null> {
+  const typed = await ctx.ui.input(title);
+  if (typed === undefined) return null;
+  const path = normalizeManualPath(typed);
+  if (path === null) {
+    ctx.ui.notify(`Hirozen: that is not an absolute ${what} (for example D:\\PROGRAMS). Nothing was saved.`, "error");
+    return null;
+  }
+  return path;
+}
+
+/** Two `ctx.ui.input`s; null when the user cancelled either one. */
+async function manualPair(ctx: ExtensionContext): Promise<HirozenConfig | null> {
+  const zenDir = await askPath(ctx, "Zen install folder (the folder holding zen.exe)", "Zen install folder");
+  if (zenDir === null) return null;
+  const profileDir = await askPath(ctx, "Zen profile folder (the folder holding prefs.js)", "Zen profile folder");
+  if (profileDir === null) return null;
+  return { zenDir, profileDir };
+}
+
+/** Discovery only proposes; the user always confirms, even when there is exactly one candidate. */
+async function choosePair(ctx: ExtensionContext): Promise<HirozenConfig | null> {
+  const candidates = await discoverZen({
+    appData: process.env.APPDATA ?? "",
+    processes: await listZenProcesses(),
+    isLocked: profileLocked,
+  });
+  if (candidates.length === 0) {
+    ctx.ui.notify("Hirozen: no Zen install with a profile was found; enter the paths manually.", "info");
+    return manualPair(ctx);
+  }
+  const labels = candidateLabels(candidates);
+  const picked = await ctx.ui.select("Which Zen should Hirozen use?", labels);
+  if (picked === undefined) return null;
+  const index = labels.indexOf(picked);
+  if (index === labels.length - 1) return manualPair(ctx);
+  const candidate = candidates[index];
+  return candidate === undefined ? null : { zenDir: candidate.zenDir, profileDir: candidate.profileDir };
+}
+
+/**
+ * What the session still overrides after the pair was saved, so the notify never promises too much.
+ * Both notes come from `resolveConfig`'s own answer: a successful save leaves only the env pair (or
+ * nothing) able to outrank the settings, and an incomplete env pair is exactly the problem it reports.
+ */
+function envOverrideNote(after: ResolveConfigResult): string {
+  if (after.ok && after.source === "env") {
+    return " HIROZEN_ZEN_DIR and HIROZEN_PROFILE are set: they still win in this session.";
+  }
+  if (!after.ok) return ` The env override is incomplete and still wins in this session: ${after.problem}`;
+  return "";
+}
+
+/** Offer the loader install after setup when verify() says this install has none (or an old one). */
+async function offerInstall(ctx: ExtensionContext, zenDir: string, problem: string): Promise<void> {
+  const wanted = await ctx.ui.confirm("Install the Hirozen loader into this Zen?", `${problem}\n\nInstall it now?`);
+  if (!wanted) return;
+  try {
+    install(zenDir);
+    ctx.ui.notify(
+      `Hirozen: loader installed into ${zenDir}. Restart Zen to load it, or run /hirozen-attach if it is already running.`,
+      "info",
+    );
+  } catch (error) {
+    const described = describeError(error);
+    ctx.ui.notify(`Hirozen: ${described.code}: ${described.text}`, "error");
+  }
+}
+
+/** The interactive half of /hirozen-setup: choose, validate, confirm, save, then offer the install. */
+async function setupPair(ctx: ExtensionContext): Promise<void> {
+  const pair = await choosePair(ctx);
+  if (pair === null) return;
+  const missing = [
+    ...(existsSync(join(pair.zenDir, "zen.exe")) ? [] : [`${join(pair.zenDir, "zen.exe")} does not exist`]),
+    ...(existsSync(join(pair.profileDir, "prefs.js")) ? [] : [`${join(pair.profileDir, "prefs.js")} does not exist`]),
+  ];
+  if (missing.length > 0) {
+    ctx.ui.notify(`Hirozen: that is not a usable Zen pair (${missing.join("; ")}). Nothing was saved.`, "error");
+    return;
+  }
+  // The profile remembers the install it last ran from. The pair is still the user's call, but the
+  // confirm has to say so before they make it.
+  const compatibility = readCompatibility(pair.profileDir);
+  const note =
+    compatibility && normalizePath(compatibility.lastPlatformDir) !== normalizePath(pair.zenDir)
+      ? `\n(this profile last ran from ${compatibility.lastPlatformDir})`
+      : "";
+  const confirmed = await ctx.ui.confirm("Use this Zen for Hirozen?", `${pair.zenDir}\n${pair.profileDir}${note}`);
+  if (!confirmed) return;
+
+  const previous = await resolveConfig(ctx.cwd);
+  try {
+    await saveConfig(ctx.cwd, pair);
+  } catch (error) {
+    ctx.ui.notify(`Hirozen: ${messageOf(error)}`, "error");
+    return;
+  }
+  // A live link and a sticky stop belong to the old Zen: a changed pair (or the first pair ever) must
+  // not leave the tools on the old one, nor a Stop on the old Zen refusing calls for the new one.
+  const changed =
+    !previous.ok ||
+    normalizePath(previous.config.zenDir) !== normalizePath(pair.zenDir) ||
+    normalizePath(previous.config.profileDir) !== normalizePath(pair.profileDir);
+  if (changed) {
+    shutdownLink();
+    stopKind = null;
+  }
+
+  const after = await resolveConfig(ctx.cwd);
+  const shadowed =
+    after.ok && after.overridePath !== undefined
+      ? ` A project override at ${after.overridePath} shadows the saved setting(s); edit it to change what Hirozen uses here.`
+      : "";
+  ctx.ui.notify(
+    `Hirozen: using ${pair.zenDir} with profile ${pair.profileDir}.${envOverrideNote(after)}${shadowed}`,
+    "info",
+  );
+
+  const outcome = verifyQuietly(pair.zenDir);
+  const problem = "problem" in outcome ? outcome.problem : outcome.checked.ok ? null : outcome.checked.reason;
+  if (problem !== null) await offerInstall(ctx, pair.zenDir, problem);
+}
+
+/** `/hirozen-setup clear`: forget the pair and drop the link and stop that belonged to it. */
+async function clearPair(ctx: ExtensionContext): Promise<void> {
+  try {
+    await clearConfig(ctx.cwd);
+  } catch (error) {
+    ctx.ui.notify(`Hirozen: ${messageOf(error)}`, "error");
+    return;
+  }
+  shutdownLink();
+  stopKind = null;
+  ctx.ui.notify("Hirozen: forgot the saved Zen and profile; run /hirozen-setup to choose them again.", "info");
+}
+
+async function runSetupCommand(ctx: ExtensionContext, args: string): Promise<void> {
+  if (!(ctx.hasUI && ctx.agent?.kind === "main")) {
+    ctx.ui.notify(`Hirozen: ${NO_UI_TEXT}`, "error");
+    return;
+  }
+  if (args.trim() === "clear") {
+    await clearPair(ctx);
+    return;
+  }
+  await setupPair(ctx);
+}
 
 /**
  * Parameter schemas, built from the injected omptype builder. They go through a named helper because
@@ -1284,19 +1469,81 @@ function toolParameters(builder: ExtensionAPI["zod"]) {
   };
 }
 
+/** Zen's name for the reinstall confirm: `Zen <version>` from application.ini's `[App] Version`, else "Zen". */
+function zenName(zenDir: string): string {
+  try {
+    const lines = readFileSync(join(zenDir, "application.ini"), "utf8").replace(/^\uFEFF/, "").split(/\r?\n/);
+    let inApp = false;
+    for (const line of lines) {
+      const section = /^\s*\[([^\]]+)\]\s*$/.exec(line);
+      if (section) {
+        inApp = section[1].toLowerCase() === "app";
+        continue;
+      }
+      const version = inApp ? /^Version=(.+)$/.exec(line.trim())?.[1]?.trim() : undefined;
+      if (version) return `Zen ${version}`;
+    }
+    return "Zen";
+  } catch {
+    return "Zen";
+  }
+}
+
+/**
+ * A Zen update replaces the install folder, which wipes the loader. `verify` reports that as "every
+ * module is missing" (nothing installed, nothing mismatched) while zen.exe is still there; anything
+ * else keeps the ordinary warning. Never installs without the confirm.
+ */
+async function offerReinstall(ctx: ExtensionContext, zenDir: string): Promise<void> {
+  const confirmed = await ctx.ui.confirm(
+    "Hirozen was removed from Zen",
+    `${zenName(zenDir)} no longer has the Hirozen loader (a Zen update replaces the install folder). Reinstall now?`,
+  );
+  if (!confirmed) return;
+  install(zenDir);
+  ctx.ui.notify(
+    `Hirozen: loader reinstalled into ${zenDir}. Restart Zen to load it, or run /hirozen-attach if it is already running.`,
+    "info",
+  );
+}
+
+/**
+ * The doc §6.3 "verify on every omp start" check. Read-only, so it is not a factory side effect, and
+ * the caller never awaits a dialog in it: the reinstall offer runs on its own.
+ */
+async function checkOnStart(ctx: ExtensionContext): Promise<void> {
+  const resolved = await resolveConfig(ctx.cwd);
+  if (!resolved.ok) {
+    ctx.ui.notify("Hirozen: not set up — run /hirozen-setup.", "info");
+    return;
+  }
+  const zenDir = resolved.config.zenDir;
+  const outcome = verifyQuietly(zenDir);
+  if ("problem" in outcome) {
+    ctx.ui.notify(`Hirozen: ${outcome.problem}`, "warning");
+    return;
+  }
+  const checked = outcome.checked;
+  if (checked.ok) return;
+  if (checked.installed === null && checked.mismatch === null) {
+    if (!existsSync(join(zenDir, "zen.exe"))) {
+      ctx.ui.notify(`Hirozen: the saved Zen install is gone (${zenDir}); run /hirozen-setup.`, "warning");
+      return;
+    }
+    void offerReinstall(ctx, zenDir).catch(error => ctx.ui.notify(`Hirozen: ${messageOf(error)}`, "error"));
+    return;
+  }
+  const fix = checked.reason.includes("/hirozen-install") ? "" : " — run /hirozen-install, restart Zen.";
+  ctx.ui.notify(`Hirozen: ${checked.reason}${fix}`, "warning");
+}
+
 export default function hirozen(pi: ExtensionAPI): void {
   const parameters = toolParameters(pi.zod);
 
   pi.on("session_start", (_event, ctx) => {
-    // Root session only, and silent while the plugin is unconfigured: this is the doc §6.3
-    // "verify on every omp start" check, read-only so it is not a factory side effect.
+    // Root session only. Nothing here is awaited, so a dialog can never hold up omp's startup.
     if (!(ctx.hasUI && ctx.agent?.kind === "main")) return;
-    const config = readConfig();
-    if (!config.ok) return;
-    const checked = checkInstalled(config.config.zenDir);
-    if (checked.ok) return;
-    const fix = checked.text.includes("/hirozen-install") ? "" : " — run /hirozen-install, restart Zen.";
-    ctx.ui.notify(`Hirozen: ${checked.text}${fix}`, "warning");
+    void checkOnStart(ctx).catch(error => ctx.ui.notify(`Hirozen: ${messageOf(error)}`, "error"));
   });
 
   pi.registerTool({
@@ -1528,8 +1775,13 @@ export default function hirozen(pi: ExtensionAPI): void {
     ),
   );
 
+  pi.registerCommand("hirozen-setup", {
+    description: "Choose the Zen install and profile Hirozen uses (saved in omp's plugin settings; `clear` forgets them)",
+    handler: (args, ctx) => runSetupCommand(ctx, args),
+  });
+
   pi.registerCommand("hirozen-install", {
-    description: "Install the Hirozen loader into the Zen install directory (HIROZEN_ZEN_DIR)",
+    description: "Install the Hirozen loader into the configured Zen install directory (see /hirozen-setup)",
     handler: (_args, ctx) => runInstallCommand(ctx),
   });
 
@@ -1544,7 +1796,7 @@ export default function hirozen(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("hirozen-status", {
-    description: "Report the loader install, the loader status file and the Zen DevTools prefs",
+    description: "Report the configured Zen and profile, the loader install, the loader status file and the DevTools prefs",
     handler: (_args, ctx) => runStatusCommand(ctx),
   });
 }
