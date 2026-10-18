@@ -127,6 +127,7 @@ const ABOUT_NAVIGABLE = ["about:blank", "about:newtab", "about:home"];
 // The network tools (T9-T11). One 64 KB budget per answer, and the two bounds the storage answer uses.
 const NET_CAP_BYTES = 65_536;
 const STORAGE_VALUE_CHARS = 200;
+const DOWNLOADS_MAX = 50;
 
 // Close codes (contract): 1000 done, 4002 pre-auth message, 4003 auth failed, 4010 stopped by user,
 // 4012 heartbeat timeout.
@@ -397,6 +398,16 @@ function capabilityPresent(name, win) {
   } catch {
     return false;
   }
+}
+
+// The state of a Download, from its own flags (DownloadCore's docs): an error, a cancel, a success,
+// still running - and `stopped` with no start time, which is a download that never began.
+function downloadState(download) {
+  if (download.error) return "failed";
+  if (download.canceled === true) return "canceled";
+  if (download.succeeded === true) return "succeeded";
+  if (download.stopped !== true) return "downloading";
+  return download.startTime ? "failed" : "queued";
 }
 
 // The notice's wording for a set of permissions: "read pages", "read and act on pages", "read network
@@ -845,6 +856,8 @@ class Loader {
         return this.#networkCookies(params, req);
       case "network.storage":
         return this.#networkStorage(params, req);
+      case "network.downloads":
+        return this.#networkDownloads(params, req);
       default:
         throw new LoaderError("E_UNKNOWN_METHOD", `unknown method ${msg.method}`);
     }
@@ -2139,6 +2152,28 @@ class Loader {
       entries.push(item);
     }
     return { tabKey, url: reply?.url ?? "", kind, entries, truncated };
+  }
+
+  // T10: the last 50 public downloads, newest first. Downloads.PUBLIC is what keeps a private window's
+  // downloads out; there is no per-tab notion here, so the tool takes no tabKey. A DownloadList's own
+  // order is the order they started, so reversing it is newest-first without trusting start times
+  // (which a restored entry may not have at all).
+  async #networkDownloads(params, req) {
+    this.#need(Services.wm.getMostRecentWindow("navigator:browser") ?? null, "Downloads");
+    await this.#gate("network", req);
+    this.#checkDeadline(req);
+    const list = await lazy.Downloads.getList(lazy.Downloads.PUBLIC);
+    const all = (await list.getAll()) ?? [];
+    const items = all.map(download => ({
+      source: String(download.source?.url ?? ""),
+      target: String(download.target?.path ?? ""),
+      state: downloadState(download),
+      bytes: Number(download.currentBytes) || 0,
+      totalBytes: Number(download.totalBytes) || 0,
+      startedAt: download.startTime instanceof Date ? download.startTime.getTime() : null,
+    }));
+    const truncated = items.length > DOWNLOADS_MAX;
+    return { downloads: items.slice(-DOWNLOADS_MAX).reverse(), truncated };
   }
 
   #emit(name, data) {
