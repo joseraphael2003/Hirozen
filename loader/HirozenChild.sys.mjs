@@ -256,6 +256,9 @@ export class HirozenChild extends JSWindowActorChild {
       case "click":
         await this.#click(win, this.#interactable(this.#element(data.ref)));
         break;
+      case "hover":
+        await this.#hover(win, this.#interactable(this.#element(data.ref)));
+        break;
       case "type": {
         if (typeof data.text !== "string" || data.text.length > MAX_TYPE_CHARS) {
           throw new HirozenError("E_BAD_PARAMS", `type needs text of at most ${MAX_TYPE_CHARS} characters`);
@@ -355,6 +358,16 @@ export class HirozenChild extends JSWindowActorChild {
     const y = rect.top + rect.height / 2;
     await lazy.event.synthesizeMouseAtPoint(x, y, { type: "mousedown", button: 0, buttons: 0, clickCount: 1, inputSource: 1 }, win);
     await lazy.event.synthesizeMouseAtPoint(x, y, { type: "mouseup", button: 0, buttons: 0, clickCount: 1, inputSource: 1 }, win);
+  }
+
+  // Hover: the element is brought to the middle of the viewport like a click - a `:hover` menu that
+  // sits off-screen has nothing to show - and one synthesized mousemove lands at its centre. That is
+  // the event BiDi's pointerMove sends (isTrusted, no OS input), and the only event a hover needs:
+  // no button, no click count.
+  async #hover(win, el) {
+    el.scrollIntoView({ block: "center", inline: "center" });
+    const rect = el.getBoundingClientRect();
+    await lazy.event.synthesizeMouseAtPoint(rect.left + rect.width / 2, rect.top + rect.height / 2, { type: "mousemove" }, win);
   }
 
   // A trusted click first, so the field is focused the way a user focuses it, then one

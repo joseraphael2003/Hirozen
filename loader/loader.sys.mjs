@@ -1145,12 +1145,12 @@ class Loader {
     const text = params?.text;
     const key = params?.key;
     const dy = params?.dy;
-    const ACTIONS = ["click", "type", "press", "scroll", "navigate"];
+    const ACTIONS = ["click", "type", "press", "scroll", "hover", "navigate"];
     if (typeof action !== "string" || !ACTIONS.includes(action)) {
       throw new LoaderError("E_BAD_PARAMS", `browser.act needs action to be one of ${ACTIONS.join(", ")}`);
     }
-    if (action === "click" && (typeof ref !== "string" || !ref)) {
-      throw new LoaderError("E_BAD_PARAMS", "browser.act click needs a ref from browser_snapshot");
+    if ((action === "click" || action === "hover") && (typeof ref !== "string" || !ref)) {
+      throw new LoaderError("E_BAD_PARAMS", `browser.act ${action} needs a ref from browser_snapshot`);
     }
     if (action === "type") {
       if (typeof ref !== "string" || !ref) throw new LoaderError("E_BAD_PARAMS", "browser.act type needs a ref from browser_snapshot");
