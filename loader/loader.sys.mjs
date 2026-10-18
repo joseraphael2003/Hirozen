@@ -124,6 +124,10 @@ const PERMISSION_VERBS = {
 // agent needs to reach the web from one (plan: navigate's exemption from E_PRIVILEGED_PAGE).
 const ABOUT_NAVIGABLE = ["about:blank", "about:newtab", "about:home"];
 
+// The network tools (T9-T11). One 64 KB budget per answer, and the two bounds the storage answer uses.
+const NET_CAP_BYTES = 65_536;
+const STORAGE_VALUE_CHARS = 200;
+
 // Close codes (contract): 1000 done, 4002 pre-auth message, 4003 auth failed, 4010 stopped by user,
 // 4012 heartbeat timeout.
 const CLOSE_DONE = 1000;
@@ -837,6 +841,10 @@ class Loader {
         return this.#zenGlance(params, req);
       case "zen.loadTab":
         return this.#zenLoadTab(params, req);
+      case "network.cookies":
+        return this.#networkCookies(params, req);
+      case "network.storage":
+        return this.#networkStorage(params, req);
       default:
         throw new LoaderError("E_UNKNOWN_METHOD", `unknown method ${msg.method}`);
     }
@@ -2044,6 +2052,93 @@ class Loader {
         // A Zen that refuses the switch leaves the user where they are; nothing else to try here.
       }
     }
+  }
+
+  // ---------------------------------------------------------------- network (T9-T11)
+
+  // Every network tool runs behind the `network` permission, refuses private windows through
+  // #resolveTab (which is why none of them has to think about one), and reads only - no bodies, no
+  // blocking, no modification. `reveal` is what turns a redacted answer into a real one, and the
+  // plugin's own prompt is what guards that.
+
+  // T9: the tab's own cookies. `getCookiesFromHost(host, originAttributes)` answers the host's cookies
+  // and its registrable-domain parents' (marionette walks the host suffixes of what it returns for
+  // exactly that reason), scoped to the tab's own origin attributes - containers and partitioned
+  // storage included - because that is what makes it this tab's jar rather than the default one.
+  async #networkCookies(params, req) {
+    const { tabKey, browser } = this.#resolveTab(params?.tabKey);
+    this.#need(browser.ownerGlobal ?? null, "Services.cookies");
+    await this.#gate("network", req);
+    this.#checkDeadline(req);
+    const uri = browser.currentURI;
+    const reveal = params?.reveal === true;
+    const cookies = [];
+    let bytes = 0;
+    let truncated = false;
+    for (const cookie of Services.cookies.getCookiesFromHost(String(uri.host ?? ""), browser.contentPrincipal?.originAttributes ?? {}) ?? []) {
+      const value = String(cookie.value ?? "");
+      const item = {
+        name: String(cookie.name ?? ""),
+        value: reveal ? value : `<${value.length} chars>`,
+        domain: String(cookie.host ?? ""),
+        path: String(cookie.path ?? ""),
+        // nsICookie.expiry is milliseconds since the epoch (marionette divides by 1000 for WebDriver);
+        // a session cookie has none.
+        expires: cookie.isSession ? null : Number(cookie.expiry) || null,
+        secure: cookie.isSecure === true,
+        httpOnly: cookie.isHttpOnly === true,
+        sameSite: String(cookie.sameSite ?? "unspecified"),
+      };
+      const size = JSON.stringify(item).length + 1;
+      if (bytes + size > NET_CAP_BYTES) {
+        truncated = true;
+        break;
+      }
+      bytes += size;
+      cookies.push(item);
+    }
+    return { tabKey, url: uri.spec, cookies, truncated };
+  }
+
+  // T9: the top document's storage. The child reads it (only the content process has the document);
+  // the redaction and both caps are here, because `reveal` is a decision the loader owns. IndexedDB
+  // is names only, which is what the child answers with `value: null`.
+  async #networkStorage(params, req) {
+    const kind = params?.kind;
+    if (kind !== "local" && kind !== "session" && kind !== "indexeddb") {
+      throw new LoaderError("E_BAD_PARAMS", 'browser_storage needs kind to be "local", "session" or "indexeddb"');
+    }
+    const { tabKey, wg } = this.#resolveTab(params?.tabKey);
+    await this.#gate("network", req);
+    this.#checkDeadline(req);
+    const reply = await this.#query(wg, "storage", { kind });
+    const reveal = params?.reveal === true;
+    const entries = [];
+    let bytes = 0;
+    let truncated = reply?.truncated === true;
+    for (const entry of Array.isArray(reply?.entries) ? reply.entries : []) {
+      const value = entry?.value === null || entry?.value === undefined ? null : String(entry.value);
+      let shown = null;
+      if (value !== null) {
+        if (!reveal) {
+          shown = `<${value.length} chars>`;
+        } else if (value.length > STORAGE_VALUE_CHARS) {
+          shown = value.slice(0, STORAGE_VALUE_CHARS);
+          truncated = true;
+        } else {
+          shown = value;
+        }
+      }
+      const item = { key: String(entry?.key ?? ""), value: shown };
+      const size = JSON.stringify(item).length + 1;
+      if (bytes + size > NET_CAP_BYTES) {
+        truncated = true;
+        break;
+      }
+      bytes += size;
+      entries.push(item);
+    }
+    return { tabKey, url: reply?.url ?? "", kind, entries, truncated };
   }
 
   #emit(name, data) {

@@ -1,9 +1,10 @@
 /* Hirozen actor child: the content-process half of the loader-owned "Hirozen" JSWindowActor.
  *
- * The loader drives it with six messages and nothing else. The surface is deliberately tiny: this
+ * The loader drives it with seven messages and nothing else. The surface is deliberately tiny: this
  * code runs in every content process with the system principal (doc 15.7).
  *   read     -> {json, fullLength}              the V1 page extraction, as literal module code
  *   article  -> {url, title, byline, text, truncated}  the reader view's parse of the same document
+ *   storage  -> {url, entries, truncated}       the top document's storage (raw; the loader redacts)
  *   viewport -> {x, y, width, height, dpr}      the rectangle the parent feeds to drawSnapshot
  *   snapshot -> {url, title, elements, truncated} visible interactive elements with stable refs
  *   act      -> {ok, url, title}                trusted click/type/press/scroll/hover
@@ -72,11 +73,17 @@ const ELEMENT_SELECTOR = [
 const FALLBACK_CODE = {
   read: "E_READ_FAILED",
   article: "E_READ_FAILED",
+  storage: "E_READ_FAILED",
   viewport: "E_READ_FAILED",
   snapshot: "E_READ_FAILED",
   act: "E_INTERNAL",
   setFiles: "E_INTERNAL",
 };
+
+// What one storage reply may carry, in characters of key + value: the loader caps again after
+// redacting (its own 64 KB budget), but a page can hold megabytes of localStorage and this bounds
+// what crosses sendQuery.
+const STORAGE_CAP_BYTES = 65_536;
 
 // The keys `press` accepts, as WebDriver key codepoints. sendSingleKey needs the codepoint: passing
 // the plain name would make KeyData treat "Enter" as a printable key and type the text instead.
@@ -157,6 +164,8 @@ export class HirozenChild extends JSWindowActorChild {
           return this.#read();
         case "article":
           return await this.#article();
+        case "storage":
+          return await this.#storage(data);
         case "viewport":
           return this.#viewport();
         case "snapshot":
@@ -233,6 +242,57 @@ export class HirozenChild extends JSWindowActorChild {
       text,
       truncated,
     };
+  }
+
+  // The top document's own storage: localStorage, sessionStorage (keys and raw values - the loader
+  // redacts, because that is where the reveal flag lives), or the IndexedDB database *names* only
+  // (indexedDB.databases(); there is no per-store value API worth crossing a process boundary with).
+  // A store that refuses to be read (an opaque origin) throws here and crosses as a read failure.
+  async #storage(data) {
+    const win = this.#window();
+    const url = this.document?.location?.href ?? "";
+    const kind = data?.kind;
+    if (kind === "indexeddb") {
+      const idb = win.indexedDB;
+      if (!idb || typeof idb.databases !== "function") {
+        throw new HirozenError("E_UNSUPPORTED", "IndexedDB is not available in this document");
+      }
+      const entries = [];
+      let bytes = 0;
+      let truncated = false;
+      for (const db of (await idb.databases()) ?? []) {
+        const name = String(db?.name ?? "");
+        if (bytes + name.length > STORAGE_CAP_BYTES) {
+          truncated = true;
+          break;
+        }
+        bytes += name.length;
+        entries.push({ key: name, value: null });
+      }
+      return { url, entries, truncated };
+    }
+    if (kind !== "local" && kind !== "session") {
+      throw new HirozenError("E_BAD_PARAMS", 'storage needs kind to be "local", "session" or "indexeddb"');
+    }
+    const store = kind === "local" ? win.localStorage : win.sessionStorage;
+    if (!store) {
+      throw new HirozenError("E_UNSUPPORTED", `${kind} storage is not available in this document`);
+    }
+    const entries = [];
+    let bytes = 0;
+    let truncated = false;
+    for (let i = 0; i < store.length; i++) {
+      const key = store.key(i);
+      if (key === null) continue;
+      const value = store.getItem(key) ?? "";
+      if (bytes + key.length + value.length > STORAGE_CAP_BYTES) {
+        truncated = true;
+        break;
+      }
+      bytes += key.length + value.length;
+      entries.push({ key, value });
+    }
+    return { url, entries, truncated };
   }
 
   // The rectangle BiDi's browsingContext.captureScreenshot uses for origin=viewport, clip=null
