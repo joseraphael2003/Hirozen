@@ -215,19 +215,12 @@ export class HirozenChild extends JSWindowActorChild {
     let truncated = false;
     let labels = null; // id of a labelled control -> the label element, built once per snapshot
 
-    for (const el of doc.querySelectorAll(ELEMENT_SELECTOR)) {
-      if (elements.length >= MAX_ELEMENTS) {
-        // More candidates behind the cap: the list is reported as truncated without walking the
-        // rest of the DOM.
-        truncated = true;
-        break;
-      }
+    // One candidate: the same visibility rules the snapshot always had (a zero-size or invisible
+    // element cannot be pointed at, and the same test makes it E_NOT_INTERACTABLE for act).
+    const consider = el => {
       const rect = el.getBoundingClientRect();
-      // "Non-zero": a zero-width or zero-height element cannot be pointed at, and the same test
-      // makes it E_NOT_INTERACTABLE for act.
-      if (!(rect.width > 0) || !(rect.height > 0)) continue;
-      if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue;
-
+      if (!(rect.width > 0) || !(rect.height > 0)) return;
+      if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return;
       if (labels === null) {
         labels = new Map();
         for (const label of doc.querySelectorAll("label[for]")) {
@@ -237,7 +230,6 @@ export class HirozenChild extends JSWindowActorChild {
           if (forId) labels.set(forId, label);
         }
       }
-
       elements.push({
         ref: refFor(state, el),
         role: roleOf(el),
@@ -245,7 +237,25 @@ export class HirozenChild extends JSWindowActorChild {
         tag: capToken(el.localName),
         rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
       });
-    }
+    };
+
+    // The walk covers the light DOM and every open *or closed* shadow root (openOrClosedShadowRoot is
+    // the ChromeOnly property that answers for a closed root too), so a web component's internals are
+    // reachable - refs inside them resolve through the same DOC_STATE map as any other element. False
+    // means the element cap was reached: the rest of the tree is not walked at all.
+    const visit = root => {
+      for (const el of root.querySelectorAll("*")) {
+        if (elements.length >= MAX_ELEMENTS) {
+          truncated = true;
+          return false;
+        }
+        if (el.matches(ELEMENT_SELECTOR)) consider(el);
+        const shadow = el.openOrClosedShadowRoot ?? null;
+        if (shadow && visit(shadow) === false) return false;
+      }
+      return true;
+    };
+    visit(doc);
 
     return { url: win.location.href, title: doc.title, elements, truncated };
   }
