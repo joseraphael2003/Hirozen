@@ -656,6 +656,45 @@ test('browser_read mode "article" sends the mode and renders the byline', async 
   await started;
 }, 30_000);
 
+test("zen_load_tab loads a lazy tab and names the restored page", async () => {
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+  const tool = host.tools.get("zen_load_tab");
+  if (!tool) throw new Error("zen_load_tab is not registered");
+  const args = { tabKey: TAB_KEY };
+  const details = tool.formatApprovalDetails?.(args);
+  const lines = Array.isArray(details) ? details.join("\n") : String(details ?? "");
+  expect(lines).toContain(TAB_KEY);
+  expect(lines).toContain("without selecting it");
+  const decision = typeof tool.approval === "function" ? tool.approval(args) : tool.approval;
+  expect(decision).toMatchObject({ tier: "exec", policy: "prompt" });
+
+  const loader = new FakeLoader(profileDir).on("zen.loadTab", frame =>
+    loader.reply(frame, { tabKey: TAB_KEY, url: "https://example.com/restored", title: "Restored page" }),
+  );
+  const started = loader.start().catch(() => undefined);
+
+  const call = callTool(host, "zen_load_tab", args);
+  const request = await loader.nextRequest();
+  expect(request.method).toBe("zen.loadTab");
+  expect(request.params).toEqual({ tabKey: TAB_KEY });
+  // Loading is an act: with nothing granted the call carries the person-wait, exactly like browser_act.
+  const budget = frameDeadline(request) - Date.now();
+  expect(budget).toBeGreaterThan(125_000);
+  expect(budget).toBeLessThanOrEqual(140_000);
+
+  const result = await call;
+  expect(result.isError).not.toBe(true);
+  const text = textOf(result);
+  expect(text).toContain("Loaded tab");
+  expect(text).toContain("selected tab are unchanged");
+  expect(text).toContain("# Restored page");
+  expect(text).toContain("https://example.com/restored");
+  expect(result.details).toMatchObject({ tabKey: TAB_KEY, url: "https://example.com/restored", title: "Restored page" });
+
+  await shutdown(host);
+  await started;
+}, 30_000);
+
 test("the reinstall offer names /hirozen-attach only when that Zen is running", async () => {
   // A Zen update wipes the loader while zen.exe is still there: the offer fires on session_start. The
   // attach hint needs a live process, and this install folder (a temp dir) has none, so the notice

@@ -85,7 +85,7 @@ const CODE_TEXT: Record<string, string> = {
   E_TAB_INACTIVE_SPACE:
     "that tab is in a non-active space: Hirozen reads, snapshots and screenshots there, but never switches spaces to act, upload or answer a dialog",
   E_TAB_UNKNOWN: "no such tab; list the tabs with zen_tabs",
-  E_TAB_UNLOADED: "that tab is not loaded; open it in Zen first (Hirozen never loads tabs)",
+  E_TAB_UNLOADED: "that tab is not loaded; open it in Zen first, or load it with zen_load_tab (which never selects it)",
   E_UNSUPPORTED:
     "the running Zen does not expose an internal Hirozen needs (a Zen update, or an older Zen); update Hirozen, or read /hirozen-status for the missing names",
   E_UNKNOWN_METHOD: "the installed loader does not support that method; run /hirozen-install, restart Zen",
@@ -137,6 +137,8 @@ type ZenActResult = {
 type ZenOpen = { tabKey: string; spaceId: string; url?: string; title?: string };
 type ZenSplit = { groupId?: string };
 type ZenGlance = { tabKey: string };
+/** zen_load_tab's reply: the page the lazy tab restored to (its real URL, never about:blank). */
+type ZenLoadTab = { tabKey: string; url: string; title: string };
 
 /**
  * The parsed arguments of the V2 tools. omp validates every call against the tool's `parameters`
@@ -564,7 +566,7 @@ function renderInventory(windows: ZenWindow[]): string {
     }
   });
   lines.push(
-    'Pass a tabKey to browser_read, browser_screenshot, browser_snapshot, browser_act, browser_upload, browser_dialog and the zen_* layout tools. "lazy" tabs have no document yet, so the read tools refuse them. Loaded tabs in a non-active space can be read, snapshotted and screenshotted; acts, uploads and dialogs there are refused, because Hirozen never switches spaces. zen_tabs and the read tools never load or activate a tab; browser_act navigate and zen_open load pages, and zen_glance selects its glance tab.',
+    'Pass a tabKey to browser_read, browser_screenshot, browser_snapshot, browser_act, browser_upload, browser_dialog and the zen_* layout tools. "lazy" tabs have no document yet: the read tools refuse them and zen_load_tab loads one without selecting it. Loaded tabs in a non-active space can be read, snapshotted and screenshotted; acts, uploads and dialogs there are refused, because Hirozen never switches spaces. zen_tabs and the read tools never load or activate a tab; zen_load_tab loads (but never selects) a tab, browser_act navigate and zen_open load pages, and zen_glance selects its glance tab.',
   );
   return lines.join("\n");
 }
@@ -897,6 +899,38 @@ async function runBrowserDialog(
   }
 }
 
+/**
+ * `zen.loadTab` answers with the page the lazy tab restored to; the loader has already put the user's
+ * selected tab and space back, so the reply only has to name what loaded.
+ */
+async function runZenLoadTab(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  tabKey: string,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  try {
+    const loaded = await access.link.call<ZenLoadTab>("zen.loadTab", { tabKey }, { timeoutMs: callBudget("act"), signal });
+    rememberTab(tabKey, loaded);
+    return {
+      content: [
+        {
+          type: "text",
+          text: [
+            `Loaded tab ${loaded.tabKey} in the background; the user's space and selected tab are unchanged.`,
+            pageHeader(loaded.url, loaded.title),
+          ].join("\n"),
+        },
+      ],
+      details: { tabKey: loaded.tabKey, url: loaded.url, title: loaded.title },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+
 async function runZenOpen(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -1090,6 +1124,12 @@ function dialogApprovalDetails(args: unknown): string[] {
   const lines = [`tab: ${describeTab(params.tabKey)}`, `action: ${params.accept ? "accept" : "dismiss"} the page dialog`];
   if (params.text !== undefined && params.text !== "") lines.push(`text: ${clipForPrompt(params.text)}`);
   return lines;
+}
+
+/** zen_load_tab: which tab starts loading, and that the view is left alone. */
+function loadTabApprovalDetails(args: unknown): string[] {
+  const params = approvalArgs<TabParams>(args);
+  return [`tab: ${describeTab(params.tabKey)}`, "action: load the tab in the background without selecting it"];
 }
 
 /** zen_open: the URL that lands in the agent space. */
@@ -1743,6 +1783,28 @@ export default function hirozen(pi: ExtensionAPI): void {
         ) => runBrowserDialog(pi, ctx, params, signal),
       },
       dialogApprovalDetails,
+    ),
+  );
+
+  pi.registerTool(
+    withApprovalDetails(
+      {
+        name: "zen_load_tab",
+        label: "Load tab",
+        description:
+          'Load an unloaded ("lazy") Zen tab by its tabKey from zen_tabs, without selecting it: the user\'s space and selected tab are left alone. Refuses pinned and essential tabs, private windows, privileged (about:/chrome:/resource:) pages and tabs that are already loaded.',
+        parameters: parameters.tabKey,
+        approval: execApproval("zen_load_tab loads an unloaded tab in Zen (its page starts loading in the background)."),
+        loadMode: "essential",
+        execute: (
+          _toolCallId: string,
+          params: TabParams,
+          signal: AbortSignal | undefined,
+          _onUpdate: unknown,
+          ctx: ExtensionContext,
+        ) => runZenLoadTab(pi, ctx, params.tabKey, signal),
+      },
+      loadTabApprovalDetails,
     ),
   );
 
