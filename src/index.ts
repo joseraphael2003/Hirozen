@@ -13,7 +13,7 @@
 //
 // Every tool checks in the plan's fixed order: root/UI -> sticky stop -> config -> connect.
 import { existsSync, readFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { AgentToolResult, ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
@@ -1533,6 +1533,9 @@ function zenName(zenDir: string): string {
  * A Zen update replaces the install folder, which wipes the loader. `verify` reports that as "every
  * module is missing" (nothing installed, nothing mismatched) while zen.exe is still there; anything
  * else keeps the ordinary warning. Never installs without the confirm.
+ *
+ * `/hirozen-attach` is only named when that Zen is still running: attaching needs a live process, and
+ * a hint nobody can follow is worse than none (the restart advice always applies).
  */
 async function offerReinstall(ctx: ExtensionContext, zenDir: string): Promise<void> {
   const confirmed = await ctx.ui.confirm(
@@ -1541,10 +1544,10 @@ async function offerReinstall(ctx: ExtensionContext, zenDir: string): Promise<vo
   );
   if (!confirmed) return;
   install(zenDir);
-  ctx.ui.notify(
-    `Hirozen: loader reinstalled into ${zenDir}. Restart Zen to load it, or run /hirozen-attach if it is already running.`,
-    "info",
-  );
+  const wanted = normalizePath(zenDir);
+  const running = (await listZenProcesses()).some(process => normalizePath(dirname(process.executablePath)) === wanted);
+  const attach = running ? ", or run /hirozen-attach while it is still running" : "";
+  ctx.ui.notify(`Hirozen: loader reinstalled into ${zenDir}. Restart Zen to load it${attach}.`, "info");
 }
 
 /**

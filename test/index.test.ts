@@ -558,3 +558,19 @@ test("a loader E_UNSUPPORTED renders its gloss and keeps the loader's message", 
   expect((result.details as { code?: string } | undefined)?.code).toBe("E_UNSUPPORTED");
   await shutdown(host);
 }, 30_000);
+
+test("the reinstall offer names /hirozen-attach only when that Zen is running", async () => {
+  // A Zen update wipes the loader while zen.exe is still there: the offer fires on session_start. The
+  // attach hint needs a live process, and this install folder (a temp dir) has none, so the notice
+  // must not offer it (the restart advice always applies).
+  uninstall(zenDir);
+  const handler = host.events.get("session_start");
+  if (!handler) throw new Error("session_start was never registered");
+  const before = host.notifications.length;
+  handler({ type: "session_start" }, host.ctx);
+  await waitFor(() => host.notifications.length > before, 20_000);
+  const notice = host.notifications.at(-1) ?? "";
+  expect(notice).toContain("reinstalled into");
+  expect(notice).toContain("Restart Zen to load it.");
+  expect(notice).not.toContain("/hirozen-attach");
+}, 30_000);
