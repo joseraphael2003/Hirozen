@@ -82,7 +82,8 @@ const CODE_TEXT: Record<string, string> = {
   E_REF_STALE:
     "that element reference is from an older page (or the element is gone); take a fresh browser_snapshot and retry",
   E_STOPPED: "the loader dropped the session (fail-closed); retry, or run /hirozen-connect",
-  E_TAB_INACTIVE_SPACE: "that tab is in an inactive space, and Hirozen never switches spaces",
+  E_TAB_INACTIVE_SPACE:
+    "that tab is in a non-active space: Hirozen reads, snapshots and screenshots there, but never switches spaces to act, upload or answer a dialog",
   E_TAB_UNKNOWN: "no such tab; list the tabs with zen_tabs",
   E_TAB_UNLOADED: "that tab is not loaded; open it in Zen first (Hirozen never loads tabs)",
   E_UNSUPPORTED:
@@ -563,7 +564,7 @@ function renderInventory(windows: ZenWindow[]): string {
     }
   });
   lines.push(
-    'Pass a tabKey to browser_read, browser_screenshot, browser_snapshot, browser_act, browser_upload, browser_dialog and the zen_* layout tools. "lazy" tabs have no document yet and tabs in a non-active space are unreachable except the Hirozen Agent space. zen_tabs and the read tools never load or activate a tab; browser_act navigate and zen_open load pages, and zen_glance selects its glance tab.',
+    'Pass a tabKey to browser_read, browser_screenshot, browser_snapshot, browser_act, browser_upload, browser_dialog and the zen_* layout tools. "lazy" tabs have no document yet, so the read tools refuse them. Loaded tabs in a non-active space can be read, snapshotted and screenshotted; acts, uploads and dialogs there are refused, because Hirozen never switches spaces. zen_tabs and the read tools never load or activate a tab; browser_act navigate and zen_open load pages, and zen_glance selects its glance tab.',
   );
   return lines.join("\n");
 }
@@ -1650,7 +1651,7 @@ export default function hirozen(pi: ExtensionAPI): void {
     name: "browser_read",
     label: "Read tab",
     description:
-      'Read the visible text of one Zen tab by its tabKey from zen_tabs, or the reader-mode article with mode:"article" (read-only; the tab is never loaded, activated or navigated).',
+      'Read the visible text of one Zen tab by its tabKey from zen_tabs, or the reader-mode article with mode:"article" (read-only; the tab is never loaded, activated or navigated). Loaded tabs in any space can be read.',
     parameters: parameters.read,
     approval: "read",
     loadMode: "essential",
@@ -1660,7 +1661,8 @@ export default function hirozen(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "browser_screenshot",
     label: "Screenshot tab",
-    description: "Capture a PNG screenshot of one Zen tab's viewport by its tabKey from zen_tabs (read-only).",
+    description:
+      "Capture a PNG screenshot of one Zen tab's viewport by its tabKey from zen_tabs (read-only; loaded tabs in any space can be screenshotted).",
     parameters: parameters.tabKey,
     approval: "read",
     loadMode: "essential",
@@ -1671,7 +1673,7 @@ export default function hirozen(pi: ExtensionAPI): void {
     name: "browser_snapshot",
     label: "Snapshot tab",
     description:
-      "List the interactive elements of one Zen tab by its tabKey (links, buttons, inputs, selects, labelled controls) with a ref for each; browser_act and browser_upload take those refs (read-only; the tab is never loaded or activated).",
+      "List the interactive elements of one Zen tab by its tabKey (links, buttons, inputs, selects, labelled controls) with a ref for each; browser_act and browser_upload take those refs (read-only; the tab is never loaded or activated, and loaded tabs in any space can be snapshotted).",
     parameters: parameters.tabKey,
     approval: "read",
     loadMode: "essential",
@@ -1684,7 +1686,7 @@ export default function hirozen(pi: ExtensionAPI): void {
         name: "browser_act",
         label: "Act in tab",
         description:
-          'Act on one Zen tab by its tabKey: click, type, press, scroll, hover or navigate (navigate needs an http(s) url). Refs come from browser_snapshot. The loader\'s in-Zen Allow/Deny gate must have granted the act permission; every call needs your approval. Refused on privileged pages, in private windows and on tabs in an inactive space that is not the Hirozen Agent space.',
+          'Act on one Zen tab by its tabKey: click, type, press, scroll, hover or navigate (navigate needs an http(s) url). Refs come from browser_snapshot. The loader\'s in-Zen Allow/Deny gate must have granted the act permission; every call needs your approval. Refused on privileged pages, in private windows and on tabs in a non-active space that is not the Hirozen Agent space (reads, snapshots and screenshots are allowed there; acts, uploads and dialogs are not).',
         parameters: parameters.act,
         approval: execApproval("browser_act changes a page in Zen (click, type, press, scroll, hover or navigate)."),
         loadMode: "essential",
