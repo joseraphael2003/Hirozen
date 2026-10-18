@@ -157,6 +157,15 @@ type ZenCookie = {
 type ZenCookies = { tabKey: string; url: string; cookies: ZenCookie[]; truncated: boolean };
 type ZenStorageEntry = { key: string; value: string | null };
 type ZenStorage = { tabKey: string; url: string; kind: string; entries: ZenStorageEntry[]; truncated: boolean };
+type ZenDownload = {
+  source: string;
+  target: string;
+  state: string;
+  bytes: number | null;
+  totalBytes: number | null;
+  startedAt: number | null;
+};
+type ZenDownloads = { downloads: ZenDownload[]; truncated: boolean };
 
 /**
  * The parsed arguments of the V2 tools. omp validates every call against the tool's `parameters`
@@ -921,7 +930,7 @@ async function runBrowserDialog(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Network (T9): the tab's cookies and its page storage
+// Network (T9-T10): the tab's cookies, its page storage and Zen's downloads
 // ---------------------------------------------------------------------------------------------
 //
 // Every call here runs under the loader's `network` permission and its own in-Zen Allow/Deny prompt,
@@ -957,6 +966,21 @@ function renderStorage(reply: ZenStorage): string {
   // IndexedDB answers database names only, which the loader sends with a null value.
   for (const entry of reply.entries) lines.push(entry.value === null ? `- ${entry.key}` : `- ${entry.key}=${entry.value}`);
   if (reply.truncated) lines.push("", "The list stops at 64 KB of storage data.");
+  return lines.join("\n");
+}
+
+/** `<n>/<total> bytes, started <ISO>`: as much as Zen knows about one download. */
+function downloadNote(download: ZenDownload): string {
+  const started = download.startedAt === null ? "unknown" : new Date(download.startedAt).toISOString();
+  return `${download.bytes ?? "?"}/${download.totalBytes ?? "?"} bytes, started ${started}`;
+}
+
+function renderDownloads(reply: ZenDownloads): string {
+  const lines = [`# ${reply.downloads.length} download(s), newest first`];
+  for (const download of reply.downloads) {
+    lines.push(`- ${download.state} ${download.source} -> ${download.target} (${downloadNote(download)})`);
+  }
+  if (reply.truncated) lines.push("", "Only the newest 50 downloads are listed.");
   return lines.join("\n");
 }
 
@@ -1020,6 +1044,27 @@ async function runBrowserStorage(
         revealed: params.reveal === true,
         truncated: reply.truncated,
       },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+
+async function runBrowserDownloads(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  try {
+    const reply = await access.link.call<ZenDownloads>("network.downloads", {}, {
+      timeoutMs: callBudget("network"),
+      signal,
+    });
+    return {
+      content: [{ type: "text", text: renderDownloads(reply) }],
+      details: { downloads: reply.downloads.length, truncated: reply.truncated },
     };
   } catch (error) {
     return fail(describeError(error));
@@ -2149,6 +2194,17 @@ export default function hirozen(pi: ExtensionAPI): void {
       storageApprovalDetails,
     ),
   );
+
+  pi.registerTool({
+    name: "browser_downloads",
+    label: "List downloads",
+    description:
+      "List Zen's most recent downloads, newest first (source URL, target path, state, bytes, start time), under the loader's network permission. Read-only: Hirozen cannot start, cancel or delete a download.",
+    parameters: parameters.none,
+    approval: "read",
+    loadMode: "essential",
+    execute: (_toolCallId, _params, signal, _onUpdate, ctx) => runBrowserDownloads(pi, ctx, signal),
+  });
 
   pi.registerCommand("hirozen-setup", {
     description: "Choose the Zen install and profile Hirozen uses (saved in omp's plugin settings; `clear` forgets them)",

@@ -695,7 +695,7 @@ test("zen_load_tab loads a lazy tab and names the restored page", async () => {
   await started;
 }, 30_000);
 
-test("browser_cookies and browser_storage send the agreed frames and render them", async () => {
+test("browser_cookies, browser_storage and browser_downloads send the agreed frames and render them", async () => {
   rmSync(join(profileDir, "hirozen-status.json"), { force: true });
   const callSpy = spyOn(ZenLink.prototype, "call");
   try {
@@ -728,6 +728,21 @@ test("browser_cookies and browser_storage send the agreed frames and render them
         entries: [
           { key: "token", value: "<9 chars>" },
           { key: "theme", value: "dark" },
+        ],
+        truncated: false,
+      }),
+    );
+    loader.on("network.downloads", frame =>
+      loader.reply(frame, {
+        downloads: [
+          {
+            source: "https://example.com/file.zip",
+            target: "C:\\Users\\x\\Downloads\\file.zip",
+            state: "succeeded",
+            bytes: 12_345_678,
+            totalBytes: 12_345_678,
+            startedAt: 1_800_000_000_000,
+          },
         ],
         truncated: false,
       }),
@@ -783,6 +798,20 @@ test("browser_cookies and browser_storage send the agreed frames and render them
     expect(storageSchema.safeParse({ tabKey: TAB_KEY, kind: "local", reveal: true }).success).toBe(true);
     expect(storageSchema.safeParse({ tabKey: TAB_KEY, kind: "local", reveal: "yes" }).success).toBe(false);
 
+    // 4. Downloads take no tab and no parameters, and are a plain read.
+    const downloadsTool = host.tools.get("browser_downloads");
+    if (!downloadsTool) throw new Error("browser_downloads is not registered");
+    expect(downloadsTool.approval).toBe("read");
+    expect(toolSchema(downloadsTool).safeParse({}).success).toBe(true);
+    const downloadsCall = callTool(host, "browser_downloads");
+    const downloadsRequest = await loader.nextRequest();
+    expect(downloadsRequest.method).toBe("network.downloads");
+    expect(downloadsRequest.params).toEqual({});
+    const downloadsText = textOf(await downloadsCall);
+    expect(downloadsText).toContain("succeeded");
+    expect(downloadsText).toContain("https://example.com/file.zip");
+    expect(downloadsText).toContain("C:\\Users\\x\\Downloads\\file.zip");
+    expect(downloadsText).toContain("2027-01-15T08:00:00.000Z");
 
     await shutdown(host);
     await started;
