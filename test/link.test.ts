@@ -193,6 +193,27 @@ test("correct loader proof completes the handshake", async () => {
   expect((error as HirozenError).code).toBe("E_UNKNOWN_METHOD");
   expect((error as HirozenError).message).toBe("zen.nonexistent is not exposed");
 
+  // An error frame may carry the URL the refusal is about (E_GRANT_STALE: the tab's live URL), which
+  // the extension uses to correct its tab cache; an error without one leaves `url` unset.
+  const stale = link.call("browser.act", { tabKey: "t" });
+  const staleRequest = await socket.next();
+  socket.send({
+    id: staleRequest.id,
+    error: {
+      code: "E_GRANT_STALE",
+      message: "the tab left the granted site; retry to be asked",
+      url: "https://elsewhere.example/page",
+    },
+  });
+  const staleError = await stale.then(
+    () => null,
+    (reason: unknown) => reason,
+  );
+  expect(staleError).toBeInstanceOf(HirozenError);
+  expect((staleError as HirozenError).code).toBe("E_GRANT_STALE");
+  expect((staleError as HirozenError).url).toBe("https://elsewhere.example/page");
+  expect((error as HirozenError).url).toBeUndefined();
+
   // Event frames are routed to onEvent as they arrive.
   socket.send({ type: "event", name: "consent.granted", data: { granted: ["read", "act"] } });
   await waitFor(() => events.length === 1);

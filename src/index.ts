@@ -21,6 +21,7 @@ import type { AgentToolResult, ExtensionAPI, ExtensionContext, ToolDefinition } 
 import { attachNow, listZenProcesses, normalizePath, profileLocked } from "./attach";
 import { type HirozenConfig, type ResolveConfigResult, clearConfig, resolveConfig, saveConfig } from "./config";
 import { type Candidate, discoverZen, normalizeManualPath, readCompatibility } from "./discover";
+import { GRANT_MINUTES_MAX, GRANT_MINUTES_MIN, GrantStore, originOf, parseGrantMinutes } from "./grant";
 import { type VerifyResult, install, sha256File, verify } from "./install";
 import {
   HirozenError,
@@ -70,6 +71,8 @@ const CODE_TEXT: Record<string, string> = {
   E_DEADLINE:
     "omp gave up before Zen answered, so nothing was done; retry when the person at Zen is ready (this is not a page failure)",
   E_DENIED: "nothing was done; ask the person at Zen to click Allow, then retry",
+  E_GRANT_STALE:
+    "the grant did not cover this call: the tab had left the site it was granted for, so nothing was done; the retry asks you (navigate and everything outside the act actions always ask)",
   E_INTERNAL: "the Zen loader hit an unexpected internal error",
   E_LAYOUT_REFUSED:
     "Zen refused that layout change; splits never include the selected tab or a pinned/essential/hidden tab, and the space must exist",
@@ -245,6 +248,11 @@ const knownTabs = new Map<string, { title: string; url: string }>();
 /** Per-tabKey elements of the last browser_snapshot, so a prompt can name the ref it acts on. */
 const snapshotRefs = new Map<string, Map<string, { role: string; name: string }>>();
 /**
+ * The /hirozen-grant grants: they are what lets a browser_act on the granted tab or site run without
+ * an omp prompt. Process-local, and dropped with the link (teardown, Zen Stop).
+ */
+const grants = new GrantStore();
+/**
  * Set by Zen's Stop button (close 4010); only /hirozen-connect, /hirozen-attach and a /hirozen-setup
  * that changes or clears the pair clear it.
  */
@@ -390,6 +398,8 @@ function releaseLink(): void {
   consentPending = null;
   knownTabs.clear();
   snapshotRefs.clear();
+  // A grant is anchored to a tab's last known URL, which dies with the cache: it goes too.
+  grants.clear();
   clearConsentNotice();
 }
 
@@ -843,6 +853,9 @@ async function runBrowserAct(
 ): Promise<AgentToolResult<unknown>> {
   const access = await requireLink(pi, ctx);
   if ("failure" in access) return fail(access.failure);
+  // A covering grant lets this act run without an omp prompt; naming its origin on the wire lets the
+  // loader check the tab's live URL, so a stale tab cache here cannot act on a site nobody granted.
+  const grant = grants.coveringAct(params.tabKey, knownTabs.get(params.tabKey)?.url, params.action);
   try {
     const result = await access.link.call<ZenActResult>(
       "browser.act",
@@ -854,6 +867,7 @@ async function runBrowserAct(
         key: params.key,
         dy: params.dy,
         url: params.url,
+        ...(grant ? { grantOrigin: grant.origin } : {}),
       },
       { timeoutMs: callBudget("act"), signal },
     );
@@ -870,6 +884,12 @@ async function runBrowserAct(
       },
     };
   } catch (error) {
+    // The loader refused because the tab is not on the granted site any more: that URL is where the
+    // tab is now, so the next call is prompted (with the grant no longer covering it) instead of
+    // looping through the same stale cache entry.
+    if (error instanceof HirozenError && error.code === "E_GRANT_STALE" && typeof error.url === "string") {
+      rememberTab(params.tabKey, { url: error.url });
+    }
     return fail(describeError(error));
   }
 }
@@ -1347,8 +1367,10 @@ async function runZenGlance(
 
 /** The per-action approval omp enforces before an act-tier tool runs. */
 type ExecApproval = { tier: "exec"; policy: "prompt"; reason: string };
+/** A granted browser_act: omp allows it outright in every mode (a user deny rule still wins). */
+type GrantedApproval = { tier: "write"; policy: "allow"; reason: string };
 /** What a tool's `approval` may answer: a bare tier (a plain read), or a tier with its own policy. */
-type ApprovalDecision = "read" | ExecApproval;
+type ApprovalDecision = "read" | ExecApproval | GrantedApproval;
 
 /** The details half of the prompt, as omp reads it (`AgentTool.formatApprovalDetails`). */
 type ApprovalDetails = (args: unknown) => string[];
@@ -1363,6 +1385,30 @@ function clipForPrompt(text: string): string {
 /** Every act-tier tool prompts on every call, even in omp's default yolo mode (S3). */
 function execApproval(reason: string): () => ExecApproval {
   return () => ({ tier: "exec", policy: "prompt", reason });
+}
+
+/**
+ * browser_act's approval: while a /hirozen-grant covers this tab and this action, omp allows the call
+ * outright (write tier, allow policy — honoured in every approval mode, though a user deny rule still
+ * wins) instead of prompting. Everything else prompts, navigate always: it can leave the site the
+ * grant was given for.
+ */
+function actApproval(args: unknown): ApprovalDecision {
+  const params = approvalArgs<ActParams>(args);
+  const grant = grants.coveringAct(params.tabKey, knownTabs.get(params.tabKey)?.url, params.action);
+  if (!grant) {
+    return {
+      tier: "exec",
+      policy: "prompt",
+      reason: "browser_act changes a page in Zen (click, type, press, scroll, hover or navigate).",
+    };
+  }
+  const minutes = Math.max(1, Math.ceil((grant.until - Date.now()) / 60_000));
+  return {
+    tier: "write",
+    policy: "allow",
+    reason: `granted by /hirozen-grant: ${grant.origin} for ${minutes} more min`,
+  };
 }
 
 /** browser_cookies: a read, unless the call asks for the cookie values themselves. */
@@ -1684,10 +1730,103 @@ async function runStatusCommand(ctx: ExtensionContext): Promise<void> {
     `config: ${resolved.ok ? `${zenDir} | ${profileDir} (${where})` : resolved.problem}`,
     `loader: ${installed ? `${installed.ok ? "ok" : "NOT ok"} (${installed.text})` : "not checked (Hirozen is not set up)"}`,
     `session: ${session}`,
+    `grants: ${renderGrants()}`,
     `status file: ${profileDir === "" ? unset : renderStatusFile(profileDir)}`,
     `devtools prefs: ${profileDir === "" ? unset : renderDevtoolsPrefs(profileDir)}`,
   ];
   ctx.ui.notify(lines.join("\n"), stopKind !== null || (installed !== null && !installed.ok) ? "warning" : "info");
+}
+
+/** The live grants for /hirozen-status: `<origin> (<tab|every tab>) until <time>`, or "none". */
+function renderGrants(): string {
+  const live = grants.list();
+  if (live.length === 0) return "none";
+  return live
+    .map(grant => {
+      const what = grant.kind === "tab" ? `tab ${grant.key}` : "every tab";
+      return `${grant.origin} (${what}) until ${new Date(grant.until).toLocaleTimeString()}`;
+    })
+    .join("; ");
+}
+
+/** What a `/hirozen-grant` target means: an http(s) origin, or a tab the plugin has seen. */
+type GrantTarget = { kind: "tab" | "origin"; key: string; origin: string; what: string };
+
+/**
+ * Resolve one `/hirozen-grant` target, or say why it cannot be granted. A target that parses as an
+ * http(s) URL is the site itself; anything else has to be a tabKey from zen_tabs, and the grant is then
+ * anchored to the origin that tab is on now (so a tab that navigates away stops being covered).
+ */
+function resolveGrantTarget(target: string): GrantTarget | { problem: string } {
+  const origin = originOf(target);
+  if (origin !== null) return { kind: "origin", key: origin, origin, what: `every tab on ${origin}` };
+  const known = knownTabs.get(target);
+  if (known === undefined) {
+    return {
+      problem: `no such tab ${target}; list the tabs with zen_tabs, or give an http(s) origin like https://example.com`,
+    };
+  }
+  const tabOrigin = originOf(known.url);
+  if (tabOrigin === null) {
+    const where = known.url === "" ? "a page with no URL" : known.url;
+    return { problem: `tab ${target} is on ${where}, which no grant can cover (an http(s) page is needed)` };
+  }
+  return { kind: "tab", key: target, origin: tabOrigin, what: `tab ${describeTab(target)}` };
+}
+
+/**
+ * `/hirozen-grant <tabKey|origin> <minutes>` and `/hirozen-grant clear` (T12). Slash command only: the
+ * agent can never grant itself anything.
+ *
+ * A grant is the one thing that makes a browser_act run without an omp approval prompt, and only for
+ * the act actions: navigate (it can leave the site), uploads, page dialogs, the zen_* tools, the
+ * network tools and a reveal always ask. The in-Zen permissions are unchanged by a grant, and the
+ * grant is anchored to the origin the target was on when it was given.
+ */
+async function runGrantCommand(ctx: ExtensionContext, args: string): Promise<void> {
+  if (!(ctx.hasUI && ctx.agent?.kind === "main")) {
+    ctx.ui.notify(`Hirozen: ${NO_UI_TEXT}`, "error");
+    return;
+  }
+  const [target = "", minutesText = ""] = args.trim().split(/\s+/);
+  if (target === "clear") {
+    const dropped = grants.clear();
+    ctx.ui.notify(
+      dropped === 0 ? "Hirozen: no grants to clear." : `Hirozen: cleared ${dropped} grant(s); browser_act asks again.`,
+      "info",
+    );
+    return;
+  }
+  if (target === "") {
+    ctx.ui.notify(
+      `Hirozen: give a tabKey from zen_tabs or an http(s) origin, then the minutes (${GRANT_MINUTES_MIN} to ${GRANT_MINUTES_MAX}).`,
+      "error",
+    );
+    return;
+  }
+  const minutes = parseGrantMinutes(minutesText);
+  if (minutes === null) {
+    ctx.ui.notify(`Hirozen: the minutes must be a whole number from ${GRANT_MINUTES_MIN} to ${GRANT_MINUTES_MAX}.`, "error");
+    return;
+  }
+  const resolved = resolveGrantTarget(target);
+  if ("problem" in resolved) {
+    ctx.ui.notify(`Hirozen: ${resolved.problem}.`, "error");
+    return;
+  }
+  const confirmed = await ctx.ui.confirm(
+    "Grant omp permission to act in Zen?",
+    `For the next ${minutes} minute(s), browser_act clicks, typing, key presses, scrolling and hovers in ${resolved.what} run without an omp approval prompt (the in-Zen Allow/Deny prompt is unchanged).\n\nNavigate, uploads, page dialogs, the zen_* tools, the network tools and a reveal always ask. Remove it early with /hirozen-grant clear.`,
+  );
+  if (!confirmed) {
+    ctx.ui.notify("Hirozen: no grant was added.", "info");
+    return;
+  }
+  const grant = grants.grant(resolved.kind, resolved.key, resolved.origin, minutes);
+  ctx.ui.notify(
+    `Hirozen: granted ${resolved.origin} for ${minutes} min (until ${new Date(grant.until).toLocaleTimeString()}); ${resolved.what} runs without an approval prompt. Navigate and everything else still ask.`,
+    "warning",
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2088,9 +2227,9 @@ export default function hirozen(pi: ExtensionAPI): void {
         name: "browser_act",
         label: "Act in tab",
         description:
-          'Act on one Zen tab by its tabKey: click, type, press, scroll, hover or navigate (navigate needs an http(s) url). Refs come from browser_snapshot. The loader\'s in-Zen Allow/Deny gate must have granted the act permission; every call needs your approval. Refused on privileged pages, in private windows and on tabs in a non-active space that is not the Hirozen Agent space (reads, snapshots and screenshots are allowed there; acts, uploads and dialogs are not).',
+          'Act on one Zen tab by its tabKey: click, type, press, scroll, hover or navigate (navigate needs an http(s) url). Refs come from browser_snapshot. The loader\'s in-Zen Allow/Deny gate must have granted the act permission; every call needs your approval, unless a /hirozen-grant you gave covers that tab or site (navigate is never covered). Refused on privileged pages, in private windows and on tabs in a non-active space that is not the Hirozen Agent space (reads, snapshots and screenshots are allowed there; acts, uploads and dialogs are not).',
         parameters: parameters.act,
-        approval: execApproval("browser_act changes a page in Zen (click, type, press, scroll, hover or navigate)."),
+        approval: actApproval,
         loadMode: "essential",
         execute: (
           _toolCallId: string,
@@ -2378,6 +2517,11 @@ export default function hirozen(pi: ExtensionAPI): void {
     approval: "read",
     loadMode: "essential",
     execute: (_toolCallId, params, signal, _onUpdate, ctx) => runBrowserNetworkStop(pi, ctx, params.tabKey, signal),
+  });
+
+  pi.registerCommand("hirozen-grant", {
+    description: `Let browser_act click/type/press/scroll/hover in one tab or site for ${GRANT_MINUTES_MIN}-${GRANT_MINUTES_MAX} minutes without an approval prompt (\`clear\` removes every grant)`,
+    handler: (args, ctx) => runGrantCommand(ctx, args),
   });
 
   pi.registerCommand("hirozen-setup", {

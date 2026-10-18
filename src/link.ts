@@ -65,12 +65,16 @@ export class HirozenError extends Error {
   readonly code: string;
   /** Set for E_IN_USE: the pid already holding the link (another omp, or Zen's pid). */
   readonly pid?: number;
+  /** Set for E_GRANT_STALE: the tab's live URL, which the extension remembers instead of its own
+   *  stale cache entry. */
+  readonly url?: string;
 
-  constructor(code: string, message: string, options: { pid?: number } = {}) {
+  constructor(code: string, message: string, options: { pid?: number; url?: string } = {}) {
     super(message);
     this.name = "HirozenError";
     this.code = code;
     if (options.pid !== undefined) this.pid = options.pid;
+    if (options.url !== undefined) this.url = options.url;
   }
 }
 
@@ -492,10 +496,14 @@ export class ZenLink {
       if (error && typeof error === "object") {
         const code = "code" in error ? error.code : undefined;
         const message = "message" in error ? error.message : undefined;
+        // E_GRANT_STALE carries the tab's live URL: the extension's tab cache was stale, and this is
+        // the URL it remembers instead. Absent on every other error.
+        const url = "url" in error && typeof error.url === "string" ? error.url : undefined;
         pending.reject(
           new HirozenError(
             typeof code === "string" ? code : "E_UNKNOWN",
             typeof message === "string" ? message : JSON.stringify(error),
+            { url },
           ),
         );
       } else if (typeof error === "string") {

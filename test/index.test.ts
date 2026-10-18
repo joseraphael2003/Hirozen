@@ -695,6 +695,138 @@ test("zen_load_tab loads a lazy tab and names the restored page", async () => {
   await started;
 }, 30_000);
 
+test("/hirozen-grant covers the granted tab until the tab leaves the site", async () => {
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+  const loader = new FakeLoader(profileDir).on("zen.inventory", frame => loader.reply(frame, INVENTORY));
+  // The act reports where the page landed, which is what the plugin's tab cache learns from.
+  let landed = "https://example.com/";
+  loader.on("browser.act", frame => loader.reply(frame, { ok: true, url: landed, title: "Example Domain" }));
+  const started = loader.start().catch(() => undefined);
+
+  const act = host.tools.get("browser_act");
+  if (!act) throw new Error("browser_act is not registered");
+  const click = { tabKey: TAB_KEY, action: "click", ref: "ab12.e1" };
+
+  // zen_tabs is the tab directory a grant is anchored to (tabKey -> its URL).
+  expect((await callTool(host, "zen_tabs")).isError).not.toBe(true);
+  expect((await loader.nextRequest()).method).toBe("zen.inventory"); // the frame that call leaves queued
+  const beforeGrant = typeof act.approval === "function" ? act.approval(click) : act.approval;
+  expect(beforeGrant).toMatchObject({ tier: "exec", policy: "prompt" });
+
+  // The command confirms first, then says what it granted for how long.
+  const before = host.notifications.length;
+  await runCommand(host, "hirozen-grant", `${TAB_KEY} 5`);
+  expect(host.notifications.length).toBeGreaterThan(before);
+  const grantNotice = host.notifications.at(-1) ?? "";
+  expect(grantNotice).toContain("https://example.com");
+  expect(grantNotice).toContain("5 min");
+
+  // While the grant covers the call, omp allows the act outright instead of prompting.
+  const granted = typeof act.approval === "function" ? act.approval(click) : act.approval;
+  expect(granted).toMatchObject({ tier: "write", policy: "allow" });
+  const grantedReason = granted && typeof granted === "object" && "reason" in granted ? granted.reason : undefined;
+  expect(typeof grantedReason).toBe("string");
+  expect(String(grantedReason)).toContain("https://example.com");
+  // Never covered by any grant: navigate (it can leave the site), and an act in another tab.
+  const navigate =
+    typeof act.approval === "function"
+      ? act.approval({ tabKey: TAB_KEY, action: "navigate", url: "https://example.com/next" })
+      : act.approval;
+  expect(navigate).toMatchObject({ tier: "exec", policy: "prompt" });
+  const otherTab =
+    typeof act.approval === "function"
+      ? act.approval({ tabKey: "1759000000000-cccc", action: "click", ref: "ab12.e2" })
+      : act.approval;
+  expect(otherTab).toMatchObject({ tier: "exec", policy: "prompt" });
+
+  // The covered call also tells the loader which site the grant was for, so a stale cache cannot act.
+  const call = callTool(host, "browser_act", click);
+  const request = await loader.nextRequest();
+  expect(request.method).toBe("browser.act");
+  expect(request.params).toMatchObject({ tabKey: TAB_KEY, action: "click", grantOrigin: "https://example.com" });
+  expect((await call).isError).not.toBe(true);
+
+  // /hirozen-status lists the live grants.
+  await runCommand(host, "hirozen-status");
+  expect(host.notifications.at(-1) ?? "").toContain("grants: https://example.com");
+
+  // A click that navigated the tab off the granted site: the reply is where the tab is now, so the
+  // call after it prompts again (the grant is anchored to the origin it was given for).
+  landed = "https://elsewhere.example/page";
+  const moved = callTool(host, "browser_act", click);
+  const movedRequest = await loader.nextRequest();
+  expect(movedRequest.params).toMatchObject({ grantOrigin: "https://example.com" }); // the old cache
+  expect((await moved).isError).not.toBe(true);
+  const afterMove = typeof act.approval === "function" ? act.approval(click) : act.approval;
+  expect(afterMove).toMatchObject({ tier: "exec", policy: "prompt" });
+  const next = callTool(host, "browser_act", click);
+  const nextRequest = await loader.nextRequest();
+  expect(nextRequest.params).not.toHaveProperty("grantOrigin");
+  expect((await next).isError).not.toBe(true);
+
+  // Granting again covers the new site, a cancelled confirm grants nothing, and clear restores prompts.
+  await runCommand(host, "hirozen-grant", `${TAB_KEY} 5`);
+  expect(typeof act.approval === "function" ? act.approval(click) : act.approval).toMatchObject({ tier: "write", policy: "allow" });
+  const cancelled = spyOn(host.ctx.ui, "confirm").mockResolvedValue(false);
+  await runCommand(host, "hirozen-grant", `${TAB_KEY} 5`);
+  cancelled.mockRestore();
+  expect(host.notifications.at(-1) ?? "").toContain("no grant");
+  // The earlier grant still stands: only clear removes it.
+  expect(typeof act.approval === "function" ? act.approval(click) : act.approval).toMatchObject({ tier: "write", policy: "allow" });
+  await runCommand(host, "hirozen-grant", "clear");
+  expect(host.notifications.at(-1) ?? "").toContain("cleared");
+  expect(typeof act.approval === "function" ? act.approval(click) : act.approval).toMatchObject({ tier: "exec", policy: "prompt" });
+
+  // Minutes outside 1 to 60, and a target that is neither a known tab nor an origin, are refused.
+  await runCommand(host, "hirozen-grant", `${TAB_KEY} 90`);
+  expect(host.notifications.at(-1) ?? "").toContain("1 to 60");
+  await runCommand(host, "hirozen-grant", "1759000000000-zzzz 5");
+  expect(host.notifications.at(-1) ?? "").toContain("no such tab");
+
+  await shutdown(host);
+  await started;
+}, 30_000);
+
+test("E_GRANT_STALE corrects the tab cache, so the retry prompts instead of looping", async () => {
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+  const loader = new FakeLoader(profileDir).on("zen.inventory", frame => loader.reply(frame, INVENTORY));
+  loader.on("browser.act", frame =>
+    loader.send({
+      id: frame.id,
+      error: { code: "E_GRANT_STALE", message: "the tab left the granted site; retry to be asked", url: "https://elsewhere.example/page" },
+    }),
+  );
+  const started = loader.start().catch(() => undefined);
+
+  const act = host.tools.get("browser_act");
+  if (!act) throw new Error("browser_act is not registered");
+  const click = { tabKey: TAB_KEY, action: "click", ref: "ab12.e1" };
+  await callTool(host, "zen_tabs");
+  expect((await loader.nextRequest()).method).toBe("zen.inventory"); // the frame that call leaves queued
+  await runCommand(host, "hirozen-grant", `${TAB_KEY} 5`);
+  expect(typeof act.approval === "function" ? act.approval(click) : act.approval).toMatchObject({ tier: "write", policy: "allow" });
+
+  // The loader's cache check refuses the call: the tab is not on the granted site any more.
+  const refused = await callTool(host, "browser_act", click);
+  expect((await loader.nextRequest()).params).toMatchObject({ grantOrigin: "https://example.com" });
+  const text = textOf(refused);
+  expect(refused.isError).toBe(true);
+  expect(text.startsWith("E_GRANT_STALE")).toBe(true);
+  expect(text).toContain("the tab left the granted site"); // the loader's own message is kept
+  expect(text).toContain("retry asks you"); // the plugin's gloss
+
+  // The URL the error carried became the tab's known URL, so the retry is prompted, not granted.
+  expect(typeof act.approval === "function" ? act.approval(click) : act.approval).toMatchObject({ tier: "exec", policy: "prompt" });
+  const retry = callTool(host, "browser_act", click);
+  const retryRequest = await loader.nextRequest();
+  expect(retryRequest.params).not.toHaveProperty("grantOrigin");
+  expect((await retry).isError).toBe(true);
+
+  await runCommand(host, "hirozen-grant", "clear");
+  await shutdown(host);
+  await started;
+}, 30_000);
+
 test("browser_cookies, browser_storage and browser_downloads send the agreed frames and render them", async () => {
   rmSync(join(profileDir, "hirozen-status.json"), { force: true });
   const callSpy = spyOn(ZenLink.prototype, "call");
@@ -813,6 +945,7 @@ test("browser_cookies, browser_storage and browser_downloads send the agreed fra
     expect(downloadsText).toContain("C:\\Users\\x\\Downloads\\file.zip");
     expect(downloadsText).toContain("2027-01-15T08:00:00.000Z");
 
+    await runCommand(host, "hirozen-grant", "clear");
     await shutdown(host);
     await started;
   } finally {
@@ -899,6 +1032,7 @@ test("the network recording tools start, read and stop a tab's request buffer", 
   expect(stopText).toContain("Stopped watching tab");
   expect(stopText).toContain("2 buffered request(s) were dropped");
 
+  await runCommand(host, "hirozen-grant", "clear");
   await shutdown(host);
   await started;
 }, 30_000);
