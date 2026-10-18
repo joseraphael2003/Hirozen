@@ -597,6 +597,65 @@ test("hover is an act action, and the prompt says what it hovers over", () => {
   expect(decision).toMatchObject({ tier: "exec", policy: "prompt" });
 });
 
+test('browser_read mode "article" sends the mode and renders the byline', async () => {
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+  const tool = host.tools.get("browser_read");
+  if (!tool) throw new Error("browser_read is not registered");
+  const schema = toolSchema(tool);
+  expect(schema.safeParse({ tabKey: TAB_KEY }).success).toBe(true);
+  expect(schema.safeParse({ tabKey: TAB_KEY, mode: "article" }).success).toBe(true);
+  expect(schema.safeParse({ tabKey: TAB_KEY, mode: "reader" }).success).toBe(false);
+
+  const loader = new FakeLoader(profileDir).on("browser.read", frame => {
+    const params = frame.params;
+    if (params && typeof params === "object" && "mode" in params && params.mode === "article") {
+      loader.reply(frame, {
+        tabKey: TAB_KEY,
+        url: "https://example.com/story",
+        title: "A story",
+        byline: "By A. Writer",
+        text: "Once upon a time.",
+        truncated: false,
+      });
+      return;
+    }
+    loader.reply(frame, {
+      tabKey: TAB_KEY,
+      url: "https://example.com/",
+      title: "Example Domain",
+      text: "Visible text",
+      truncated: false,
+    });
+  });
+  const started = loader.start().catch(() => undefined); // reported by the assertions, not as an unhandled rejection
+
+  const articleCall = callTool(host, "browser_read", { tabKey: TAB_KEY, mode: "article" });
+  const articleRequest = await loader.nextRequest();
+  expect(articleRequest.method).toBe("browser.read");
+  expect(articleRequest.params).toMatchObject({ tabKey: TAB_KEY, mode: "article" });
+  const article = await articleCall;
+  expect(article.isError).not.toBe(true);
+  const articleText = textOf(article);
+  expect(articleText).toContain("# A story");
+  expect(articleText).toContain("https://example.com/story");
+  expect(articleText).toContain("By A. Writer");
+  expect(articleText).toContain("Once upon a time.");
+  expect(article.details).toMatchObject({ mode: "article", byline: "By A. Writer", chars: 17 });
+
+  // A plain read is the loader's default: it names no mode, and renders the visible text alone.
+  const plainCall = callTool(host, "browser_read", { tabKey: TAB_KEY });
+  const plainRequest = await loader.nextRequest();
+  expect(plainRequest.params).toEqual({ tabKey: TAB_KEY });
+  const plain = await plainCall;
+  const plainText = textOf(plain);
+  expect(plainText).toContain("Visible text");
+  expect(plainText).not.toContain("By A. Writer");
+  expect(plain.details).toMatchObject({ mode: "text" });
+
+  await shutdown(host);
+  await started;
+}, 30_000);
+
 test("the reinstall offer names /hirozen-attach only when that Zen is running", async () => {
   // A Zen update wipes the loader while zen.exe is still there: the offer fires on session_start. The
   // attach hint needs a live process, and this install folder (a temp dir) has none, so the notice

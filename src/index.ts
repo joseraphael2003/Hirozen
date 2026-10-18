@@ -105,7 +105,8 @@ type ZenTab = {
 type ZenWindow = { activeSpace: string | null; spaces: ZenSpace[]; tabs: ZenTab[] };
 /** `zen.spaces` answers with the same windows, minus the tabs. */
 type ZenSpaceWindow = { activeSpace: string | null; spaces: ZenSpace[] };
-type ZenRead = { tabKey: string; url: string; title: string; text: string; truncated: boolean };
+/** `browser.read` with `mode: "article"` adds the reader-mode byline ("" when the reader found none). */
+type ZenRead = { tabKey: string; url: string; title: string; text: string; truncated: boolean; byline?: string };
 type ZenScreenshot = { tabKey: string; mimeType: string; data: string };
 /** One element of a `browser.snapshot`; `ref` is the handle `browser_act` takes. */
 type ZenElement = {
@@ -141,6 +142,8 @@ type ZenGlance = { tabKey: string };
  * before it runs, so these are the schemas' output shapes, named here for the approval plumbing.
  */
 type TabParams = { tabKey: string };
+/** browser_read: `mode` selects the reader-mode article instead of the visible text. */
+type ReadParams = { tabKey: string; mode?: string };
 type UrlParams = { url: string };
 type ActParams = {
   tabKey: string;
@@ -661,25 +664,42 @@ async function runZenSpaces(pi: ExtensionAPI, ctx: ExtensionContext, signal?: Ab
   }
 }
 
-/** `# <title>\n<url>\n\n<text>`; the header is capped so one page cannot flood the terminal. */
+/**
+ * `# <title>\n<url>` and, when the reader found one, its byline, then the text; the header is capped
+ * so one page cannot flood the terminal. A text read has no byline and renders as it always did.
+ */
 function renderRead(page: ZenRead): string {
-  return `${pageHeader(page.url, page.title)}\n\n${page.text}`;
+  return `${pageHeader(page.url, page.title)}\n${page.byline ?? ""}\n${page.text}`;
 }
 
 async function runBrowserRead(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
-  tabKey: string,
+  params: ReadParams,
   signal?: AbortSignal,
 ): Promise<AgentToolResult<unknown>> {
   const access = await requireLink(pi, ctx);
   if ("failure" in access) return fail(access.failure);
+  // mode "text" is the loader's default, so only an article read names a mode on the wire.
+  const article = params.mode === "article";
   try {
-    const page = await access.link.call<ZenRead>("browser.read", { tabKey }, { timeoutMs: callBudget("read"), signal });
-    rememberTab(tabKey, page);
+    const page = await access.link.call<ZenRead>(
+      "browser.read",
+      article ? { tabKey: params.tabKey, mode: "article" } : { tabKey: params.tabKey },
+      { timeoutMs: callBudget("read"), signal },
+    );
+    rememberTab(params.tabKey, page);
     return {
       content: [{ type: "text", text: renderRead(page) }],
-      details: { tabKey: page.tabKey, url: page.url, title: page.title, truncated: page.truncated, chars: page.text.length },
+      details: {
+        tabKey: page.tabKey,
+        url: page.url,
+        title: page.title,
+        mode: article ? "article" : "text",
+        truncated: page.truncated,
+        chars: page.text.length,
+        ...(article ? { byline: typeof page.byline === "string" ? page.byline : "" } : {}),
+      },
     };
   } catch (error) {
     return fail(describeError(error));
@@ -1478,6 +1498,13 @@ function toolParameters(builder: ExtensionAPI["zod"]) {
   return {
     none: builder.object({}),
     tabKey: builder.object({ tabKey: tabKey() }),
+    read: builder.object({
+      tabKey: tabKey(),
+      mode: builder
+        .enum(["text", "article"])
+        .optional()
+        .describe('"article" reads the page in reader mode (title, byline, article text) instead of the visible text'),
+    }),
     act: builder.object({
       tabKey: tabKey(),
       action: builder
@@ -1623,11 +1650,11 @@ export default function hirozen(pi: ExtensionAPI): void {
     name: "browser_read",
     label: "Read tab",
     description:
-      "Read the visible text of one Zen tab by its tabKey from zen_tabs (read-only; the tab is never loaded or activated).",
-    parameters: parameters.tabKey,
+      'Read the visible text of one Zen tab by its tabKey from zen_tabs, or the reader-mode article with mode:"article" (read-only; the tab is never loaded, activated or navigated).',
+    parameters: parameters.read,
     approval: "read",
     loadMode: "essential",
-    execute: (_toolCallId, params, signal, _onUpdate, ctx) => runBrowserRead(pi, ctx, params.tabKey, signal),
+    execute: (_toolCallId, params, signal, _onUpdate, ctx) => runBrowserRead(pi, ctx, params, signal),
   });
 
   pi.registerTool({
