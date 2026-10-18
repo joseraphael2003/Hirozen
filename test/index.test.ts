@@ -356,7 +356,7 @@ test("a superseded connect cannot release the live link (orphan guard)", async (
   expect(loaderB.requests.length).toBe(2);
 }, 30_000);
 
-test("the act budget tracks the gate scope, the terminal hint mirrors consent, and the details name the ref", async () => {
+test("the act budget tracks the granted permissions, the terminal hint mirrors consent, and the details name the ref", async () => {
   // The orphan-guard test above left its live link connected; release it, and drop the status record
   // it wrote, before a fresh loader offers a handoff.
   await shutdown(host);
@@ -382,14 +382,14 @@ test("the act budget tracks the gate scope, the terminal hint mirrors consent, a
     expect(Math.abs(frameDeadline(firstRequest) - (Date.now() + 140_000))).toBeLessThan(5_000);
 
     // 2. The gate prompt reaches the terminal while the call is still pending.
-    loader.send({ type: "event", name: "consent.pending", data: { scope: "act" } });
+    loader.send({ type: "event", name: "consent.pending", data: { asked: ["act"] } });
     await waitFor(() => host.notifications.some(message => message.includes("click Allow in Zen")));
     const hint = host.notifications.find(message => message.includes("click Allow in Zen")) ?? "";
     expect(hint).toContain("read and act on pages");
 
     // 3. Allow, then answer the pending call. The reply frame is queued behind the event frame, so
-    //    awaiting the call proves the granted scope was applied before the next call is made.
-    loader.send({ type: "event", name: "consent.granted", data: { scope: "act" } });
+    //    awaiting the call proves the granted permissions were applied before the next call is made.
+    loader.send({ type: "event", name: "consent.granted", data: { granted: ["act"] } });
     loader.reply(firstRequest, { ok: true, url: "https://example.com/", title: "Example Domain" });
     expect(textOf(await firstCall)).toContain("https://example.com/");
 

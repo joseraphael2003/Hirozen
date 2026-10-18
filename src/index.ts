@@ -2,7 +2,7 @@
 //
 // V2 is loader-first: reads, screenshots, snapshots, page input, uploads, page dialogs and Zen layout
 // all run through the loader's own JSWindowActor and gZen* code, so nothing here starts WebDriver
-// BiDi. Consent comes from the loader's in-Zen Allow/Deny gate; this plugin mirrors the scope it
+// BiDi. Consent comes from the loader's in-Zen Allow/Deny gate; this plugin mirrors the permissions it
 // reports into each call's budget and into a terminal hint ("click Allow in Zen"), which is the only
 // sign in omp while a person still has to answer in Zen.
 //
@@ -159,8 +159,16 @@ type SplitParams = { tabKeys: string[]; layout: string };
 /** A tool-visible failure: the contract's code plus text the model can read. */
 type Failure = { code: string; text: string; details?: Record<string, unknown> };
 
-/** The gate scope the loader reported for this link, and what a pending notice is asking for. */
-type GateScope = "none" | "read" | "act";
+/** The gate permissions the loader grants independently; `act` implies `read` (loader: #scopeCovers). */
+type Permission = "read" | "act" | "network";
+/** The order a notice or a budget check names them in (weakest first). */
+const PERMISSIONS: Permission[] = ["read", "act", "network"];
+/** What each permission lets the loader do, for the terminal hint. */
+const PERMISSION_VERBS: Record<Permission, string> = {
+  read: "read pages",
+  act: "read and act on pages",
+  network: "read network data: cookies, downloads, storage, request headers",
+};
 
 // ---------------------------------------------------------------------------------------------
 // Link lifecycle (module state is per process, which is where the root session lives)
@@ -178,10 +186,11 @@ let connectPromise: Promise<ZenLink> | null = null;
 let connectGen = 0;
 /** Cancels the armed repeat of the gate notice while it is showing. */
 let consentRepeat: (() => void) | null = null;
-/** The scope the loader granted this link; the budget for a call depends on it. Reset with the link. */
-let consentScope: GateScope = "none";
+/** The permissions the loader granted this link; the budget for a call depends on them. Reset with
+ *  the link. */
+let consentGranted = new Set<Permission>();
 /** What the pending Allow/Deny notice asks for, or null when nothing waits on a person. */
-let consentPending: "read" | "act" | null = null;
+let consentPending: Permission[] | null = null;
 /** Per-tabKey title/URL the plugin last saw, so an approval prompt can name the tab it acts on. */
 const knownTabs = new Map<string, { title: string; url: string }>();
 /** Per-tabKey elements of the last browser_snapshot, so a prompt can name the ref it acts on. */
@@ -254,11 +263,8 @@ function clearConsentNotice(): void {
 /** The gate notice: the only thing in omp while a person still has to answer in Zen. */
 function notifyGateWait(ctx: ExtensionContext, repeated: boolean): void {
   const prefix = `Hirozen: ${repeated ? "still waiting — " : ""}`;
-  const scope = consentPending ?? "read";
-  ctx.ui.notify(
-    `${prefix}click Allow in Zen to let omp ${scope === "act" ? "read and act on pages" : "read pages"} (Deny refuses).`,
-    "warning",
-  );
+  const asked = consentPending ?? ["read"];
+  ctx.ui.notify(`${prefix}click Allow in Zen to let omp ${permissionVerbs(asked)} (Deny refuses).`, "warning");
 }
 
 /**
@@ -284,25 +290,35 @@ function announceGateWait(): void {
   armGateNotice(ctx);
 }
 
-/** The `scope` of a `consent.*` event, or null when the loader sent something this plugin cannot use. */
-function eventScope(data: unknown): "read" | "act" | null {
-  if (!data || typeof data !== "object" || !("scope" in data)) return null;
-  const scope = data.scope;
-  return scope === "read" || scope === "act" ? scope : null;
+/** `"read and act on pages"` for a set of permissions; `act` covers `read`, so they never both show. */
+function permissionVerbs(permissions: readonly Permission[]): string {
+  const has = (need: Permission) => permissions.includes(need);
+  return PERMISSIONS.filter(need => has(need) && !(need === "read" && has("act")))
+    .map(need => PERMISSION_VERBS[need])
+    .join(" and ");
 }
 
-/** Loader events: the consent gate, whose scope drives every call's budget. */
+/** The permissions a `consent.*` event carries under `key`, or null when the loader sent something
+ *  this plugin cannot use. An empty list is a usable answer (nothing granted / nothing asked). */
+function eventPermissions(data: unknown, key: "asked" | "granted"): Permission[] | null {
+  if (!data || typeof data !== "object" || !(key in data)) return null;
+  const value = (data as Record<string, unknown>)[key];
+  if (!Array.isArray(value)) return null;
+  return value.every(need => PERMISSIONS.includes(need as Permission)) ? (value as Permission[]) : null;
+}
+
+/** Loader events: the consent gate, whose granted set drives every call's budget. */
 function handleLoaderEvent(event: LoaderEvent): void {
   if (event.name === "consent.pending") {
-    // The loader upgrades a pending read prompt in place, so this also fires for an act upgrade.
-    consentPending = eventScope(event.data) ?? "read";
+    // A call joining the notice adds its own permission, so this also fires for an upgrade.
+    consentPending = eventPermissions(event.data, "asked") ?? ["read"];
     announceGateWait();
     return;
   }
   if (event.name === "consent.granted") {
-    const scope = eventScope(event.data);
-    if (scope === null) return;
-    consentScope = scope;
+    const granted = eventPermissions(event.data, "granted");
+    if (granted === null) return;
+    consentGranted = new Set(granted);
     consentPending = null;
     clearConsentNotice();
     return;
@@ -319,9 +335,9 @@ function releaseLink(): void {
   link = null;
   linkCtx = null;
   connectPromise = null;
-  // The gate belongs to the loader, which clears it with the link: a new link starts at "none" and
-  // must ask again. The caches describe what that link last saw, so they go with it.
-  consentScope = "none";
+  // The gate belongs to the loader, which clears it with the link: a new link starts with nothing
+  // granted and must ask again. The caches describe what that link last saw, so they go with it.
+  consentGranted = new Set();
   consentPending = null;
   knownTabs.clear();
   snapshotRefs.clear();
@@ -575,17 +591,16 @@ function pageHeader(url: string, title: string): string {
   return `# ${title}\n${shown}`;
 }
 
-/** How strong a granted scope is; a call waits for a person while its own requirement is above it. */
-const SCOPE_RANK: Record<GateScope, number> = { none: 0, read: 1, act: 2 };
-
 /**
  * The omp-side budget for one call: 15 s of base work plus 125 s while the Hirozen Allow/Deny notice
- * may still be waiting for an answer, which is whenever the granted scope is below what the call
- * needs. The loader receives the same instant as an absolute deadline and refuses to act once it
+ * may still be waiting for an answer, which is whenever the granted set does not cover what the call
+ * needs (mirroring the loader's `#scopeCovers`: a granted `act` covers `read`, nothing else covers
+ * anything). The loader receives the same instant as an absolute deadline and refuses to act once it
  * passed, so a late answer never turns into an action omp has already given up on.
  */
-function callBudget(needs: "read" | "act"): number {
-  return SCOPE_RANK[consentScope] < SCOPE_RANK[needs] ? BASE_BUDGET_MS + PERSON_WAIT_MS : BASE_BUDGET_MS;
+function callBudget(needs: Permission): number {
+  const covered = consentGranted.has(needs) || (needs === "read" && consentGranted.has("act"));
+  return covered ? BASE_BUDGET_MS : BASE_BUDGET_MS + PERSON_WAIT_MS;
 }
 
 /** Remember what a page call just reported, so a later approval prompt can name that tab. */
@@ -1203,11 +1218,13 @@ function readUserPrefs(profileDir: string): Map<string, string> | null {
 function renderStatusFile(profileDir: string): string {
   const status = readStatusFile(profileDir);
   if (!status) return `absent (${join(profileDir, "hirozen-status.json")})`;
+  const granted = status.consent ?? [];
+  const asking = status.consentPending ?? [];
   const parts = [
     `state=${status.state ?? "?"}`,
     `mode=${status.mode ?? "?"}`,
     `zenPid=${status.zenPid ?? "?"}`,
-    `consent=${status.consent ?? "?"}${status.consentPending ? ` (asking: ${status.consentPending})` : ""}`,
+    `consent=${granted.length === 0 ? "none" : granted.join(",")}${asking.length > 0 ? ` (asking: ${asking.join(",")})` : ""}`,
     `capabilities=${renderCapabilities(status.capabilities)}`,
     `updated=${status.updated ?? "?"}`,
   ];

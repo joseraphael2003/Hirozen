@@ -118,9 +118,10 @@ export type ZenStatus = {
   lastHandoff?: { pid?: number; cwd?: string; at?: string };
   /** What the running Zen exposes, by the same names as ReadyFrame.capabilities. */
   capabilities?: Record<string, boolean>;
-  /** The Hirozen gate's granted scope, and what a pending Allow/Deny notice is asking for. */
-  consent?: "none" | "read" | "act";
-  consentPending?: null | "read" | "act";
+  /** The permissions the gate has granted this link (e.g. `["read","act"]`), and what a pending
+   *  Allow/Deny notice is asking for (null when nothing waits on a person). */
+  consent?: string[];
+  consentPending?: string[] | null;
   /** The actor registration failure, if any. */
   actorError?: { code?: string; message?: string; at?: string };
   lastClose?: string;

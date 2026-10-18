@@ -194,9 +194,9 @@ test("correct loader proof completes the handshake", async () => {
   expect((error as HirozenError).message).toBe("zen.nonexistent is not exposed");
 
   // Event frames are routed to onEvent as they arrive.
-  socket.send({ type: "event", name: "consent.granted", data: { scope: "read" } });
+  socket.send({ type: "event", name: "consent.granted", data: { granted: ["read", "act"] } });
   await waitFor(() => events.length === 1);
-  expect(events[0]).toEqual({ name: "consent.granted", data: { scope: "read" } });
+  expect(events[0]).toEqual({ name: "consent.granted", data: { granted: ["read", "act"] } });
 
   expect(existsSync(join(dir, HANDOFF_FILE))).toBe(false); // consumed, never left behind
 });

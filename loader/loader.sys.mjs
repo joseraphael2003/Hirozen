@@ -8,9 +8,12 @@
 // BiDi is gone entirely - this module never starts a remote-control agent or opens a DevTools port,
 // and a read, a snapshot or a screenshot never shows a prompt: consent is the in-Zen notice below).
 //
-// V2 consent gate (§8.2): no method shows a Firefox prompt any more, so this loader owns an in-Zen
+// Consent gate (§8.2): no method shows a Firefox prompt any more, so this loader owns an in-Zen
 // Allow/Deny notice per link (state `#consent`, default Deny, persistent while connected) before any
-// gated method runs, and omp keeps its per-action approval on top.
+// gated method runs, and omp keeps its per-action approval on top. V3: consent is a *set* of
+// independent permissions {read, act, network} rather than one ladder - `act` still implies `read`,
+// `network` is independent - and a call joins a pending notice by adding its own permission to the
+// asked set, so one Allow settles every waiter.
 //
 // V3 capabilities: the Zen internals Hirozen calls are probed (most recent window) at init and at
 // ready into `capabilities` (status file + ready frame), and every call site guards per call with
@@ -101,6 +104,16 @@ const CAPABILITY_NAMES = [
   "Downloads",
   "Services.cookies",
 ];
+
+// The gate's permissions, weakest first. `act` implies `read` (a page you may act on is a page you
+// may read); `network` is independent of both, so an Allow for pages never covers a network call.
+const PERMISSIONS = ["read", "act", "network"];
+// What a notice says each permission lets Hirozen do.
+const PERMISSION_VERBS = {
+  read: "read pages",
+  act: "read and act on pages",
+  network: "read network data: cookies, downloads, storage, request headers",
+};
 // The only privileged pages a navigate may leave: an empty tab has no content to protect, and the
 // agent needs to reach the web from one (plan: navigate's exemption from E_PRIVILEGED_PAGE).
 const ABOUT_NAVIGABLE = ["about:blank", "about:newtab", "about:home"];
@@ -349,6 +362,15 @@ function capabilityPresent(name, win) {
   }
 }
 
+// The notice's wording for a set of permissions: "read pages", "read and act on pages", "read network
+// data: cookies, downloads, storage, request headers". `act` covers `read`, so the two are never named
+// together.
+function permissionVerbs(permissions) {
+  return PERMISSIONS.filter(need => permissions.has(need) && !(need === "read" && permissions.has("act")))
+    .map(need => PERMISSION_VERBS[need])
+    .join(" and ");
+}
+
 class Loader {
   #started = false;
   #loaderSha256 = null;
@@ -371,7 +393,8 @@ class Loader {
     capabilities: {},
     updated: null,
     lastHandoff: null,
-    consent: "none",
+    // The granted permissions (e.g. ["read","act"]) and what a pending notice is asking for.
+    consent: [],
     consentPending: null,
     actorError: null,
     lastClose: null,
@@ -382,7 +405,7 @@ class Loader {
   #noticeState = null; // {generation, text, warning, buttons} of the notice currently shown
   #noticeBase = null; // {text, warning, buttons}: the notice every window gets, Stop included
   #noticeObserver = null; // browser-delayed-startup-finished observer while a notice is up
-  #consent = { scope: null, pending: null }; // per link; created on auth, cleared in #teardown
+  #consent = { granted: new Set(), pending: null }; // per link; created on auth, cleared in #teardown
   #tabOpenWatchers = new Map(); // window -> {states: [state], handler}: agent-space popup re-homing
 
   init(mode, hashes) {
@@ -406,7 +429,7 @@ class Loader {
       parentSha256: this.#parentSha256,
       capabilities: this.#probeCapabilities(),
       actorError: this.#actorError,
-      consent: "none",
+      consent: [],
       consentPending: null,
       lastClose: null,
     });
@@ -627,10 +650,10 @@ class Loader {
             this.#client = ws;
             // The consent state belongs to this link and is never inherited: the previous link's grant
             // dies with it, so the user's Allow is asked for again (plan §8.2).
-            this.#consent = { scope: null, pending: null };
+            this.#consent = { granted: new Set(), pending: null };
             this.#startHeartbeat();
             this.#showNotice(`Hirozen: ${this.#who()} is connected. Stop ends the session.`);
-            this.#writeStatus({ state: "connected", consent: "none", consentPending: null, lastClose: null });
+            this.#writeStatus({ state: "connected", consent: [], consentPending: null, lastClose: null });
             ws.send({
               type: "ready",
               loaderVersion: LOADER_VERSION,
@@ -727,14 +750,15 @@ class Loader {
       resetScope: true,
     });
     this.#clearTabOpenWatchers();
-    this.#writeStatus({ state: "stopping", consent: "none", consentPending: null, lastClose: reason });
+    this.#writeStatus({ state: "stopping", consent: [], consentPending: null, lastClose: reason });
     this.#hideNotice();
-    this.#writeStatus({ state: "dormant", consent: "none", consentPending: null });
+    this.#writeStatus({ state: "dormant", consent: [], consentPending: null });
   }
 
   // Clears the gate: a pending Allow/Deny notice is cancelled (its waiters get `rejectPending`), the
   // notice returns to the pre-prompt state (or is dropped entirely when the link is going away), and
-  // the granted scope is either reset (link teardown) or left alone (prompt cancelled on its own).
+  // the granted permissions are either cleared (link teardown) or left alone (prompt cancelled on its
+  // own).
   #clearConsent({ rejectPending, resetScope = false } = {}) {
     const pending = this.#consent.pending;
     if (pending) {
@@ -742,7 +766,7 @@ class Loader {
       this.#consent.pending = null;
       pending.reject(rejectPending ?? new LoaderError("E_DENIED", "the Allow/Deny notice was cancelled"));
     }
-    if (resetScope) this.#consent.scope = null;
+    if (resetScope) this.#consent.granted.clear();
   }
 
   async #handle(msg) {
@@ -795,85 +819,82 @@ class Loader {
 
   // ---------------------------------------------------------------- consent gate (§8.2)
 
-  // Order of strength: null < "read" < "act". A granted act covers read.
-  #scopeCovers(granted, needed) {
-    if (granted === "act") return true;
-    return granted === "read" && needed === "read";
-  }
-
-  #consentVerb(scope) {
-    return scope === "act" ? "read and act on pages" : "read pages";
+  // Independent permissions: a granted `act` covers `read` (a page you may act on is a page you may
+  // read), and nothing else covers anything - a `network` call is never settled by an Allow for pages.
+  #scopeCovers(needed) {
+    const granted = this.#consent.granted;
+    return granted.has(needed) || (needed === "read" && granted.has("act"));
   }
 
   // Body of the gate call: the actor must be registered (a broken install refuses loudly, and no
-  // prompt is shown for a feature that cannot work), then the current scope decides whether the user
-  // has to be asked. Joined calls wait on the one pending promise, so one answer settles them all.
-  async #gate(scope, req) {
+  // prompt is shown for a feature that cannot work), then the granted set decides whether the user has
+  // to be asked. A call that joins a pending notice adds its own permission to the asked set and waits
+  // on the same promise, so one Allow settles every waiter; the loop re-checks coverage after the
+  // answer instead of returning, so a call can never ride an Allow that did not cover it.
+  async #gate(need, req) {
     if (this.#actorError) {
       throw new LoaderError("E_ACTOR", `Hirozen's actor is not registered in Zen (${this.#actorError.message}); reinstall or fix the loader and restart Zen`);
     }
-    if (this.#scopeCovers(this.#consent.scope, scope)) return;
-    let pending = this.#consent.pending;
-    if (pending) {
-      if (scope === "act" && pending.scope === "read") this.#upgradePrompt(pending);
-      await pending.promise;
-      return;
+    for (;;) {
+      if (this.#scopeCovers(need)) return;
+      const pending = this.#consent.pending;
+      if (pending) {
+        if (!pending.asks.has(need)) {
+          pending.asks.add(need);
+          this.#writeStatus({ consentPending: [...pending.asks] });
+          this.#emit("consent.pending", { asked: [...pending.asks] });
+          this.#showConsentNotice();
+        }
+        await pending.promise;
+        continue;
+      }
+      const { promise, resolve, reject } = Promise.withResolvers();
+      const fresh = { asks: new Set([need]), promise, resolve, reject, timer: null };
+      this.#consent.pending = fresh;
+      // 120 s is the plan's bound: no answer is a Deny (not sticky - the next call asks again). The
+      // timer is real (the loader has no clock of its own), and never restarted when a call joins.
+      fresh.timer = setTimeout(() => this.#settleConsent(fresh, { granted: false, timedOut: true }), GATE_TIMEOUT_MS);
+      this.#writeStatus({ consentPending: [...fresh.asks] });
+      this.#emit("consent.pending", { asked: [...fresh.asks] });
+      this.#showConsentNotice();
+      await promise;
     }
-    const { promise, resolve, reject } = Promise.withResolvers();
-    pending = { scope, promise, resolve, reject, timer: null };
-    this.#consent.pending = pending;
-    // 120 s is the plan's bound: no answer is a Deny (not sticky - the next call asks again). The
-    // timer is real (the loader has no clock of its own), and never restarted by an upgrade.
-    pending.timer = setTimeout(() => this.#settleConsent(pending, { granted: false, timedOut: true }), GATE_TIMEOUT_MS);
-    this.#writeStatus({ consentPending: pending.scope });
-    this.#emit("consent.pending", { scope: pending.scope });
-    this.#showConsentNotice();
-    await promise;
   }
 
-  // An act call arriving while a read prompt is up upgrades the prompt in place: same notice, same
-  // waiter, same 120 s timer - one answer settles both.
-  #upgradePrompt(pending) {
-    if (pending.scope === "act") return;
-    pending.scope = "act";
-    this.#writeStatus({ consentPending: "act" });
-    this.#emit("consent.pending", { scope: "act" });
-    this.#showConsentNotice();
-  }
-
-  // Allow: the scope is granted to every waiter, the status is written before the event (plan: the
-  // status file must never contradict the terminal hint), and the notice becomes the persistent
-  // connected notice with the granted scope.
+  // Allow: every asked permission is added to the granted set, the status is written before the event
+  // (plan: the status file must never contradict the terminal hint), and the notice becomes the
+  // persistent connected notice naming every granted permission. The event carries the whole granted
+  // set, not only what this answer added.
   #settleConsent(pending, { granted, timedOut = false }) {
     if (this.#consent.pending !== pending) return;
     clearTimeout(pending.timer);
     this.#consent.pending = null;
-    const scope = pending.scope;
+    const asked = [...pending.asks];
     if (granted) {
-      this.#consent.scope = scope;
-      this.#writeStatus({ consent: scope, consentPending: null });
-      this.#emit("consent.granted", { scope });
+      for (const need of pending.asks) this.#consent.granted.add(need);
+      this.#writeStatus({ consent: [...this.#consent.granted], consentPending: null });
+      this.#emit("consent.granted", { granted: [...this.#consent.granted] });
       this.#showConsentNotice();
-      pending.resolve({ scope });
+      pending.resolve();
       return;
     }
-    // Deny or timeout: the scope goes back to what it was, so the notice returns to the one shown
-    // before the prompt, and the next call asks again.
-    this.#writeStatus({ consent: this.#consent.scope ?? "none", consentPending: null });
-    this.#emit("consent.denied", { scope });
+    // Deny or timeout: the granted set is untouched, so the notice returns to the one shown before the
+    // prompt, and the next call asks again.
+    this.#writeStatus({ consent: [...this.#consent.granted], consentPending: null });
+    this.#emit("consent.denied", { asked });
     this.#showConsentNotice();
     pending.reject(new LoaderError("E_DENIED", timedOut
       ? "the Allow/Deny notice in Zen was not answered within 120 s; the next call asks again"
       : "the Allow/Deny notice in Zen was denied; the next call asks again"));
   }
 
-  // The gate notice: the prompt while an answer is owed, the V1 connected notice plus the granted
-  // scope otherwise. Private windows stay excluded, as for every notice.
+  // The gate notice: the prompt while an answer is owed (naming everything it asks for), the V1
+  // connected notice plus every granted permission otherwise. Private windows stay excluded, as for
+  // every notice.
   #showConsentNotice() {
     const pending = this.#consent.pending;
     if (pending) {
-      const scope = pending.scope;
-      this.#showNotice(`Hirozen: ${this.#who()} wants to ${this.#consentVerb(scope)} in Zen.`, {
+      this.#showNotice(`Hirozen: ${this.#who()} wants to ${permissionVerbs(pending.asks)} in Zen.`, {
         buttons: [
           { label: "Allow", callback: () => { this.#settleConsent(pending, { granted: true }); return false; } },
           { label: "Deny", callback: () => { this.#settleConsent(pending, { granted: false }); return false; } },
@@ -881,7 +902,8 @@ class Loader {
       });
       return;
     }
-    const suffix = this.#consent.scope ? ` - Hirozen can ${this.#consentVerb(this.#consent.scope)}` : "";
+    const granted = this.#consent.granted;
+    const suffix = granted.size > 0 ? ` - Hirozen can ${permissionVerbs(granted)}` : "";
     this.#showNotice(`Hirozen: ${this.#who()} is connected${suffix}. Stop ends the session.`);
   }
 
