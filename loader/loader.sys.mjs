@@ -124,8 +124,18 @@ const PERMISSION_VERBS = {
 // agent needs to reach the web from one (plan: navigate's exemption from E_PRIVILEGED_PAGE).
 const ABOUT_NAVIGABLE = ["about:blank", "about:newtab", "about:home"];
 
-// The network tools (T9-T11). One 64 KB budget per answer, and the two bounds the storage answer uses.
+// The network tools (T9-T11). One 64 KB budget per answer, a ring of the last 200 requests per watched
+// tab, and the header values that never leave the loader unredacted.
 const NET_CAP_BYTES = 65_536;
+const NET_RING_MAX = 200;
+const NET_TOPICS = [
+  "http-on-modify-request",
+  "http-on-examine-response",
+  "http-on-examine-cached-response",
+  "http-on-examine-merged-response",
+];
+const REDACTED_HEADERS = new Set(["cookie", "set-cookie", "authorization", "proxy-authorization"]);
+const REDACTED = "<redacted>";
 const STORAGE_VALUE_CHARS = 200;
 const DOWNLOADS_MAX = 50;
 
@@ -400,6 +410,61 @@ function capabilityPresent(name, win) {
   }
 }
 
+// The tab a channel belongs to: the top-level browsing context's browserId. 0 means "no tab" - a
+// service worker, a chrome-side fetch, a download - and the observer drops it. `channel.browserId` is
+// the direct attribute; the loadInfo's browsing contexts are the fallback the plan names.
+function channelBrowserId(channel) {
+  let id = 0;
+  try {
+    id = Number(channel.browserId) || 0;
+  } catch {
+    id = 0;
+  }
+  if (id) return id;
+  try {
+    const info = channel.loadInfo;
+    return Number(info?.browsingContext?.browserId ?? info?.associatedBrowsingContext?.browserId) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+// A private channel is never buffered: its requests belong to a window Hirozen refuses to touch, and
+// `privateBrowsingId` is the only place that is visible from the channel. An unreadable loadInfo is
+// treated as private (fail closed).
+function isPrivateChannel(channel) {
+  try {
+    return (channel.loadInfo?.originAttributes?.privateBrowsingId ?? 0) > 0;
+  } catch {
+    return true;
+  }
+}
+
+// nsIHttpHeaders -> a plain object, with the credential headers' values replaced. Names are compared
+// lowercased so the redaction cannot be dodged by casing.
+function collectHeaders(headers) {
+  const into = {};
+  if (!headers || typeof headers.visit !== "function") return into;
+  try {
+    headers.visit({
+      visitHeader(name, value) {
+        const key = String(name);
+        into[key] = REDACTED_HEADERS.has(key.toLowerCase()) ? REDACTED : String(value);
+      },
+    });
+  } catch {
+    // A channel whose headers cannot be read contributes what it gave up to that point.
+  }
+  return into;
+}
+
+// An upper bound on what one header set adds to the serialized entry (name, quotes, colon, comma).
+function headerBytes(headers) {
+  let bytes = 0;
+  for (const [name, value] of Object.entries(headers)) bytes += name.length + value.length + 8;
+  return bytes;
+}
+
 // The state of a Download, from its own flags (DownloadCore's docs): an error, a cancel, a success,
 // still running - and `stopped` with no start time, which is a download that never began.
 function downloadState(download) {
@@ -455,6 +520,13 @@ class Loader {
   #noticeObserver = null; // browser-delayed-startup-finished observer while a notice is up
   #consent = { granted: new Set(), pending: null }; // per link; created on auth, cleared in #teardown
   #tabOpenWatchers = new Map(); // window -> {states: [state], handler}: agent-space popup re-homing
+  // The network capture (T9-T11): one watcher per watched tabKey, the same watcher reachable by the
+  // tab's browserId (the observer's only filter), the one shared observer object, and the TabClose
+  // listener installed on each window that has a watched tab.
+  #netWatch = new Map(); // tabKey -> {tabKey, tab, browserId, entries, byChannel, bytes, dropped}
+  #netByBrowser = new Map(); // browserId -> the same watcher
+  #netObserver = null; // registered for every NET_TOPICS topic while a watcher is live
+  #netWindows = new Map(); // window -> its TabClose handler
 
   init(mode, hashes) {
     if (this.#started) return "already-started";
@@ -798,6 +870,9 @@ class Loader {
       resetScope: true,
     });
     this.#clearTabOpenWatchers();
+    // The capture is link state too: its observers and its buffers die here, which is also where Zen's
+    // Stop lands.
+    this.#stopNetwork();
     this.#writeStatus({ state: "stopping", consent: [], consentPending: null, lastClose: reason });
     this.#hideNotice();
     this.#writeStatus({ state: "dormant", consent: [], consentPending: null });
@@ -858,6 +933,12 @@ class Loader {
         return this.#networkStorage(params, req);
       case "network.downloads":
         return this.#networkDownloads(params, req);
+      case "network.start":
+        return this.#networkStart(params, req);
+      case "network.read":
+        return this.#networkRead(params, req);
+      case "network.stop":
+        return this.#networkStop(params, req);
       default:
         throw new LoaderError("E_UNKNOWN_METHOD", `unknown method ${msg.method}`);
     }
@@ -2174,6 +2255,233 @@ class Loader {
     }));
     const truncated = items.length > DOWNLOADS_MAX;
     return { downloads: items.slice(-DOWNLOADS_MAX).reverse(), truncated };
+  }
+
+  // T11: start watching one tab's requests. The tab is resolved and its browserId read before the
+  // gate, so a call that cannot be scoped never costs a prompt. Watching the same tab twice is a
+  // no-op (the buffer survives), and the observers are installed once for every watcher.
+  async #networkStart(params, req) {
+    const { tabKey, tab, browser } = this.#resolveTab(params?.tabKey);
+    const browserId = Number(browser.browsingContext?.browserId) || 0;
+    if (!browserId) {
+      throw new LoaderError("E_TAB_UNLOADED", `tab ${tabKey} has no live browsing context; Hirozen cannot tell its requests apart`);
+    }
+    await this.#gate("network", req);
+    this.#checkDeadline(req);
+    if (!this.#netWatch.has(tabKey)) {
+      const watcher = { tabKey, tab, browserId, entries: [], byChannel: new Map(), bytes: 0, dropped: 0 };
+      this.#netWatch.set(tabKey, watcher);
+      this.#netByBrowser.set(browserId, watcher);
+    }
+    this.#installNetworkObservers();
+    this.#watchTabClose(browser.ownerGlobal ?? tab.ownerDocument?.defaultView ?? null);
+    return { tabKey, url: browser.currentURI.spec, active: true };
+  }
+
+  // T11: what has been captured for that tab, then the buffer is cleared. Reading a tab nobody is
+  // watching is not an error - it is an empty answer with `active: false`, which is what a read after
+  // a stop should say.
+  async #networkRead(params, req) {
+    const { tabKey, browser } = this.#resolveTab(params?.tabKey);
+    await this.#gate("network", req);
+    this.#checkDeadline(req);
+    const watcher = this.#netWatch.get(tabKey) ?? null;
+    const entries = watcher ? this.#netEntries(watcher) : [];
+    const truncated = watcher ? watcher.dropped : 0;
+    if (watcher) this.#clearBuffer(watcher);
+    return { tabKey, url: browser.currentURI.spec, active: !!watcher, entries, truncated };
+  }
+
+  // T11: stop watching that tab. Its buffer goes with it, and so does the observer set when it was the
+  // last watcher.
+  async #networkStop(params, req) {
+    const { tabKey, browser } = this.#resolveTab(params?.tabKey);
+    await this.#gate("network", req);
+    this.#checkDeadline(req);
+    const watcher = this.#netWatch.get(tabKey) ?? null;
+    const dropped = watcher ? watcher.entries.length : 0;
+    if (watcher) this.#dropWatcher(watcher);
+    return { tabKey, url: browser.currentURI.spec, active: false, dropped };
+  }
+
+  // One observer object for all four topics, installed with the first watcher and removed with the
+  // last: Gecko calls it on every request in the browser, so it does nothing but look the channel's
+  // browserId up in a Map and drop what nobody watches.
+  #installNetworkObservers() {
+    if (this.#netObserver) return;
+    const observer = { observe: (subject, topic) => this.#onHttp(subject, topic) };
+    this.#netObserver = observer;
+    for (const topic of NET_TOPICS) Services.obs.addObserver(observer, topic);
+  }
+
+  #removeNetworkObservers() {
+    const observer = this.#netObserver;
+    if (!observer) return;
+    this.#netObserver = null;
+    for (const topic of NET_TOPICS) Services.obs.removeObserver(observer, topic);
+  }
+
+  // TabClose is the one event that can take a watcher away without the agent asking: the tab (and its
+  // buffer) is gone, and the refcount has to notice. Zen's own listeners take the same event on the
+  // window, so the handler goes there too - one per window that has a watched tab.
+  #watchTabClose(win) {
+    if (!win || this.#netWindows.has(win)) return;
+    const handler = event => {
+      const tab = event?.target ?? null;
+      for (const watcher of [...this.#netWatch.values()]) {
+        if (watcher.tab === tab) this.#dropWatcher(watcher);
+      }
+    };
+    try {
+      win.addEventListener("TabClose", handler);
+      this.#netWindows.set(win, handler);
+    } catch {
+      // A window that refuses the listener is a window that is going away; its tabs go with it.
+    }
+  }
+
+  #unwatchTabClose() {
+    for (const [win, handler] of [...this.#netWindows]) {
+      this.#netWindows.delete(win);
+      try {
+        win.removeEventListener("TabClose", handler);
+      } catch {
+        // Nothing left to remove.
+      }
+    }
+  }
+
+  // Drops one tab's buffer and its share of the refcount; the observers and every TabClose listener
+  // go with the last watcher.
+  #dropWatcher(watcher) {
+    this.#netWatch.delete(watcher.tabKey);
+    this.#netByBrowser.delete(watcher.browserId);
+    watcher.entries.length = 0;
+    watcher.byChannel.clear();
+    watcher.bytes = 0;
+    if (this.#netWatch.size === 0) {
+      this.#removeNetworkObservers();
+      this.#unwatchTabClose();
+    }
+  }
+
+  // The whole capture dies with the link, and with Zen's Stop (which runs the same teardown): nothing
+  // between this and the next auth may inherit a running observer.
+  #stopNetwork() {
+    for (const watcher of [...this.#netWatch.values()]) {
+      this.#netWatch.delete(watcher.tabKey);
+      this.#netByBrowser.delete(watcher.browserId);
+    }
+    this.#netWatch.clear();
+    this.#netByBrowser.clear();
+    this.#removeNetworkObservers();
+    this.#unwatchTabClose();
+  }
+
+  #clearBuffer(watcher) {
+    watcher.entries.length = 0;
+    watcher.byChannel.clear();
+    watcher.bytes = 0;
+    watcher.dropped = 0;
+  }
+
+  // The ring (the last NET_RING_MAX requests) and the 64 KB buffer cap, both dropping the oldest;
+  // `dropped` is what a read reports as `truncated`. The last entry is never dropped for size: a
+  // single request bigger than the cap is still the one the agent asked for.
+  #trimBuffer(watcher) {
+    while (watcher.entries.length > NET_RING_MAX || (watcher.bytes > NET_CAP_BYTES && watcher.entries.length > 1)) {
+      const oldest = watcher.entries.shift();
+      watcher.bytes -= oldest.bytes;
+      watcher.byChannel.delete(oldest.channel);
+      watcher.dropped++;
+    }
+  }
+
+  #onHttp(channel, topic) {
+    try {
+      if (!channel) return;
+      const browserId = channelBrowserId(channel);
+      if (!browserId) return; // no tab at all: a service worker, a chrome-side fetch, a download
+      const watcher = this.#netByBrowser.get(browserId);
+      if (!watcher) return; // a tab nobody is watching
+      if (isPrivateChannel(channel)) return;
+      if (topic === "http-on-modify-request") this.#onRequest(watcher, channel);
+      else this.#onResponse(watcher, channel);
+    } catch {
+      // An observer must never throw into Gecko's notification loop, and one unreadable channel must
+      // not take the capture down with it.
+    }
+  }
+
+  #onRequest(watcher, channel) {
+    let url = "";
+    let method = "";
+    try {
+      url = String(channel.URI?.spec ?? "");
+    } catch {
+      url = "";
+    }
+    try {
+      method = String(channel.requestMethod ?? "");
+    } catch {
+      method = "";
+    }
+    const requestHeaders = collectHeaders(channel.requestHeaders);
+    const entry = {
+      channel,
+      method,
+      url,
+      status: null,
+      contentType: null,
+      startedAt: Date.now(),
+      ms: null,
+      requestHeaders,
+      responseHeaders: {},
+      // An upper bound on this entry's serialized size: the buffer's 64 KB cap has to hold for what a
+      // read hands the agent, and the fixed field names, quotes and punctuation are the 160.
+      bytes: url.length + method.length + 160 + headerBytes(requestHeaders),
+    };
+    watcher.entries.push(entry);
+    watcher.byChannel.set(channel, entry);
+    watcher.bytes += entry.bytes;
+    this.#trimBuffer(watcher);
+  }
+
+  // The response half of a request the capture saw begin: the status, the content type and the timing
+  // land on the same entry. A response whose request predates the watch has no entry and is dropped.
+  #onResponse(watcher, channel) {
+    const entry = watcher.byChannel.get(channel);
+    if (!entry) return;
+    try {
+      entry.status = Number(channel.responseStatus);
+    } catch {
+      entry.status = null;
+    }
+    try {
+      entry.contentType = channel.contentType ? String(channel.contentType) : null;
+    } catch {
+      entry.contentType = null;
+    }
+    entry.responseHeaders = collectHeaders(channel.responseHeaders);
+    entry.ms = Math.max(0, Date.now() - entry.startedAt);
+    const added = headerBytes(entry.responseHeaders) + 48;
+    entry.bytes += added;
+    watcher.bytes += added;
+    this.#trimBuffer(watcher);
+  }
+
+  // The entries as the agent sees them: the channel object itself never crosses.
+  #netEntries(watcher) {
+    return watcher.entries.map(entry => ({
+      method: entry.method,
+      url: entry.url,
+      status: entry.status,
+      contentType: entry.contentType,
+      startedAt: entry.startedAt,
+      ms: entry.ms,
+      requestHeaders: entry.requestHeaders,
+      responseHeaders: entry.responseHeaders,
+    }));
   }
 
   #emit(name, data) {
