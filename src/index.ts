@@ -166,6 +166,19 @@ type ZenDownload = {
   startedAt: number | null;
 };
 type ZenDownloads = { downloads: ZenDownload[]; truncated: boolean };
+type ZenNetworkEntry = {
+  method: string;
+  url: string;
+  status: number | null;
+  contentType: string | null;
+  startedAt: number;
+  ms: number | null;
+  requestHeaders: Record<string, string>;
+  responseHeaders: Record<string, string>;
+};
+type ZenNetworkWatch = { tabKey: string; url: string; active: boolean };
+type ZenNetworkRead = ZenNetworkWatch & { entries: ZenNetworkEntry[]; truncated: number };
+type ZenNetworkStop = ZenNetworkWatch & { dropped: number };
 
 /**
  * The parsed arguments of the V2 tools. omp validates every call against the tool's `parameters`
@@ -930,7 +943,7 @@ async function runBrowserDialog(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Network (T9-T10): the tab's cookies, its page storage and Zen's downloads
+// Network (T9-T11): the tab's cookies, its page storage, Zen's downloads, and its request headers
 // ---------------------------------------------------------------------------------------------
 //
 // Every call here runs under the loader's `network` permission and its own in-Zen Allow/Deny prompt,
@@ -982,6 +995,37 @@ function renderDownloads(reply: ZenDownloads): string {
   }
   if (reply.truncated) lines.push("", "Only the newest 50 downloads are listed.");
   return lines.join("\n");
+}
+
+/** One `name=value` header line, or null when that side of the exchange carried no header. */
+function headerLine(side: string, headers: Record<string, string>): string | null {
+  const pairs = Object.entries(headers);
+  return pairs.length === 0 ? null : `  ${side}: ${pairs.map(([name, value]) => `${name}=${value}`).join(" ")}`;
+}
+
+function renderNetworkRead(reply: ZenNetworkRead): string {
+  const lines = [pageHeader(reply.url, `${reply.entries.length} request(s) in tab ${reply.tabKey}`)];
+  if (!reply.active) lines.push("", "This tab is not being recorded any more; start it again with browser_network_start.");
+  for (const entry of reply.entries) {
+    const status = entry.status === null ? "(no response)" : String(entry.status);
+    const timing = entry.ms === null ? "" : `, ${entry.ms} ms`;
+    lines.push(`- ${entry.method} ${status} ${entry.url} (${entry.contentType ?? "no content type"}${timing})`);
+    for (const line of [headerLine("request", entry.requestHeaders), headerLine("response", entry.responseHeaders)]) {
+      if (line !== null) lines.push(line);
+    }
+  }
+  if (reply.truncated > 0) {
+    lines.push("", `${reply.truncated} more request(s) did not fit in this reply (64 KB) and are gone; record again for more.`);
+  }
+  return lines.join("\n");
+}
+
+function renderNetworkStart(reply: ZenNetworkWatch): string {
+  return `${pageHeader(reply.url, `Watching tab ${reply.tabKey}`)}\nRequests are recorded until browser_network_stop; read them with browser_network_read.`;
+}
+
+function renderNetworkStop(reply: ZenNetworkStop): string {
+  return `${pageHeader(reply.url, `Stopped watching tab ${reply.tabKey}`)}\n${reply.dropped} buffered request(s) were dropped.`;
 }
 
 async function runBrowserCookies(
@@ -1065,6 +1109,82 @@ async function runBrowserDownloads(
     return {
       content: [{ type: "text", text: renderDownloads(reply) }],
       details: { downloads: reply.downloads.length, truncated: reply.truncated },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+
+async function runBrowserNetworkStart(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  tabKey: string,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  try {
+    const reply = await access.link.call<ZenNetworkWatch>("network.start", { tabKey }, {
+      timeoutMs: callBudget("network"),
+      signal,
+    });
+    rememberTab(tabKey, reply);
+    return {
+      content: [{ type: "text", text: renderNetworkStart(reply) }],
+      details: { tabKey: reply.tabKey, url: reply.url, active: reply.active },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+
+async function runBrowserNetworkRead(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  tabKey: string,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  try {
+    // Reading clears what was buffered, so this is the one look at those requests.
+    const reply = await access.link.call<ZenNetworkRead>("network.read", { tabKey }, {
+      timeoutMs: callBudget("network"),
+      signal,
+    });
+    rememberTab(tabKey, reply);
+    return {
+      content: [{ type: "text", text: renderNetworkRead(reply) }],
+      details: {
+        tabKey: reply.tabKey,
+        url: reply.url,
+        active: reply.active,
+        requests: reply.entries.length,
+        truncated: reply.truncated,
+      },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+
+async function runBrowserNetworkStop(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  tabKey: string,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  try {
+    const reply = await access.link.call<ZenNetworkStop>("network.stop", { tabKey }, {
+      timeoutMs: callBudget("network"),
+      signal,
+    });
+    rememberTab(tabKey, reply);
+    return {
+      content: [{ type: "text", text: renderNetworkStop(reply) }],
+      details: { tabKey: reply.tabKey, url: reply.url, dropped: reply.dropped },
     };
   } catch (error) {
     return fail(describeError(error));
@@ -1320,6 +1440,15 @@ function storageApprovalDetails(args: unknown): string[] {
   return [
     `tab: ${describeTab(params.tabKey)}`,
     `action: read this tab's ${params.kind} storage${params.reveal === true ? " WITH its values" : " (values redacted)"}`,
+  ];
+}
+
+/** browser_network_start: which tab starts being recorded, and what stays redacted. */
+function networkStartApprovalDetails(args: unknown): string[] {
+  const params = approvalArgs<TabParams>(args);
+  return [
+    `tab: ${describeTab(params.tabKey)}`,
+    "action: record this tab's requests (URLs, statuses and headers; cookie and authorization values are redacted)",
   ];
 }
 
@@ -2204,6 +2333,51 @@ export default function hirozen(pi: ExtensionAPI): void {
     approval: "read",
     loadMode: "essential",
     execute: (_toolCallId, _params, signal, _onUpdate, ctx) => runBrowserDownloads(pi, ctx, signal),
+  });
+
+  pi.registerTool(
+    withApprovalDetails(
+      {
+        name: "browser_network_start",
+        label: "Record requests",
+        description:
+          'Start recording one Zen tab\'s requests (URLs, statuses, timings and headers) under the loader\'s network permission; cookie, set-cookie, authorization and proxy-authorization values are redacted. Read them with browser_network_read, stop with browser_network_stop. Read-only: nothing is modified, blocked or replayed.',
+        parameters: parameters.tabKey,
+        approval: execApproval(
+          "browser_network_start records a tab's requests in Zen (URLs, statuses and headers, with the sensitive values redacted).",
+        ),
+        loadMode: "essential",
+        execute: (
+          _toolCallId: string,
+          params: TabParams,
+          signal: AbortSignal | undefined,
+          _onUpdate: unknown,
+          ctx: ExtensionContext,
+        ) => runBrowserNetworkStart(pi, ctx, params.tabKey, signal),
+      },
+      networkStartApprovalDetails,
+    ),
+  );
+
+  pi.registerTool({
+    name: "browser_network_read",
+    label: "Read recorded requests",
+    description:
+      "Read what browser_network_start recorded for one Zen tab (oldest first, newest 200 within 64 KB) and clear the buffer. Reading a tab that is not being recorded is not an error: it answers with no requests.",
+    parameters: parameters.tabKey,
+    approval: "read",
+    loadMode: "essential",
+    execute: (_toolCallId, params, signal, _onUpdate, ctx) => runBrowserNetworkRead(pi, ctx, params.tabKey, signal),
+  });
+
+  pi.registerTool({
+    name: "browser_network_stop",
+    label: "Stop recording requests",
+    description: "Stop recording one Zen tab's requests and drop what was buffered.",
+    parameters: parameters.tabKey,
+    approval: "read",
+    loadMode: "essential",
+    execute: (_toolCallId, params, signal, _onUpdate, ctx) => runBrowserNetworkStop(pi, ctx, params.tabKey, signal),
   });
 
   pi.registerCommand("hirozen-setup", {

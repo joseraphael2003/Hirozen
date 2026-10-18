@@ -820,6 +820,89 @@ test("browser_cookies, browser_storage and browser_downloads send the agreed fra
   }
 }, 30_000);
 
+test("the network recording tools start, read and stop a tab's request buffer", async () => {
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+  const loader = new FakeLoader(profileDir).on("zen.inventory", frame => loader.reply(frame, INVENTORY));
+  loader.on("network.start", frame => loader.reply(frame, { tabKey: TAB_KEY, url: "https://example.com/", active: true }));
+  loader.on("network.read", frame =>
+    loader.reply(frame, {
+      tabKey: TAB_KEY,
+      url: "https://example.com/",
+      active: true,
+      entries: [
+        {
+          method: "GET",
+          url: "https://example.com/api/data",
+          status: 200,
+          contentType: "application/json",
+          startedAt: 1_800_000_000_000,
+          ms: 42,
+          requestHeaders: { accept: "*/*", cookie: "<redacted>" },
+          responseHeaders: { "content-type": "application/json", "set-cookie": "<redacted>" },
+        },
+        {
+          method: "POST",
+          url: "https://example.com/api/save",
+          status: null,
+          contentType: null,
+          startedAt: 1_800_000_001_000,
+          ms: null,
+          requestHeaders: { authorization: "<redacted>" },
+          responseHeaders: {},
+        },
+      ],
+      truncated: 3,
+    }),
+  );
+  loader.on("network.stop", frame => loader.reply(frame, { tabKey: TAB_KEY, url: "https://example.com/", active: false, dropped: 2 }));
+  const started = loader.start().catch(() => undefined);
+  // A round trip first: the socket has to be up before the frames below are answered, and zen_tabs
+  // leaves its own frame queued for the drain.
+  expect((await callTool(host, "zen_tabs")).isError).not.toBe(true);
+  expect((await loader.nextRequest()).method).toBe("zen.inventory");
+
+  const startTool = host.tools.get("browser_network_start");
+  if (!startTool) throw new Error("browser_network_start is not registered");
+  // Starting a recording is an exec-tier action: it always prompts.
+  expect(typeof startTool.approval === "function" ? startTool.approval({ tabKey: TAB_KEY }) : startTool.approval).toMatchObject({
+    tier: "exec",
+    policy: "prompt",
+  });
+  const startDetails = startTool.formatApprovalDetails?.({ tabKey: TAB_KEY });
+  expect(Array.isArray(startDetails) ? startDetails.join("\n") : String(startDetails ?? "")).toContain("redacted");
+
+  const startCall = callTool(host, "browser_network_start", { tabKey: TAB_KEY });
+  const startRequest = await loader.nextRequest();
+  expect(startRequest.method).toBe("network.start");
+  expect(startRequest.params).toEqual({ tabKey: TAB_KEY });
+  expect(textOf(await startCall)).toContain("Watching tab");
+
+  for (const name of ["browser_network_read", "browser_network_stop"]) {
+    const tool = host.tools.get(name);
+    if (!tool) throw new Error(`${name} is not registered`);
+    expect(tool.approval).toBe("read");
+  }
+  const readCall = callTool(host, "browser_network_read", { tabKey: TAB_KEY });
+  expect((await loader.nextRequest()).method).toBe("network.read");
+  const readText = textOf(await readCall);
+  expect(readText).toContain("GET 200 https://example.com/api/data");
+  expect(readText).toContain("application/json, 42 ms");
+  expect(readText).toContain("cookie=<redacted>");
+  expect(readText).toContain("set-cookie=<redacted>");
+  expect(readText).toContain("POST (no response) https://example.com/api/save");
+  expect(readText).toContain("authorization=<redacted>");
+  expect(readText).toContain("3 more request(s)");
+
+  const stopCall = callTool(host, "browser_network_stop", { tabKey: TAB_KEY });
+  expect((await loader.nextRequest()).method).toBe("network.stop");
+  const stopText = textOf(await stopCall);
+  expect(stopText).toContain("Stopped watching tab");
+  expect(stopText).toContain("2 buffered request(s) were dropped");
+
+  await shutdown(host);
+  await started;
+}, 30_000);
+
 test("the reinstall offer names /hirozen-attach only when that Zen is running", async () => {
   // A Zen update wipes the loader while zen.exe is still there: the offer fires on session_start. The
   // attach hint needs a live process, and this install folder (a temp dir) has none, so the notice
