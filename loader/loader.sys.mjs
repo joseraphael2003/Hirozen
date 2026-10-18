@@ -744,7 +744,7 @@ class Loader {
     this.#client = null;
     // The link is gone: a pending gate has nobody to answer to, its waiters must not hang, and the
     // grant itself dies here (resetScope: a new link asks again, and nothing between this teardown and
-    // the next auth may inherit the old scope).
+    // the next auth may inherit the old permissions).
     this.#clearConsent({
       rejectPending: new LoaderError("E_STOPPED", "the omp link closed while the Allow/Deny notice was up"),
       resetScope: true,

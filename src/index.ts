@@ -1649,7 +1649,7 @@ export default function hirozen(pi: ExtensionAPI): void {
         name: "browser_act",
         label: "Act in tab",
         description:
-          "Act on one Zen tab by its tabKey: click, type, press, scroll or navigate (navigate needs an http(s) url). Refs come from browser_snapshot. The loader's in-Zen Allow/Deny gate must have granted the act scope; every call needs your approval. Refused on privileged pages, in private windows and on tabs in an inactive space that is not the Hirozen Agent space.",
+          "Act on one Zen tab by its tabKey: click, type, press, scroll or navigate (navigate needs an http(s) url). Refs come from browser_snapshot. The loader's in-Zen Allow/Deny gate must have granted the act permission; every call needs your approval. Refused on privileged pages, in private windows and on tabs in an inactive space that is not the Hirozen Agent space.",
         parameters: parameters.act,
         approval: execApproval("browser_act changes a page in Zen (click, type, press, scroll or navigate)."),
         loadMode: "essential",
@@ -1671,7 +1671,7 @@ export default function hirozen(pi: ExtensionAPI): void {
         name: "browser_upload",
         label: "Upload files",
         description:
-          "Set files on an <input type=file> in one Zen tab (ref from browser_snapshot). The loader's in-Zen Allow/Deny gate must have granted the act scope; every call needs your approval. Paths must exist locally (relative paths resolve against this omp session's cwd).",
+          "Set files on an <input type=file> in one Zen tab (ref from browser_snapshot). The loader's in-Zen Allow/Deny gate must have granted the act permission; every call needs your approval. Paths must exist locally (relative paths resolve against this omp session's cwd).",
         parameters: parameters.upload,
         approval: execApproval("browser_upload sets files on a page's file input in Zen."),
         loadMode: "essential",
