@@ -180,9 +180,10 @@ type Host = {
   commands: Map<string, (args: string, ctx: ExtensionContext) => unknown>;
 };
 
-/** What the stub keeps from a registered tool: the handler plus the approval surface omp reads. */
+/** What the stub keeps from a registered tool: the handler, the schema and the approval surface omp reads. */
 type StubTool = {
   execute: (...args: unknown[]) => Promise<AgentToolResult<unknown>>;
+  parameters?: unknown;
   approval?: unknown;
   formatApprovalDetails?: (args: unknown) => string | string[] | undefined;
 };
@@ -220,6 +221,26 @@ function makeHost(cwd: string): Host {
   } as unknown as ExtensionAPI;
 
   return { pi, ctx, notifications, tools, events, commands };
+}
+
+/** The schema surface omp validates a call against before the handler runs (the omptype builder). */
+type ToolSchema = { safeParse: (value: unknown) => { success: boolean } };
+
+/**
+ * The registered tool's own `parameters`, narrowed to the one member these tests read: the builder's
+ * object also carries parse/clone/…, and its shape is not worth modelling here.
+ */
+function toolSchema(tool: StubTool): ToolSchema {
+  const parameters = tool.parameters;
+  // The builder's schemas are callable objects, so both typeof answers are valid here.
+  const usable =
+    parameters !== undefined &&
+    parameters !== null &&
+    (typeof parameters === "object" || typeof parameters === "function");
+  if (usable && "safeParse" in parameters && typeof parameters.safeParse === "function") {
+    return parameters as ToolSchema;
+  }
+  throw new Error("the registered tool has no schema");
 }
 
 /** Runs a registered slash command the way omp does, with the root context. */
@@ -558,6 +579,23 @@ test("a loader E_UNSUPPORTED renders its gloss and keeps the loader's message", 
   expect((result.details as { code?: string } | undefined)?.code).toBe("E_UNSUPPORTED");
   await shutdown(host);
 }, 30_000);
+
+test("hover is an act action, and the prompt says what it hovers over", () => {
+  const tool = host.tools.get("browser_act");
+  if (!tool) throw new Error("browser_act is not registered");
+  // omp validates a call against the tool's schema before the handler runs, so the enum is the gate.
+  const schema = toolSchema(tool);
+  expect(schema.safeParse({ tabKey: TAB_KEY, action: "hover", ref: "ab12.e9" }).success).toBe(true);
+  expect(schema.safeParse({ tabKey: TAB_KEY, action: "dblclick", ref: "ab12.e9" }).success).toBe(false);
+
+  const args = { tabKey: TAB_KEY, action: "hover", ref: "ab12.e9" };
+  const details = tool.formatApprovalDetails?.(args);
+  const lines = Array.isArray(details) ? details.join("\n") : String(details ?? "");
+  expect(lines).toContain("hover over");
+  expect(lines).toContain("ab12.e9");
+  const decision = typeof tool.approval === "function" ? tool.approval(args) : tool.approval;
+  expect(decision).toMatchObject({ tier: "exec", policy: "prompt" });
+});
 
 test("the reinstall offer names /hirozen-attach only when that Zen is running", async () => {
   // A Zen update wipes the loader while zen.exe is still there: the offer fires on session_start. The

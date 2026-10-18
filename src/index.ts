@@ -1040,6 +1040,9 @@ function actApprovalDetails(args: unknown): string[] {
     case "scroll":
       lines.push(`action: ${target ? `scroll ${target} into view` : `scroll by ${params.dy ?? 0} px`}`);
       break;
+    case "hover":
+      lines.push(`action: hover over ${target ?? "the page"}`);
+      break;
     case "navigate":
       lines.push(`action: navigate to ${params.url ?? "?"}`);
       break;
@@ -1477,8 +1480,13 @@ function toolParameters(builder: ExtensionAPI["zod"]) {
     tabKey: builder.object({ tabKey: tabKey() }),
     act: builder.object({
       tabKey: tabKey(),
-      action: builder.enum(["click", "type", "press", "scroll", "navigate"]).describe("what to do on the tab"),
-      ref: builder.string().optional().describe("element ref from browser_snapshot (click/type/press/scroll target)"),
+      action: builder
+        .enum(["click", "type", "press", "scroll", "hover", "navigate"])
+        .describe("what to do on the tab"),
+      ref: builder
+        .string()
+        .optional()
+        .describe("element ref from browser_snapshot (click/type/press/scroll/hover target)"),
       text: builder.string().optional().describe("text to type (action=type)"),
       key: builder
         .string()
@@ -1649,9 +1657,9 @@ export default function hirozen(pi: ExtensionAPI): void {
         name: "browser_act",
         label: "Act in tab",
         description:
-          "Act on one Zen tab by its tabKey: click, type, press, scroll or navigate (navigate needs an http(s) url). Refs come from browser_snapshot. The loader's in-Zen Allow/Deny gate must have granted the act permission; every call needs your approval. Refused on privileged pages, in private windows and on tabs in an inactive space that is not the Hirozen Agent space.",
+          'Act on one Zen tab by its tabKey: click, type, press, scroll, hover or navigate (navigate needs an http(s) url). Refs come from browser_snapshot. The loader\'s in-Zen Allow/Deny gate must have granted the act permission; every call needs your approval. Refused on privileged pages, in private windows and on tabs in an inactive space that is not the Hirozen Agent space.',
         parameters: parameters.act,
-        approval: execApproval("browser_act changes a page in Zen (click, type, press, scroll or navigate)."),
+        approval: execApproval("browser_act changes a page in Zen (click, type, press, scroll, hover or navigate)."),
         loadMode: "essential",
         execute: (
           _toolCallId: string,
