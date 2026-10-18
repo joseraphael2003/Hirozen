@@ -9,7 +9,7 @@
 //        loader -> {type:"auth", mac: HMAC(nonce, "loader:"+challenge), challenge: <loader's own>}
 //        omp    -> {type:"auth", mac: HMAC(nonce, "omp:"+loaderChallenge)}
 //        loader -> {type:"ready", loaderVersion, loaderSha256, childSha256, parentSha256, zenVersion,
-//                   platformVersion, zenDir, zenPid}
+//                   platformVersion, zenDir, capabilities, zenPid}
 //   4. Requests {id, method, params, deadline} are answered with {id, result} or
 //      {id, error: {code, message}}; `deadline` is the absolute epoch ms after which the loader must
 //      not act on the request at all (see CALL_TIMEOUT_MS); loader events arrive as
@@ -86,6 +86,12 @@ export type ReadyFrame = {
   platformVersion: string;
   /** Zen's install folder (GreD) the loader runs from; absent from loaders older than 0.2.2. */
   zenDir?: string;
+  /**
+   * The Zen internals the loader could find, by name (e.g. `"gZenViewSplitter.splitTabs"`): probed on
+   * the most recent window, and again by every method that needs one (E_UNSUPPORTED). The status file
+   * carries the same record, which is what `/hirozen-status` reads.
+   */
+  capabilities: Record<string, boolean>;
   zenPid: number;
 };
 
@@ -110,6 +116,8 @@ export type ZenStatus = {
   mode?: "startup" | "attach";
   updated?: string;
   lastHandoff?: { pid?: number; cwd?: string; at?: string };
+  /** What the running Zen exposes, by the same names as ReadyFrame.capabilities. */
+  capabilities?: Record<string, boolean>;
   /** The Hirozen gate's granted scope, and what a pending Allow/Deny notice is asking for. */
   consent?: "none" | "read" | "act";
   consentPending?: null | "read" | "act";

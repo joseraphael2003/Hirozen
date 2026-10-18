@@ -104,6 +104,7 @@ class FakeLoader {
       zenVersion: "1.22.3b",
       platformVersion: "156.0.1",
       zenDir: readyZenDir,
+      capabilities: { gZenWorkspaces: true, "gZenViewSplitter.splitTabs": true, ReaderMode: true },
       zenPid: process.pid,
     });
   }
@@ -176,6 +177,7 @@ type Host = {
   notifications: string[];
   tools: Map<string, StubTool>;
   events: Map<string, (event: unknown, ctx: ExtensionContext) => unknown>;
+  commands: Map<string, (args: string, ctx: ExtensionContext) => unknown>;
 };
 
 /** What the stub keeps from a registered tool: the handler plus the approval surface omp reads. */
@@ -190,12 +192,15 @@ function makeHost(cwd: string): Host {
   const notifications: string[] = [];
   const tools = new Map<string, StubTool>();
   const events = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
+  const commands = new Map<string, (args: string, ctx: ExtensionContext) => unknown>();
 
   const ctx = {
     hasUI: true,
     agent: { kind: "main", id: "Main", name: "main", depth: 0 },
     cwd,
-    ui: { notify: (message: string) => notifications.push(message) },
+    // `confirm` is what the reinstall offer and the setup flows read; every test that reaches one
+    // answers yes (a test that needs a no overrides it for its own duration).
+    ui: { notify: (message: string) => notifications.push(message), confirm: () => true },
     setTimeout: (callback: () => void, ms: number) => setTimeout(callback, ms),
     clearTimer: (timer: unknown) => clearTimeout(timer as ReturnType<typeof setTimeout>),
   } as unknown as ExtensionContext;
@@ -209,11 +214,19 @@ function makeHost(cwd: string): Host {
     registerTool: (tool: { name: string } & StubTool) => {
       tools.set(tool.name, tool);
     },
-    // Commands are registered by the factory; no test drives them, so the stub only accepts them.
-    registerCommand: () => undefined,
+    registerCommand: (name: string, command: { handler: (args: string, ctx: ExtensionContext) => unknown }) => {
+      commands.set(name, command.handler);
+    },
   } as unknown as ExtensionAPI;
 
-  return { pi, ctx, notifications, tools, events };
+  return { pi, ctx, notifications, tools, events, commands };
+}
+
+/** Runs a registered slash command the way omp does, with the root context. */
+async function runCommand(host: Host, name: string, args = ""): Promise<void> {
+  const handler = host.commands.get(name);
+  if (!handler) throw new Error(`command ${name} is not registered`);
+  await handler(args, host.ctx);
 }
 
 async function callTool(host: Host, name: string, params: unknown = {}): Promise<AgentToolResult<unknown>> {
@@ -504,5 +517,44 @@ test("a failed connect is not cached: the next call retries after a reinstall", 
   await started;
   expect(result.isError).not.toBe(true);
   expect(loader.requests.length).toBe(1);
+  await shutdown(host);
+}, 30_000);
+
+test("/hirozen-status reports the granted permissions and the missing capabilities", async () => {
+  writeFileSync(
+    join(profileDir, "hirozen-status.json"),
+    JSON.stringify({
+      state: "dormant",
+      capabilities: { gZenWorkspaces: true, "gZenGlanceManager.openGlance": false, ReaderMode: true },
+      consent: ["read", "act"],
+      consentPending: ["network"],
+    }),
+  );
+  const before = host.notifications.length;
+  await runCommand(host, "hirozen-status");
+  expect(host.notifications.length).toBeGreaterThan(before);
+  const report = host.notifications.at(-1) ?? "";
+  expect(report).toContain("consent=read,act (asking: network)");
+  expect(report).toContain("capabilities=missing gZenGlanceManager.openGlance");
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+});
+
+test("a loader E_UNSUPPORTED renders its gloss and keeps the loader's message", async () => {
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+  const loader = new FakeLoader(profileDir).on("browser.read", frame =>
+    loader.send({
+      id: frame.id,
+      error: { code: "E_UNSUPPORTED", message: "this Zen lacks gZenViewSplitter.splitTabs; Hirozen needs an update" },
+    }),
+  );
+  const started = loader.start().catch(() => undefined);
+  const result = await callTool(host, "browser_read", { tabKey: TAB_KEY });
+  await started;
+  const text = textOf(result);
+  expect(result.isError).toBe(true);
+  expect(text.startsWith("E_UNSUPPORTED")).toBe(true);
+  expect(text).toContain("this Zen lacks gZenViewSplitter.splitTabs");
+  expect(text).toContain("update Hirozen");
+  expect((result.details as { code?: string } | undefined)?.code).toBe("E_UNSUPPORTED");
   await shutdown(host);
 }, 30_000);

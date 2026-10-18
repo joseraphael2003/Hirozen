@@ -12,6 +12,10 @@
 // Allow/Deny notice per link (state `#consent`, default Deny, persistent while connected) before any
 // gated method runs, and omp keeps its per-action approval on top.
 //
+// V3 capabilities: the Zen internals Hirozen calls are probed (most recent window) at init and at
+// ready into `capabilities` (status file + ready frame), and every call site guards per call with
+// #need() so a Zen that lacks one gets E_UNSUPPORTED naming it instead of a TypeError.
+//
 // Wire & status contract (.sisyphus/plans/hirozen-v1.md, hirozen-v1.1.md, hirozen-v2.md, shared with
 // the omp side in src/link.ts):
 //   request {id, method, params, deadline?}; success {id, result}; error {id, error: {code, message}};
@@ -49,6 +53,11 @@ import { setTimeout, clearTimeout, setInterval, clearInterval } from "resource:/
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
+  // Probed by the capability report; the reader view (child) and the downloads tool import the same
+  // modules (browser.js L80 defines ReaderMode on this URI, webdriver-bidi's browsingContext.sys.mjs
+  // L17 defines Downloads on this one).
+  ReaderMode: "moz-src:///toolkit/components/reader/ReaderMode.sys.mjs",
+  Downloads: "resource://gre/modules/Downloads.sys.mjs",
 });
 
 const LOADER_VERSION = "1";
@@ -73,6 +82,25 @@ const TAB_OPEN_GRACE_MS = 1_000; // popups from an agent-space tab are re-homed 
 const TAB_KEY_TIMEOUT_MS = 2_000; // a freshly opened tab's Zen sync id may land after addTab returns
 const TAB_KEY_POLL_MS = 50;
 const XHTML_NS = "http://www.w3.org/1999/xhtml";
+// The Zen internals Hirozen needs, by the name the report and every per-call guard use. The four
+// objects are probed for presence; every other name must be callable.
+const CAPABILITY_OBJECTS = new Set(["gZenWorkspaces", "ReaderMode", "Downloads", "Services.cookies"]);
+const CAPABILITY_NAMES = [
+  "gZenWorkspaces",
+  "gZenWorkspaces.getWorkspaces",
+  "gZenWorkspaces.moveTabToWorkspace",
+  "gZenWorkspaces.changeWorkspace",
+  "gZenWorkspaces.createAndSaveWorkspace",
+  "gZenWorkspaces.getWorkspaceFromId",
+  "gZenViewSplitter.splitTabs",
+  "gZenViewSplitter.removeTabFromGroup",
+  "gZenGlanceManager.openGlance",
+  "gZenGlanceManager.closeGlance",
+  "gBrowser.insertBrowser",
+  "ReaderMode",
+  "Downloads",
+  "Services.cookies",
+];
 // The only privileged pages a navigate may leave: an empty tab has no content to protect, and the
 // agent needs to reach the web from one (plan: navigate's exemption from E_PRIVILEGED_PAGE).
 const ABOUT_NAVIGABLE = ["about:blank", "about:newtab", "about:home"];
@@ -299,6 +327,28 @@ function isPrivilegedPage(browser) {
   );
 }
 
+// The value a capability name points at: ReaderMode/Downloads live on `lazy`, Services.* on Services,
+// every other name walks the window. A missing link is undefined, never a throw.
+function capabilityValue(name, win) {
+  if (name === "ReaderMode" || name === "Downloads") return lazy[name];
+  const parts = name.split(".");
+  if (parts[0] === "Services") return Services[parts[1]];
+  let value = win;
+  for (const part of parts) value = value == null ? undefined : value[part];
+  return value;
+}
+
+// One probed name. A lazy getter whose module cannot be imported (a Zen update moved it) is exactly
+// "this Zen does not have it", so the probe answers false rather than throwing at init.
+function capabilityPresent(name, win) {
+  try {
+    const value = capabilityValue(name, win);
+    return CAPABILITY_OBJECTS.has(name) ? value !== null && typeof value === "object" : typeof value === "function";
+  } catch {
+    return false;
+  }
+}
+
 class Loader {
   #started = false;
   #loaderSha256 = null;
@@ -317,6 +367,8 @@ class Loader {
     zenPid: null,
     state: "dormant",
     mode: null,
+    // What the running Zen exposes; filled by #probeCapabilities() at init and again at ready.
+    capabilities: {},
     updated: null,
     lastHandoff: null,
     consent: "none",
@@ -352,6 +404,7 @@ class Loader {
       loaderSha256: this.#loaderSha256,
       childSha256: this.#childSha256,
       parentSha256: this.#parentSha256,
+      capabilities: this.#probeCapabilities(),
       actorError: this.#actorError,
       consent: "none",
       consentPending: null,
@@ -359,6 +412,25 @@ class Loader {
     });
     this.#schedulePoll();
     return "started";
+  }
+
+  // Probed at init and again at ready, on the most recent window: a session can start before any
+  // window exists, and the report is a fact about the Zen that is running now.
+  #probeCapabilities() {
+    const win = Services.wm.getMostRecentWindow("navigator:browser") ?? null;
+    const capabilities = {};
+    for (const name of CAPABILITY_NAMES) capabilities[name] = capabilityPresent(name, win);
+    return capabilities;
+  }
+
+  // Every call into a probed Zen internal that would otherwise be a TypeError from calling undefined
+  // goes through this. The ready-time report was taken on one window, and windows open later (or a Zen
+  // update renames a method), so the check is per call. A missing internal is E_UNSUPPORTED naming it.
+  // Sites that already tolerate absence by design (the optional-chained space lookups, whose failure
+  // path is a documented refusal or a best-effort restore) keep their `?.` instead.
+  #need(win, name) {
+    if (capabilityPresent(name, win)) return;
+    throw new LoaderError("E_UNSUPPORTED", `this Zen lacks ${name}; Hirozen needs an update`);
   }
 
   // The Hirozen actor is registered here, at init and before the first poll: attach re-init means a
@@ -568,6 +640,7 @@ class Loader {
               zenVersion: Services.appinfo.version,
               platformVersion: Services.appinfo.platformVersion,
               zenDir: Services.dirsvc.get("GreD", Ci.nsIFile).path,
+              capabilities: this.#probeCapabilities(),
               zenPid: Services.appinfo.processID,
             });
           } else {
@@ -1552,6 +1625,7 @@ class Loader {
   // The agent space, by name: found when it exists, never created here (only zen.open creates it).
   #agentSpaceIdOf(win) {
     try {
+      this.#need(win, "gZenWorkspaces.getWorkspaces");
       const space = win.gZenWorkspaces?.getWorkspaces?.()?.find(candidate => candidate.name === AGENT_SPACE_NAME);
       return space?.uuid ?? null;
     } catch {
@@ -1567,6 +1641,7 @@ class Loader {
     let spaceId = this.#agentSpaceIdOf(win);
     if (!spaceId) {
       // dontChange=true: creating the space must not switch the user's own space (plan).
+      this.#need(win, "gZenWorkspaces.createAndSaveWorkspace");
       const created = await win.gZenWorkspaces?.createAndSaveWorkspace?.(AGENT_SPACE_NAME, undefined, true);
       // Either shape is accepted: the resolved workspace data, or a fresh name lookup (Zen returns
       // null when workspaces are disabled, and an unsynced window renames the space on creation).
@@ -1619,6 +1694,7 @@ class Loader {
       triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
       inBackground: true,
     });
+    this.#need(win, "gZenWorkspaces.moveTabToWorkspace");
     win.gZenWorkspaces.moveTabToWorkspace(tab, spaceId);
     const tabKey = await this.#waitForTabKey(tab);
     // The tab exists now, so E_DEADLINE ("nothing was done") would be a lie: only the load wait's own
@@ -1658,6 +1734,7 @@ class Loader {
       throw new LoaderError("E_LAYOUT_REFUSED", `tab ${tabKey} is pinned or essential; Zen clones those instead of moving them`);
     }
     this.#checkDeadline(req);
+    this.#need(win, "gZenWorkspaces.moveTabToWorkspace");
     win.gZenWorkspaces.moveTabToWorkspace(tab, spaceId);
     if (tab.getAttribute("zen-workspace-id") !== spaceId) {
       throw new LoaderError("E_LAYOUT_REFUSED", `Zen did not move tab ${tabKey} to space ${spaceId}`);
@@ -1692,6 +1769,7 @@ class Loader {
     }
     this.#checkDeadline(req);
     // -1 keeps Zen from selecting any of the tabs (the shipped splitTabs has no activate option).
+    this.#need(win, "gZenViewSplitter.splitTabs");
     const group = win.gZenViewSplitter.splitTabs(tabs, layout, -1);
     if (!group) {
       throw new LoaderError("E_LAYOUT_REFUSED", "Zen refused the split view");
@@ -1715,6 +1793,7 @@ class Loader {
     }
     this.#checkDeadline(req);
     // changeTab:false: the tab leaves its group without the user's selection moving.
+    this.#need(win, "gZenViewSplitter.removeTabFromGroup");
     splitter.removeTabFromGroup(tab, undefined, { changeTab: false });
     return { ok: true, tabKey: params?.tabKey };
   }
@@ -1736,6 +1815,7 @@ class Loader {
     }
     await this.#gate("act", req);
     this.#checkDeadline(req);
+    this.#need(win, "gZenGlanceManager.openGlance");
     const manager = win.gZenGlanceManager;
     if (manager?.overlay?.classList?.contains("zen-glance-overlay")) {
       throw new LoaderError("E_LAYOUT_REFUSED", "a glance is already open in this window");
@@ -1761,6 +1841,7 @@ class Loader {
         try {
           manager._animating = false;
           manager.animatingOpen = false;
+          this.#need(win, "gZenGlanceManager.closeGlance");
           manager.closeGlance();
         } catch {
           // Nothing else can be done; the timeout is still the honest answer.

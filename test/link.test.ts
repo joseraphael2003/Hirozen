@@ -16,6 +16,7 @@ const READY_FRAME: ReadyFrame = {
   parentSha256: "2".repeat(64),
   zenVersion: "1.22.3b",
   platformVersion: "142.0",
+  capabilities: { gZenWorkspaces: true, "gZenViewSplitter.splitTabs": true, ReaderMode: false },
   zenPid: 4242,
 };
 

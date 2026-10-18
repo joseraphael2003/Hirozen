@@ -85,6 +85,8 @@ const CODE_TEXT: Record<string, string> = {
   E_TAB_INACTIVE_SPACE: "that tab is in an inactive space, and Hirozen never switches spaces",
   E_TAB_UNKNOWN: "no such tab; list the tabs with zen_tabs",
   E_TAB_UNLOADED: "that tab is not loaded; open it in Zen first (Hirozen never loads tabs)",
+  E_UNSUPPORTED:
+    "the running Zen does not expose an internal Hirozen needs (a Zen update, or an older Zen); update Hirozen, or read /hirozen-status for the missing names",
   E_UNKNOWN_METHOD: "the installed loader does not support that method; run /hirozen-install, restart Zen",
 };
 
@@ -1206,11 +1208,19 @@ function renderStatusFile(profileDir: string): string {
     `mode=${status.mode ?? "?"}`,
     `zenPid=${status.zenPid ?? "?"}`,
     `consent=${status.consent ?? "?"}${status.consentPending ? ` (asking: ${status.consentPending})` : ""}`,
+    `capabilities=${renderCapabilities(status.capabilities)}`,
     `updated=${status.updated ?? "?"}`,
   ];
   if (status.lastClose) parts.push(`lastClose=${status.lastClose}`);
   if (status.actorError) parts.push(formatStatusError("actorError", status.actorError));
   return parts.join(" ");
+}
+
+/** Every capability the running Zen reported as missing, or a note that there is nothing to report. */
+function renderCapabilities(capabilities: Record<string, boolean> | undefined): string {
+  if (!capabilities) return "not reported";
+  const missing = Object.keys(capabilities).filter(name => capabilities[name] !== true);
+  return missing.length === 0 ? "all present" : `missing ${missing.join(", ")}`;
 }
 
 /** One `name=code @ at: message` field, used for the actor error. */
