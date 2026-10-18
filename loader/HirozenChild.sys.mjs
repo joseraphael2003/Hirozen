@@ -1,11 +1,12 @@
 /* Hirozen actor child: the content-process half of the loader-owned "Hirozen" JSWindowActor.
  *
- * The loader drives it with five messages and nothing else. The surface is deliberately tiny: this
+ * The loader drives it with six messages and nothing else. The surface is deliberately tiny: this
  * code runs in every content process with the system principal (doc 15.7).
  *   read     -> {json, fullLength}              the V1 page extraction, as literal module code
+ *   article  -> {url, title, byline, text, truncated}  the reader view's parse of the same document
  *   viewport -> {x, y, width, height, dpr}      the rectangle the parent feeds to drawSnapshot
  *   snapshot -> {url, title, elements, truncated} visible interactive elements with stable refs
- *   act      -> {ok, url, title}                trusted click/type/press/scroll
+ *   act      -> {ok, url, title}                trusted click/type/press/scroll/hover
  *   setFiles -> {ok, count}                     File objects onto a ref'd <input type=file>
  *
  * Gecko facts this file depends on (checked against Zen 1.22.3b / Gecko 156.0.1):
@@ -30,6 +31,9 @@ const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   event: "chrome://remote/content/shared/webdriver/Event.sys.mjs",
   keyData: "chrome://remote/content/shared/webdriver/KeyData.sys.mjs",
+  // The reader view's parser (the same URI browser.js defines; the loader probes the same name for
+  // its capability report). Loaded lazily: a Zen that cannot import it answers E_UNSUPPORTED.
+  ReaderMode: "moz-src:///toolkit/components/reader/ReaderMode.sys.mjs",
 });
 
 // The same cap V1's extraction used in the loader (TEXT_CAP): the two must agree, the marker text
@@ -67,6 +71,7 @@ const ELEMENT_SELECTOR = [
 // is an internal error. Both codes are part of the loader's contract.
 const FALLBACK_CODE = {
   read: "E_READ_FAILED",
+  article: "E_READ_FAILED",
   viewport: "E_READ_FAILED",
   snapshot: "E_READ_FAILED",
   act: "E_INTERNAL",
@@ -150,6 +155,8 @@ export class HirozenChild extends JSWindowActorChild {
       switch (name) {
         case "read":
           return this.#read();
+        case "article":
+          return await this.#article();
         case "viewport":
           return this.#viewport();
         case "snapshot":
@@ -159,7 +166,7 @@ export class HirozenChild extends JSWindowActorChild {
         case "setFiles":
           return this.#setFiles(data);
         default:
-          // The loader only ever sends the five above; anything else is a bug on the parent side.
+          // The loader only ever sends the six above; anything else is a bug on the parent side.
           throw new HirozenError("E_INTERNAL", `HirozenChild: unknown message ${name}`);
       }
     } catch (e) {
@@ -191,6 +198,41 @@ export class HirozenChild extends JSWindowActorChild {
     const json = extractPage(doc);
     const body = doc.body;
     return { json, fullLength: body ? body.innerText.length : 0 };
+  }
+
+  // The reader view, without navigating the tab: exactly the call AboutReaderChild makes
+  // (ReaderMode.parseDocument). It serializes the document and parses it in a worker, so the page is
+  // never mutated, and it answers null (synchronously) for a URI the reader refuses or for a page with
+  // no article - both are E_BAD_PARAMS here, the contract's "no article found".
+  async #article() {
+    this.#window();
+    const doc = this.document;
+    let ReaderMode = null;
+    try {
+      ReaderMode = lazy.ReaderMode;
+    } catch (e) {
+      // The module cannot be imported at all (a Zen that moved or dropped it): the capability is
+      // missing, not the article.
+      throw new HirozenError("E_UNSUPPORTED", `the reader view is not available in this Zen: ${e?.message ?? e}`);
+    }
+    if (!ReaderMode || typeof ReaderMode.parseDocument !== "function") {
+      throw new HirozenError("E_UNSUPPORTED", "the reader view is not available in this Zen");
+    }
+    const article = await ReaderMode.parseDocument(doc);
+    if (!article) {
+      throw new HirozenError("E_BAD_PARAMS", "no article found");
+    }
+    // Every page-chosen string is bounded before it reaches the agent: the text like a read (40k with
+    // the same marker), the title and byline like an element name (collapsed, 80 chars) - the article's
+    // own text is where the content is, and it is what the cap is for.
+    const { text, truncated } = capText(typeof article.textContent === "string" ? article.textContent : "");
+    return {
+      url: doc.location.href,
+      title: capName(typeof article.title === "string" && article.title ? article.title : doc.title),
+      byline: capName(typeof article.byline === "string" ? article.byline : ""),
+      text,
+      truncated,
+    };
   }
 
   // The rectangle BiDi's browsingContext.captureScreenshot uses for origin=viewport, clip=null
@@ -478,6 +520,16 @@ function nameOf(el, labels) {
 // aria-label full of tabs) becomes a single space before the cap.
 function capName(text) {
   return text.replace(/\s+/g, " ").trim().slice(0, MAX_NAME_CHARS);
+}
+
+// The read's text cap, for the reader view's article: the same 40k bound and the same marker the
+// extraction puts on a truncated page (that one keeps its own copy - its output is byte-identical to
+// V1's READ_FUNCTION and the harness proves it).
+function capText(text) {
+  const omitted = text.length - TEXT_CAP;
+  return omitted > 0
+    ? { text: text.slice(0, TEXT_CAP) + `\n\n[hirozen: truncated - ${omitted} more characters]`, truncated: true }
+    : { text, truncated: false };
 }
 
 // A page-chosen token - an explicit role, a tag name (custom elements can be any length) - is capped

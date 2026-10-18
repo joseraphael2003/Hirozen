@@ -1063,10 +1063,28 @@ class Loader {
     return { promise, cancel: () => Services.obs.removeObserver(observer, "common-dialog-loaded") };
   }
 
+  // `mode` (V3): "text" (the default) is the V1 extraction; "article" is the reader view's parse of
+  // the same document - the child runs ReaderMode.parseDocument, the page is never navigated and never
+  // mutated. Both answer through the same read permission.
   async #read(params, req) {
+    const mode = params?.mode ?? "text";
+    if (mode !== "text" && mode !== "article") {
+      throw new LoaderError("E_BAD_PARAMS", 'browser.read accepts mode as "text" or "article"');
+    }
     const { tabKey, wg } = this.#resolveTab(params?.tabKey);
     await this.#gate("read", req);
     this.#checkDeadline(req);
+    if (mode === "article") {
+      const reply = await this.#query(wg, "article", {});
+      return {
+        tabKey,
+        url: reply?.url ?? "",
+        title: reply?.title ?? "",
+        byline: reply?.byline ?? "",
+        text: typeof reply?.text === "string" ? reply.text : "",
+        truncated: reply?.truncated === true,
+      };
+    }
     const reply = await this.#query(wg, "read", {});
     const fullLength = Number.isFinite(reply?.fullLength) ? reply.fullLength : null;
     let page;
