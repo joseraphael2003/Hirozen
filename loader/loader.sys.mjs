@@ -2,11 +2,17 @@
 //
 // It never listens on a port. It polls the profile for a one-shot omp handoff file, connects OUT to
 // omp, proves a shared nonce with HMAC, and from then on serves one omp session: inventory/spaces come
-// from chrome scope, reads, snapshot, screenshots, page input and file uploads run through the Hirozen
+// from chrome scope, reads, snapshots, screenshots, page input and file uploads run through the Hirozen
 // JSWindowActor this module registers, page dialogs are answered through the tab's own dialog box, and
 // Zen layout runs through the window's gZen* - see .sisyphus/plans/hirozen-v2.md (Rev 2: WebDriver
 // BiDi is gone entirely - this module never starts a remote-control agent or opens a DevTools port,
 // and a read, a snapshot or a screenshot never shows a prompt: consent is the in-Zen notice below).
+//
+// V3 (plan hirozen-v3.md): reads, snapshots and screenshots reach a loaded tab in any space without
+// switching it (only writes keep E_TAB_INACTIVE_SPACE), `browser.read` can answer the reader view's
+// parse of the page (`mode: "article"`, still no navigation), `browser.act` can hover, and
+// `zen.loadTab` gives one unloaded tab its docshell through Zen's own restore path without selecting
+// it or moving the user's space. Consent stays the permission set below.
 //
 // Consent gate (§8.2): no method shows a Firefox prompt any more, so this loader owns an in-Zen
 // Allow/Deny notice per link (state `#consent`, default Deny, persistent while connected) before any
@@ -331,13 +337,40 @@ function tabSummary(entry) {
 function isPrivilegedPage(browser) {
   const spec = browser.currentURI.spec;
   return (
-    spec.startsWith("about:") ||
-    spec.startsWith("chrome:") ||
-    spec.startsWith("resource:") ||
+    isPrivilegedSpec(spec) ||
     browser.documentContentType === "application/pdf" ||
     browser.isSyntheticDocument ||
     browser.contentPrincipal?.spec === "resource://pdf.js/web/viewer.html"
   );
+}
+
+// The three schemes Hirozen never loads or navigates to, tested on a URL string: a pending tab has no
+// document yet, so its stored URL is all there is to judge (zen.loadTab).
+function isPrivilegedSpec(spec) {
+  return (
+    typeof spec === "string" &&
+    (spec.startsWith("about:") || spec.startsWith("chrome:") || spec.startsWith("resource:"))
+  );
+}
+
+// The URL a pending tab will load: SessionStore's lazy-tab state, which is what Zen's own restore
+// reads (SessionStore.sys.mjs getLazyTabValue -> the tab's stored url), with the browser that is not
+// bound to a docshell yet as the fallback (about:blank for a tab SessionStore never saw - which
+// isPrivilegedSpec then refuses, because a load with no known target is not one Hirozen starts).
+function lazyTabURL(win, tab) {
+  let stored = null;
+  try {
+    stored = win.SessionStore?.getLazyTabValue?.(tab, "url") ?? null;
+  } catch {
+    // A SessionStore that is not there, or a tab it does not know: the browser's URL answers.
+    stored = null;
+  }
+  if (typeof stored === "string" && stored) return stored;
+  try {
+    return tab.linkedBrowser?.currentURI?.spec ?? "";
+  } catch {
+    return "";
+  }
 }
 
 // The value a capability name points at: ReaderMode/Downloads live on `lazy`, Services.* on Services,
@@ -802,6 +835,8 @@ class Loader {
         return this.#zenUnsplit(params, req);
       case "zen.glance":
         return this.#zenGlance(params, req);
+      case "zen.loadTab":
+        return this.#zenLoadTab(params, req);
       default:
         throw new LoaderError("E_UNKNOWN_METHOD", `unknown method ${msg.method}`);
     }
@@ -1911,6 +1946,105 @@ class Loader {
     return { tabKey: await this.#waitForTabKey(tab) };
   }
 
+  // ---------------------------------------------------------------- lazy tabs
+
+  // zen.loadTab: gives one unloaded tab its docshell where it is. No navigation (the stored URL is
+  // Zen's own restore path, never a load this loader starts), no space switch, no selection change,
+  // no new tab. Every refusal is decided before the gate, so nobody is asked about a call that cannot
+  // run:
+  //  - an unknown/blank key is E_TAB_UNKNOWN and a private window's tab is E_PRIVATE (a private tab
+  //    key must resolve to the reason, not to "unknown");
+  //  - an already loaded tab, a pinned tab and an essential tab are E_BAD_PARAMS. Zen's
+  //    onTabBrowserInserted (ZenSpaceManager, window listener) stamps the *active* workspace onto a
+  //    tab that has no zen-workspace-id - which pinned and essential tabs never have - so inserting
+  //    one would mark the user's current space onto it for good;
+  //  - a stored about:/chrome:/resource: URL is E_PRIVILEGED_PAGE, read from SessionStore's lazy-tab
+  //    state (what Zen's own restore reads) with the unbound browser's currentURI as the fallback.
+  async #zenLoadTab(params, req) {
+    const tabKey = params?.tabKey;
+    if (typeof tabKey !== "string" || !tabKey) {
+      throw new LoaderError("E_TAB_UNKNOWN", "a tabKey from zen.inventory is required");
+    }
+    const entry = collectTabs().find(candidate => candidate.key === tabKey);
+    if (!entry) {
+      throw new LoaderError("E_TAB_UNKNOWN", `no tab with key ${tabKey}; list tabs with zen.inventory`);
+    }
+    if (entry.private) {
+      throw new LoaderError("E_PRIVATE", `tab ${tabKey} lives in a private window; Hirozen never touches private windows`);
+    }
+    const tab = entry.tab;
+    const win = entry.window;
+    if (entry.loaded) {
+      throw new LoaderError("E_BAD_PARAMS", `tab ${tabKey} is already loaded; zen.loadTab loads an unloaded tab (see zen.inventory's lazy flag)`);
+    }
+    if (tab.pinned) {
+      throw new LoaderError("E_BAD_PARAMS", `tab ${tabKey} is pinned; Zen would stamp the space you are looking at onto it for good`);
+    }
+    if (tab.getAttribute("zen-essential") === "true") {
+      throw new LoaderError("E_BAD_PARAMS", `tab ${tabKey} is essential; Zen keeps essential tabs out of every space's restore path`);
+    }
+    const stored = lazyTabURL(win, tab);
+    if (isPrivilegedSpec(stored)) {
+      throw new LoaderError("E_PRIVILEGED_PAGE", `tab ${tabKey} holds a privileged URL (${stored}); Hirozen never loads privileged pages`);
+    }
+    // A missing internal refuses before the prompt, like the actor check in #gate.
+    this.#need(win, "gBrowser.insertBrowser");
+    await this.#gate("act", req);
+    this.#checkDeadline(req);
+    // The load bound is measured from here, after the gate (see #zenOpen): the time a person spends on
+    // the Allow/Deny notice is theirs and must not be charged to the page load.
+    const started = Date.now();
+    // The user's view, captured before anything is inserted: the selection and the space are restored
+    // separately (a switch Zen started can land without the selection having moved).
+    const previousSelected = win.gBrowser?.selectedTab ?? null;
+    const userSpaceId = win.gZenWorkspaces?.activeWorkspace ?? null;
+    win.gBrowser.insertBrowser(tab);
+    // Zen's own restore path for a pending tab (ZenViewSplitter.activateSplitView): insert the
+    // browser, then hand the tab to SessionStore with this event on the tab container - kept
+    // non-bubbling exactly as Zen does, so it never reaches tabbrowser's own split-view tracking.
+    win.gBrowser.tabContainer.dispatchEvent(
+      new win.CustomEvent("TabSplitViewActivate", { detail: { tabs: [tab] } })
+    );
+    // The browser the tab now has (a pending tab's substitute properties are gone after the insert),
+    // falling back to the copy collectTabs saw.
+    const browser = tab.linkedBrowser ?? entry.browser;
+    const bound = Math.max(1_000, NAVIGATE_TIMEOUT_MS - (Date.now() - started));
+    let landed = null;
+    try {
+      landed = await this.#waitForLoad(tabKey, browser, {
+        previous: "about:blank",
+        bound,
+        what: `zen.loadTab's page (tab ${tabKey}, already inserted and restored, and still usable)`,
+      });
+    } finally {
+      // The tab exists now, so a failed load may not leave the user somewhere else.
+      this.#restoreLoadedView(win, previousSelected, userSpaceId);
+    }
+    return { tabKey, url: landed.url, title: tab.label ?? "" };
+  }
+
+  // Puts the user's view back after a pending tab was inserted. The selection first: #restoreUserView
+  // only acts on a popup it re-homed, and this tab is not one - so the space is checked here on its
+  // own, with the same call Zen's own onLocationChange makes, and only ever to the space captured
+  // before the insert. Both are best-effort: a Zen that refuses leaves the user where they are.
+  #restoreLoadedView(win, previousSelected, userSpaceId) {
+    if (previousSelected && !previousSelected.closed && win.gBrowser?.selectedTab !== previousSelected) {
+      try {
+        win.gBrowser.selectedTab = previousSelected;
+      } catch {
+        // The previous tab went away in the same breath: there is nothing left to restore.
+      }
+    }
+    const active = win.gZenWorkspaces?.activeWorkspace;
+    if (userSpaceId && active && active !== userSpaceId) {
+      try {
+        const space = win.gZenWorkspaces.getWorkspaceFromId?.(userSpaceId) ?? null;
+        if (space) win.gZenWorkspaces.changeWorkspace?.(space);
+      } catch {
+        // A Zen that refuses the switch leaves the user where they are; nothing else to try here.
+      }
+    }
+  }
 
   #emit(name, data) {
     this.#client?.send({ type: "event", name, data });
