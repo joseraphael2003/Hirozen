@@ -695,6 +695,102 @@ test("zen_load_tab loads a lazy tab and names the restored page", async () => {
   await started;
 }, 30_000);
 
+test("browser_cookies and browser_storage send the agreed frames and render them", async () => {
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+  const callSpy = spyOn(ZenLink.prototype, "call");
+  try {
+    const loader = new FakeLoader(profileDir).on("zen.inventory", frame => loader.reply(frame, INVENTORY));
+    loader.on("network.cookies", frame =>
+      loader.reply(frame, {
+        tabKey: TAB_KEY,
+        url: "https://example.com/",
+        cookies: [
+          {
+            name: "sid",
+            value: "<8 chars>",
+            domain: "example.com",
+            path: "/",
+            expires: 1_800_000_000_000,
+            secure: true,
+            httpOnly: true,
+            sameSite: "lax",
+          },
+          { name: "theme", value: "dark", domain: "example.com", path: "/", expires: null, secure: false, httpOnly: false, sameSite: "unspecified" },
+        ],
+        truncated: false,
+      }),
+    );
+    loader.on("network.storage", frame =>
+      loader.reply(frame, {
+        tabKey: TAB_KEY,
+        url: "https://example.com/",
+        kind: "local",
+        entries: [
+          { key: "token", value: "<9 chars>" },
+          { key: "theme", value: "dark" },
+        ],
+        truncated: false,
+      }),
+    );
+    const started = loader.start().catch(() => undefined);
+
+    // 1. Nothing granted yet: a network call carries the same person wait as an act (15 s + 125 s).
+    expect((await callTool(host, "zen_tabs")).isError).not.toBe(true);
+    expect((await loader.nextRequest()).method).toBe("zen.inventory"); // the frame that call leaves queued
+    const cookiesCall = callTool(host, "browser_cookies", { tabKey: TAB_KEY });
+    const cookiesRequest = await loader.nextRequest();
+    expect(cookiesRequest.method).toBe("network.cookies");
+    expect(cookiesRequest.params).toEqual({ tabKey: TAB_KEY }); // no reveal unless asked for
+    expect(frameDeadline(cookiesRequest) - Date.now()).toBeGreaterThan(125_000);
+    const cookiesText = textOf(await cookiesCall);
+    expect(cookiesText).toContain("https://example.com/");
+    expect(cookiesText).toContain("sid=<8 chars>");
+    expect(cookiesText).toContain("expires=2027-01-15T08:00:00.000Z");
+    expect(cookiesText).toContain("flags=secure,httpOnly,sameSite=lax");
+    expect(cookiesText).toContain("theme=dark");
+    expect(cookiesText).toContain("expires=session");
+
+    // 2. Reading a value itself is a different decision: it prompts, and the wire says so.
+    const cookiesTool = host.tools.get("browser_cookies");
+    if (!cookiesTool) throw new Error("browser_cookies is not registered");
+    const plain = typeof cookiesTool.approval === "function" ? cookiesTool.approval({ tabKey: TAB_KEY }) : cookiesTool.approval;
+    expect(plain).toBe("read");
+    const reveal = typeof cookiesTool.approval === "function" ? cookiesTool.approval({ tabKey: TAB_KEY, reveal: true }) : cookiesTool.approval;
+    expect(reveal).toMatchObject({ tier: "exec", policy: "prompt" });
+    const revealDetails = cookiesTool.formatApprovalDetails?.({ tabKey: TAB_KEY, reveal: true });
+    expect(Array.isArray(revealDetails) ? revealDetails.join("\n") : String(revealDetails ?? "")).toContain("WITH");
+
+    // 3. The Allow for network has to reach the plugin before the next call, so that call is already
+    //    on the base budget: a round trip after the event is what proves the event was handled.
+    loader.send({ type: "event", name: "consent.granted", data: { granted: ["network"] } });
+    expect((await callTool(host, "zen_tabs")).isError).not.toBe(true);
+    expect((await loader.nextRequest()).method).toBe("zen.inventory");
+    const storageCall = callTool(host, "browser_storage", { tabKey: TAB_KEY, kind: "local" });
+    const storageRequest = await loader.nextRequest();
+    expect(storageRequest.method).toBe("network.storage");
+    expect(storageRequest.params).toEqual({ tabKey: TAB_KEY, kind: "local" });
+    expect(callSpy.mock.calls.at(-1)?.[2]?.timeoutMs).toBe(15_000);
+    const storageText = textOf(await storageCall);
+    expect(storageText).toContain("token=<9 chars>");
+    expect(storageText).toContain("theme=dark");
+
+    const storageTool = host.tools.get("browser_storage");
+    if (!storageTool) throw new Error("browser_storage is not registered");
+    const storageSchema = toolSchema(storageTool);
+    expect(storageSchema.safeParse({ tabKey: TAB_KEY, kind: "session" }).success).toBe(true);
+    expect(storageSchema.safeParse({ tabKey: TAB_KEY, kind: "indexeddb" }).success).toBe(true);
+    expect(storageSchema.safeParse({ tabKey: TAB_KEY, kind: "cookie" }).success).toBe(false);
+    expect(storageSchema.safeParse({ tabKey: TAB_KEY, kind: "local", reveal: true }).success).toBe(true);
+    expect(storageSchema.safeParse({ tabKey: TAB_KEY, kind: "local", reveal: "yes" }).success).toBe(false);
+
+
+    await shutdown(host);
+    await started;
+  } finally {
+    callSpy.mockRestore();
+  }
+}, 30_000);
+
 test("the reinstall offer names /hirozen-attach only when that Zen is running", async () => {
   // A Zen update wipes the loader while zen.exe is still there: the offer fires on session_start. The
   // attach hint needs a live process, and this install folder (a temp dir) has none, so the notice

@@ -139,6 +139,24 @@ type ZenSplit = { groupId?: string };
 type ZenGlance = { tabKey: string };
 /** zen_load_tab's reply: the page the lazy tab restored to (its real URL, never about:blank). */
 type ZenLoadTab = { tabKey: string; url: string; title: string };
+/**
+ * The network replies (`network.*`). Values the loader considers sensitive arrive redacted as
+ * `"<n chars>"` unless the call asked for `reveal`, and the headers of a recorded request have
+ * `cookie`, `set-cookie`, `authorization` and `proxy-authorization` replaced by `"<redacted>"`.
+ */
+type ZenCookie = {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  expires: number | null;
+  secure: boolean;
+  httpOnly: boolean;
+  sameSite: string | null;
+};
+type ZenCookies = { tabKey: string; url: string; cookies: ZenCookie[]; truncated: boolean };
+type ZenStorageEntry = { key: string; value: string | null };
+type ZenStorage = { tabKey: string; url: string; kind: string; entries: ZenStorageEntry[]; truncated: boolean };
 
 /**
  * The parsed arguments of the V2 tools. omp validates every call against the tool's `parameters`
@@ -159,6 +177,9 @@ type ActParams = {
 };
 type UploadParams = { tabKey: string; ref: string; paths: string[] };
 type DialogParams = { tabKey: string; accept: boolean; text?: string };
+/** browser_cookies/browser_storage: `reveal` asks for the values themselves instead of `<n chars>`. */
+type CookiesParams = { tabKey: string; reveal?: boolean };
+type StorageParams = { tabKey: string; kind: string; reveal?: boolean };
 type MoveParams = { tabKey: string; spaceId: string };
 type SplitParams = { tabKeys: string[]; layout: string };
 
@@ -899,6 +920,112 @@ async function runBrowserDialog(
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Network (T9): the tab's cookies and its page storage
+// ---------------------------------------------------------------------------------------------
+//
+// Every call here runs under the loader's `network` permission and its own in-Zen Allow/Deny prompt,
+// so a call that still has to ask carries the person wait (`callBudget("network")`, exactly like act).
+// The loader has already redacted what matters: cookie and storage values are `"<n chars>"` unless the
+// call asked for `reveal`, and a recorded request's headers never carry a live cookie or authorization
+// value. This side only renders what came back.
+
+/** `flags=secure,httpOnly,sameSite=lax` for the cookie attributes that are set, or "" for none. */
+function cookieFlags(cookie: ZenCookie): string {
+  const flags = [
+    cookie.secure ? "secure" : "",
+    cookie.httpOnly ? "httpOnly" : "",
+    cookie.sameSite && cookie.sameSite !== "unspecified" ? `sameSite=${cookie.sameSite}` : "",
+  ].filter(flag => flag !== "");
+  return flags.length === 0 ? "" : ` flags=${flags.join(",")}`;
+}
+
+function renderCookies(reply: ZenCookies): string {
+  const lines = [pageHeader(reply.url, `${reply.cookies.length} cookie(s) for tab ${reply.tabKey}`)];
+  for (const cookie of reply.cookies) {
+    const expires = cookie.expires === null ? "session" : new Date(cookie.expires).toISOString();
+    lines.push(
+      `- ${cookie.name}=${cookie.value} domain=${cookie.domain} path=${cookie.path} expires=${expires}${cookieFlags(cookie)}`,
+    );
+  }
+  if (reply.truncated) lines.push("", "The list stops at 64 KB of cookie data.");
+  return lines.join("\n");
+}
+
+function renderStorage(reply: ZenStorage): string {
+  const lines = [pageHeader(reply.url, `${reply.entries.length} ${reply.kind} entry(s) for tab ${reply.tabKey}`)];
+  // IndexedDB answers database names only, which the loader sends with a null value.
+  for (const entry of reply.entries) lines.push(entry.value === null ? `- ${entry.key}` : `- ${entry.key}=${entry.value}`);
+  if (reply.truncated) lines.push("", "The list stops at 64 KB of storage data.");
+  return lines.join("\n");
+}
+
+async function runBrowserCookies(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  params: CookiesParams,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  // `reveal` is only ever sent when asked for: the loader answers "<n chars>" otherwise, and its own
+  // prompt (and this plugin's approval) is what a reveal costs.
+  const wire = params.reveal === true ? { tabKey: params.tabKey, reveal: true } : { tabKey: params.tabKey };
+  try {
+    const reply = await access.link.call<ZenCookies>("network.cookies", wire, {
+      timeoutMs: callBudget("network"),
+      signal,
+    });
+    rememberTab(params.tabKey, reply);
+    return {
+      content: [{ type: "text", text: renderCookies(reply) }],
+      details: {
+        tabKey: reply.tabKey,
+        url: reply.url,
+        cookies: reply.cookies.length,
+        revealed: params.reveal === true,
+        truncated: reply.truncated,
+      },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+
+async function runBrowserStorage(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  params: StorageParams,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+  const access = await requireLink(pi, ctx);
+  if ("failure" in access) return fail(access.failure);
+  const wire =
+    params.reveal === true
+      ? { tabKey: params.tabKey, kind: params.kind, reveal: true }
+      : { tabKey: params.tabKey, kind: params.kind };
+  try {
+    const reply = await access.link.call<ZenStorage>("network.storage", wire, {
+      timeoutMs: callBudget("network"),
+      signal,
+    });
+    rememberTab(params.tabKey, reply);
+    return {
+      content: [{ type: "text", text: renderStorage(reply) }],
+      details: {
+        tabKey: reply.tabKey,
+        url: reply.url,
+        kind: reply.kind,
+        entries: reply.entries.length,
+        revealed: params.reveal === true,
+        truncated: reply.truncated,
+      },
+    };
+  } catch (error) {
+    return fail(describeError(error));
+  }
+}
+
 /**
  * `zen.loadTab` answers with the page the lazy tab restored to; the loader has already put the user's
  * selected tab and space back, so the reply only has to name what loaded.
@@ -1055,6 +1182,8 @@ async function runZenGlance(
 
 /** The per-action approval omp enforces before an act-tier tool runs. */
 type ExecApproval = { tier: "exec"; policy: "prompt"; reason: string };
+/** What a tool's `approval` may answer: a bare tier (a plain read), or a tier with its own policy. */
+type ApprovalDecision = "read" | ExecApproval;
 
 /** The details half of the prompt, as omp reads it (`AgentTool.formatApprovalDetails`). */
 type ApprovalDetails = (args: unknown) => string[];
@@ -1069,6 +1198,28 @@ function clipForPrompt(text: string): string {
 /** Every act-tier tool prompts on every call, even in omp's default yolo mode (S3). */
 function execApproval(reason: string): () => ExecApproval {
   return () => ({ tier: "exec", policy: "prompt", reason });
+}
+
+/** browser_cookies: a read, unless the call asks for the cookie values themselves. */
+function cookiesApproval(args: unknown): ApprovalDecision {
+  if (approvalArgs<CookiesParams>(args).reveal !== true) return "read";
+  return {
+    tier: "exec",
+    policy: "prompt",
+    reason: "browser_cookies with reveal:true returns the cookie values themselves.",
+  };
+}
+
+/** browser_storage: a read, unless the call asks for the stored values themselves (IndexedDB answers
+ *  database names only, so reveal changes nothing there). */
+function storageApproval(args: unknown): ApprovalDecision {
+  const params = approvalArgs<StorageParams>(args);
+  if (params.reveal !== true || params.kind === "indexeddb") return "read";
+  return {
+    tier: "exec",
+    policy: "prompt",
+    reason: "browser_storage with reveal:true returns the stored values themselves.",
+  };
 }
 
 /** The parsed arguments of a tool, recovered at the approval boundary: omp validated them against the
@@ -1105,6 +1256,26 @@ function actApprovalDetails(args: unknown): string[] {
       lines.push(`action: ${params.action}`);
   }
   return lines;
+}
+
+/** browser_cookies: the tab, and whether the cookie values themselves are shown. */
+function cookiesApprovalDetails(args: unknown): string[] {
+  const params = approvalArgs<CookiesParams>(args);
+  return [
+    `tab: ${describeTab(params.tabKey)}`,
+    params.reveal === true
+      ? "action: read this tab's cookies WITH their values"
+      : "action: read this tab's cookies (values redacted)",
+  ];
+}
+
+/** browser_storage: the tab, the store, and whether the stored values themselves are shown. */
+function storageApprovalDetails(args: unknown): string[] {
+  const params = approvalArgs<StorageParams>(args);
+  return [
+    `tab: ${describeTab(params.tabKey)}`,
+    `action: read this tab's ${params.kind} storage${params.reveal === true ? " WITH its values" : " (values redacted)"}`,
+  ];
 }
 
 /** browser_upload: which file input, and every path Zen is about to read. */
@@ -1568,6 +1739,23 @@ function toolParameters(builder: ExtensionAPI["zod"]) {
       ref: builder.string().describe("ref of an <input type=file> from browser_snapshot"),
       paths: builder.array(builder.string()).describe("files to set on the input; relative paths resolve against the omp cwd"),
     }),
+    cookies: builder.object({
+      tabKey: tabKey(),
+      reveal: builder
+        .boolean()
+        .optional()
+        .describe('return the cookie values themselves instead of "<n chars>" (needs its own approval)'),
+    }),
+    storage: builder.object({
+      tabKey: tabKey(),
+      kind: builder
+        .enum(["local", "session", "indexeddb"])
+        .describe("which storage to read; indexeddb lists database names only"),
+      reveal: builder
+        .boolean()
+        .optional()
+        .describe('return the stored values themselves instead of "<n chars>" (needs its own approval)'),
+    }),
     dialog: builder.object({
       tabKey: tabKey(),
       accept: builder.boolean().describe("true accepts the dialog, false dismisses it"),
@@ -1915,6 +2103,50 @@ export default function hirozen(pi: ExtensionAPI): void {
         ) => runZenGlance(pi, ctx, params.url, signal),
       },
       glanceApprovalDetails,
+    ),
+  );
+
+  pi.registerTool(
+    withApprovalDetails(
+      {
+        name: "browser_cookies",
+        label: "Read cookies",
+        description:
+          'Read the cookies Zen would send to one tab\'s top-level site (name, domain, path, expiry, flags) under the loader\'s network permission. Values come back as "<n chars>" unless reveal:true, which needs its own approval. Read-only: the tab is never loaded, activated or navigated.',
+        parameters: parameters.cookies,
+        approval: cookiesApproval,
+        loadMode: "essential",
+        execute: (
+          _toolCallId: string,
+          params: CookiesParams,
+          signal: AbortSignal | undefined,
+          _onUpdate: unknown,
+          ctx: ExtensionContext,
+        ) => runBrowserCookies(pi, ctx, params, signal),
+      },
+      cookiesApprovalDetails,
+    ),
+  );
+
+  pi.registerTool(
+    withApprovalDetails(
+      {
+        name: "browser_storage",
+        label: "Read page storage",
+        description:
+          'Read one tab\'s page storage (localStorage, sessionStorage, or IndexedDB database names) under the loader\'s network permission. Values come back as "<n chars>" unless reveal:true, which needs its own approval. Read-only: nothing is written.',
+        parameters: parameters.storage,
+        approval: storageApproval,
+        loadMode: "essential",
+        execute: (
+          _toolCallId: string,
+          params: StorageParams,
+          signal: AbortSignal | undefined,
+          _onUpdate: unknown,
+          ctx: ExtensionContext,
+        ) => runBrowserStorage(pi, ctx, params, signal),
+      },
+      storageApprovalDetails,
     ),
   );
 
