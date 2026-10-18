@@ -148,10 +148,13 @@ const CLOSE_STOPPED = 4010;
 const CLOSE_HEARTBEAT = 4012;
 
 class LoaderError extends Error {
-  constructor(code, message) {
+  // `url` (V3): an optional fact a refusal carries to the plugin - E_GRANT_STALE hands over the tab's
+  // live URL so the plugin's tab cache can catch up instead of looping on the same stale origin.
+  constructor(code, message, url = null) {
     super(message);
     this.name = "LoaderError";
     this.code = code;
+    this.url = url;
   }
 }
 
@@ -408,6 +411,15 @@ function capabilityPresent(name, win) {
   } catch {
     return false;
   }
+}
+
+// The origin of a URI as `new URL(u).origin` spells it: scheme://host[:port], with the default port
+// omitted (nsIURI.port is -1 when the URL did not carry one). Anything that is not http(s) has no
+// origin a grant could match, so the comparison there is always a refusal.
+function originOf(uri) {
+  if (!uri || (uri.scheme !== "http" && uri.scheme !== "https")) return null;
+  const port = Number.isInteger(uri.port) && uri.port > 0 ? `:${uri.port}` : "";
+  return `${uri.scheme}://${uri.host}${port}`;
 }
 
 // The tab a channel belongs to: the top-level browsing context's browserId. 0 means "no tab" - a
@@ -801,8 +813,13 @@ class Loader {
           e => ws.send({
             id: msg.id,
             // Every failure path throws a LoaderError; anything else is a loader bug, reported as
-            // E_INTERNAL with its real message.
-            error: { code: e instanceof LoaderError ? e.code : "E_INTERNAL", message: `${e instanceof LoaderError ? "" : "internal error: "}${e?.message ?? e}` },
+            // E_INTERNAL with its real message. `url` is a fact a refusal may carry (E_GRANT_STALE
+            // hands the plugin the tab's live URL); no other error sets it.
+            error: {
+              code: e instanceof LoaderError ? e.code : "E_INTERNAL",
+              message: `${e instanceof LoaderError ? "" : "internal error: "}${e?.message ?? e}`,
+              ...(e instanceof LoaderError && e.url ? { url: e.url } : {}),
+            },
           })
         );
       },
@@ -1350,6 +1367,17 @@ class Loader {
     if (action === "navigate") return this.#navigate(params, req);
 
     const { tabKey, tab, browser, wg } = this.#resolveTab(params?.tabKey, { write: true });
+    // A grant covers a tab or an origin (T12). The plugin's tab cache can be stale, so an origin
+    // grant sends `grantOrigin` with the act: the tab must still be on that origin. The check is
+    // before the gate and before anything reaches the page - a stale grant is a refusal, never a
+    // silent prompt - and it carries the tab's live URL so the plugin can fix its cache and retry.
+    const grantOrigin = params?.grantOrigin;
+    if (typeof grantOrigin === "string" && grantOrigin) {
+      const origin = originOf(browser.currentURI);
+      if (origin !== grantOrigin) {
+        throw new LoaderError("E_GRANT_STALE", "the tab left the granted site; retry to be asked", browser.currentURI.spec);
+      }
+    }
     await this.#gate("act", req);
     this.#checkDeadline(req);
     const payload = { action, ref, text, key, dy };
