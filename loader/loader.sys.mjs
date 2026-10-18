@@ -920,7 +920,12 @@ class Loader {
   // tab, its browser and the actor's WindowGlobalParent. Same five codes and order as V1's
   // #resolveTarget. What a method needs a tab *for* is no longer resolved here: uploads and dialogs act
   // through the actor and the tab's own dialog box, so neither needs a WebDriver context.
-  #resolveTab(tabKey, { allowAbout = false } = {}) {
+  //
+  // `write` (V3): a loaded tab in an inactive space is readable - read, snapshot and screenshot reach it
+  // without switching spaces - while everything that changes the page (act, navigate, upload, dialog)
+  // keeps E_TAB_INACTIVE_SPACE, because that is the call that would need the space to be the one the
+  // user is looking at. The agent-space exemption below covers both.
+  #resolveTab(tabKey, { allowAbout = false, write = false } = {}) {
     if (typeof tabKey !== "string" || !tabKey) {
       throw new LoaderError("E_TAB_UNKNOWN", "a tabKey from zen.inventory is required");
     }
@@ -935,8 +940,8 @@ class Loader {
     // reason, not because it is lazy. Deviation 3 narrows the rule: every tab in the agent space stays
     // reachable while that space is inactive - reads, snapshot, input and screenshots (drawSnapshot
     // renders a tab of an inactive space correctly, verified live) - while every other inactive-space
-    // tab keeps E_TAB_INACTIVE_SPACE.
-    if (!this.#isInActiveSpace(entry)) {
+    // tab keeps E_TAB_INACTIVE_SPACE for writes.
+    if (write && !this.#isInActiveSpace(entry)) {
       const agentSpaceId = this.#agentSpaceIdOf(entry.window);
       const inAgentSpace = !!agentSpaceId && entry.tab.getAttribute("zen-workspace-id") === agentSpaceId;
       if (!inAgentSpace) {
@@ -1119,7 +1124,18 @@ class Loader {
     }
     const scale = browser.browsingContext?.overrideDPPX || win.devicePixelRatio || 1;
     const rect = new win.DOMRect(vp.x, vp.y, vp.width, vp.height);
-    const snapshot = await wg.drawSnapshot(rect, scale, "rgb(255,255,255)");
+    let snapshot;
+    try {
+      snapshot = await wg.drawSnapshot(rect, scale, "rgb(255,255,255)");
+    } catch (e) {
+      // A hidden tab (one in an inactive space) is rendered correctly by drawSnapshot - verified live
+      // - so a failure here is either that one Gecko case or a real read failure. The hidden case gets
+      // the refusal that names the space; anything else stays a read failure with Gecko's message.
+      if (tab.hidden) {
+        throw new LoaderError("E_TAB_INACTIVE_SPACE", `screenshot unavailable for hidden tabs (tab ${tabKey} is in an inactive space): ${e?.message ?? e}`);
+      }
+      throw new LoaderError("E_READ_FAILED", `browser.screenshot could not render tab ${tabKey}: ${e?.message ?? e}`);
+    }
     try {
       const canvas = win.document.createElementNS(XHTML_NS, "canvas");
       canvas.width = Math.round(vp.width * scale);
@@ -1196,7 +1212,7 @@ class Loader {
     }
     if (action === "navigate") return this.#navigate(params, req);
 
-    const { tabKey, tab, browser, wg } = this.#resolveTab(params?.tabKey);
+    const { tabKey, tab, browser, wg } = this.#resolveTab(params?.tabKey, { write: true });
     await this.#gate("act", req);
     this.#checkDeadline(req);
     const payload = { action, ref, text, key, dy };
@@ -1238,7 +1254,7 @@ class Loader {
     if (scheme !== "http" && scheme !== "https") {
       throw new LoaderError("E_BAD_PARAMS", "browser.act navigate accepts http(s) URLs only");
     }
-    const { tabKey, tab, browser } = this.#resolveTab(params?.tabKey, { allowAbout: true });
+    const { tabKey, tab, browser } = this.#resolveTab(params?.tabKey, { allowAbout: true, write: true });
     await this.#gate("act", req);
     this.#checkDeadline(req);
     const watcher = this.#watchAgentTabOpens(tab, browser);
@@ -1339,7 +1355,7 @@ class Loader {
     if (!Array.isArray(paths) || paths.length === 0 || paths.some(path => !isAbsolutePath(path))) {
       throw new LoaderError("E_BAD_PARAMS", "browser.upload needs paths as a non-empty array of absolute file paths");
     }
-    const { tabKey, tab, browser, wg } = this.#resolveTab(params?.tabKey);
+    const { tabKey, tab, browser, wg } = this.#resolveTab(params?.tabKey, { write: true });
     await this.#gate("act", req);
     this.#checkDeadline(req);
     const files = [];
@@ -1412,7 +1428,7 @@ class Loader {
     if (text !== undefined && typeof text !== "string") {
       throw new LoaderError("E_BAD_PARAMS", "browser.dialog accepts text as a string only");
     }
-    const { tabKey, tab, browser } = this.#resolveTab(params?.tabKey);
+    const { tabKey, tab, browser } = this.#resolveTab(params?.tabKey, { write: true });
     // Looked up before the gate: prompting the user about a tab that has no dialog would be noise.
     if (!this.#findPrompt(browser)) {
       throw new LoaderError("E_NO_DIALOG", `tab ${tabKey} has no open prompt; act on the page and watch for a dialog first`);
