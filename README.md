@@ -2,7 +2,7 @@
 
 An [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) plugin that lets the omp agent work in your running [Zen](https://github.com/zen-browser/desktop) browser. Think "Gemini in Chrome", but for Zen and driven by the models you already use in omp.
 
-The agent can list your tabs and spaces, read pages, take screenshots, click, type, navigate, upload files, answer page dialogs, and arrange tabs with Zen's own layout features (spaces, split view, glance).
+The agent can list your tabs and spaces, read pages (or just the article), take screenshots, click, type, hover, navigate, load unloaded tabs, upload files, read cookies, storage, downloads and request headers, answer page dialogs, and arrange tabs with Zen's own layout features (spaces, split view, glance).
 
 > **Status:** 0.3.0. Verified on Windows on a Zen 1.22.3b test install, with a short check on the everyday Zen 1.23.3b. See [CHANGELOG.md](CHANGELOG.md).
 
@@ -39,7 +39,7 @@ omp + Hirozen plugin  <── authenticated loopback WebSocket ──  Hirozen l
 | `browser_downloads` | Lists recent downloads. |
 | `browser_network_start` / `_read` / `_stop` | Records one tab's requests (URL, status, timing, headers; cookie and auth headers redacted). |
 
-Every tool except `zen_tabs`, `zen_spaces`, `browser_read`, `browser_screenshot` and `browser_snapshot` asks for omp approval first, showing the tab and the target (for example `button "Save"`). Tools run only in the interactive root omp session. Subagents and headless runs are refused.
+These run without an omp prompt: `zen_tabs`, `zen_spaces`, `browser_read`, `browser_screenshot`, `browser_snapshot`, `browser_downloads`, `browser_network_read` and `browser_network_stop`, plus `browser_cookies` and `browser_storage` unless `reveal:true`. `browser_act` clicks, typing, keys, scrolling and hover skip the prompt while a `/hirozen-grant` covers them. Every other call asks for omp approval first, showing the tab and the target (for example `button "Save"`). All of them still need the matching permission in Zen. Tools run only in the interactive root omp session. Subagents and headless runs are refused.
 
 ## Commands
 
@@ -49,8 +49,8 @@ Every tool except `zen_tabs`, `zen_spaces`, `browser_read`, `browser_screenshot`
 | `/hirozen-install` | Installs or verifies the autoconfig, loader and actor in the configured Zen install. Restart Zen once afterwards. |
 | `/hirozen-attach` | Loads Hirozen into an already-running Zen without a restart, through a one-time debugger connection. |
 | `/hirozen-connect` | Reconnects after you pressed Stop in Zen. |
-| `/hirozen-grant` | `/hirozen-grant <tabKey|origin> <minutes 1-60>` lets clicks, typing, keys, scrolling and hover on that site run without omp prompts; `/hirozen-grant clear` ends it. Navigation and everything else still ask. |
-| `/hirozen-status` | Shows the configured Zen and where that setting came from, plus install, link and consent state. |
+| `/hirozen-grant` | `/hirozen-grant <tabKey|origin> <minutes 1-60>` lets clicks, typing, keys, scrolling and hover run without omp prompts: a tabKey covers that one tab while it stays on the site it was on, an origin covers every tab on that site; `/hirozen-grant clear` ends it. Navigation and everything else still ask. |
+| `/hirozen-status` | Shows the configured Zen and where that setting came from, plus install, link, consent, active grants and any Zen internals the loader could not find. |
 
 ## Setup
 
@@ -84,7 +84,7 @@ HIROZEN_PROFILE=<full path to the Zen profile folder>
 ## Safety
 
 - **Consent in Zen.** Permissions are asked separately in Zen: read pages, act on pages (clicks, typing, uploads, dialogs, layout, tab loading; includes read), and network data (cookies, storage, downloads, request headers). A call asks only for what is not granted yet. Deny returns `E_DENIED`, and an unanswered prompt is denied after 120 s. The terminal tells you when Zen is waiting for you.
-- **Approval in omp.** Each action is also approved in omp, with the tab and target shown, unless a `/hirozen-grant` you gave covers that tab's site. A grant stops covering a tab that has moved to another site (`E_GRANT_STALE`).
+- **Approval in omp.** Each action is also approved in omp, with the tab and target shown, unless a `/hirozen-grant` you gave covers that tab or site. A grant stops covering a tab that has moved to another site (`E_GRANT_STALE`).
 - **Network data is redacted.** Cookie and storage values and cookie/authorization headers are hidden unless you approve a reveal. No response bodies, no blocking.
 - **Visible.** While connected, every Zen window shows a notice naming the omp process and what it may do, with a **Stop** button. Stop is sticky until you run `/hirozen-connect`.
 - **Your view stays yours.** `zen_open` works in the "Hirozen Agent" space; popups from agent tabs stay there, and your space and selected tab are restored.

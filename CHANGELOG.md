@@ -21,11 +21,6 @@ Wider reach, network read, fewer prompts. Verified on Windows on a Zen 1.22.3b t
 - Loaded tabs in other spaces can be read, snapshotted and screenshotted; actions there are still refused.
 - The reinstall offer after a Zen update mentions `/hirozen-attach` only when Zen is running.
 
-### Fixed
-
-- Network entries had no method, status or headers on a real Zen (found in live QA).
-- A cookie's `sameSite` showed as a raw number.
-
 ## [0.2.2] - 2026-10-07
 
 Configure once, work from any folder. Verified on Windows with the everyday Zen 1.23.1b (Gecko 157.0.1) and a 1.22.3b test install. The loader changed, so run `/hirozen-install` and restart Zen; until then tool calls return `E_STALE_LOADER`.
