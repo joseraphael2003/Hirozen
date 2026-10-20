@@ -642,6 +642,10 @@ test("an aborted call is E_CANCELLED and sends cancel; E_STOPPED no longer blame
   expect(stopped.isError).toBe(true);
   expect(stoppedText.startsWith("E_STOPPED")).toBe(true);
   expect(stoppedText).not.toContain("loader dropped the session");
+  // A close can hit an action already under way (#failAll rejects every pending call), so the gloss
+  // must not promise that nothing was done.
+  expect(stoppedText).not.toContain("nothing was done");
+  expect(stoppedText).toContain("may or may not have run");
   expect(stoppedText).toContain("retry");
   await shutdown(host);
 }, 30_000);
