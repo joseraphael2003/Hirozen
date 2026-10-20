@@ -4,7 +4,7 @@ An [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) plugin that lets the om
 
 The agent can list your tabs and spaces, read pages (or just the article), take screenshots, click, type, hover, navigate, load unloaded tabs, upload files, read cookies, storage, downloads and request headers, answer page dialogs, and arrange tabs with Zen's own layout features (spaces, split view, glance).
 
-> **Status:** 0.3.0. Verified on Windows on a Zen 1.22.3b test install, with a short check on the everyday Zen 1.23.3b. See [CHANGELOG.md](CHANGELOG.md).
+> **Status:** 0.3.1 (compact-mode and cancellation fixes on top of the 0.3.0 build verified on Windows with Zen 1.22.3b and 1.23.3b). See [CHANGELOG.md](CHANGELOG.md).
 
 ## How it works
 

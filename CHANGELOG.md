@@ -2,6 +2,20 @@
 
 All notable changes to Hirozen are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
+## [0.3.1] - 2026-10-21
+
+Consent notices that stay visible and calls that cancel cleanly. The loader changed, so run `/hirozen-install` and restart Zen; until then tool calls return `E_STALE_LOADER`.
+
+### Added
+
+- A "Stop Hirozen" key (Ctrl+Alt+Shift+H) and an app-menu item exist in every window while a link is connected, so a session can be stopped even when the notice is off screen. Both use the notice's Stop path and disappear with the link.
+
+### Fixed
+
+- In compact mode the Allow/Deny notice now forces Zen's sidebar back on screen (`flash-popup`) while the prompt waits; Zen's own flash timer can no longer hide it again, and the attribute is removed when the prompt settles.
+- Interrupting a call in omp (`Esc`) is now `E_CANCELLED` ("cancelled in omp; nothing was done; retry") instead of the misleading `E_STOPPED`. The loader also drops a pending Allow/Deny gate and its 120 s timer when its last waiting call is cancelled, so the next call asks afresh instead of inheriting the old deadline. Granted permissions are untouched and no `consent.denied` is reported.
+- The `E_STOPPED` text no longer claims the loader dropped the session when the link simply closed or was never connected.
+
 ## [0.3.0] - 2026-10-20
 
 Wider reach, network read, fewer prompts. Verified on Windows on a Zen 1.22.3b test install, with a short check on the everyday Zen 1.23.3b. The loader and actor changed, so run `/hirozen-install` and restart Zen; until then tool calls return `E_STALE_LOADER`.
