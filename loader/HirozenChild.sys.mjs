@@ -175,7 +175,7 @@ export class HirozenChild extends JSWindowActorChild {
         case "setFiles":
           return this.#setFiles(data);
         default:
-          // The loader only ever sends the six above; anything else is a bug on the parent side.
+          // The loader only ever sends the seven above; anything else is a bug on the parent side.
           throw new HirozenError("E_INTERNAL", `HirozenChild: unknown message ${name}`);
       }
     } catch (e) {

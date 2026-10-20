@@ -1859,9 +1859,13 @@ class Loader {
   }
 
   // The agent space, by name: found when it exists, never created here (only zen.open creates it).
+  // The capability guard stays outside the try: inside it, the E_UNSUPPORTED it throws was caught by
+  // the same catch that answers "this window has no agent space", so a Zen without the API was never
+  // reported. A window whose getWorkspaces() itself throws still answers null - that is a window with
+  // no agent space to find, which is what every caller already handles.
   #agentSpaceIdOf(win) {
+    this.#need(win, "gZenWorkspaces.getWorkspaces");
     try {
-      this.#need(win, "gZenWorkspaces.getWorkspaces");
       const space = win.gZenWorkspaces?.getWorkspaces?.()?.find(candidate => candidate.name === AGENT_SPACE_NAME);
       return space?.uuid ?? null;
     } catch {
