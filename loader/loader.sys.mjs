@@ -2162,18 +2162,24 @@ class Loader {
         what: `zen.loadTab's page (tab ${tabKey}, already inserted and restored, and still usable)`,
       });
     } finally {
-      // The tab exists now, so a failed load may not leave the user somewhere else.
-      this.#restoreLoadedView(win, previousSelected, userSpaceId);
+      // The tab exists now, so a failed load may not leave the user somewhere else - but only the
+      // view this insert took may be put back (see #restoreLoadedView).
+      this.#restoreLoadedView(win, tab, previousSelected, userSpaceId);
     }
     return { tabKey, url: landed.url, title: tab.label ?? "" };
   }
 
-  // Puts the user's view back after a pending tab was inserted. The selection first: #restoreUserView
-  // only acts on a popup it re-homed, and this tab is not one - so the space is checked here on its
-  // own, with the same call Zen's own onLocationChange makes, and only ever to the space captured
-  // before the insert. Both are best-effort: a Zen that refuses leaves the user where they are.
-  #restoreLoadedView(win, previousSelected, userSpaceId) {
-    if (previousSelected && !previousSelected.closed && win.gBrowser?.selectedTab !== previousSelected) {
+  // Puts the user's view back after a pending tab was inserted. Only a view the insert itself took
+  // may be undone: the inserted tab must be the selection now, exactly as #restoreUserView blames the
+  // popup it re-homed. A load can take seconds, and a user who picked another tab (or another space)
+  // in the meantime moved of their own accord - their view is theirs and is never put back. The
+  // selection is restored first, then the space on its own (a switch Zen started can land without the
+  // selection having moved), with the same call Zen's own onLocationChange makes and only ever to the
+  // space captured before the insert. Both are best-effort: a Zen that refuses leaves the user where
+  // they are.
+  #restoreLoadedView(win, tab, previousSelected, userSpaceId) {
+    if (win.gBrowser?.selectedTab !== tab) return;
+    if (previousSelected && !previousSelected.closed) {
       try {
         win.gBrowser.selectedTab = previousSelected;
       } catch {
