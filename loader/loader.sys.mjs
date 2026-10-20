@@ -136,6 +136,15 @@ const NET_TOPICS = [
 ];
 const REDACTED_HEADERS = new Set(["cookie", "set-cookie", "authorization", "proxy-authorization"]);
 const REDACTED = "<redacted>";
+// nsICookie.sameSite is a number - the Ci.nsICookie.SAMESITE_* constants, which is how every shipped
+// caller reads it (marionette, ext-cookies, webdriver-bidi). The agent gets the name; anything a build
+// adds later answers "unknown" rather than a raw number.
+const SAME_SITE_NAMES = new Map([
+  [Ci.nsICookie.SAMESITE_NONE, "none"],
+  [Ci.nsICookie.SAMESITE_LAX, "lax"],
+  [Ci.nsICookie.SAMESITE_STRICT, "strict"],
+  [Ci.nsICookie.SAMESITE_UNSET, "unset"],
+]);
 const STORAGE_VALUE_CHARS = 200;
 const DOWNLOADS_MAX = 50;
 
@@ -2211,7 +2220,7 @@ class Loader {
         expires: cookie.isSession ? null : Number(cookie.expiry) || null,
         secure: cookie.isSecure === true,
         httpOnly: cookie.isHttpOnly === true,
-        sameSite: String(cookie.sameSite ?? "unspecified"),
+        sameSite: SAME_SITE_NAMES.get(cookie.sameSite) ?? "unknown",
       };
       const size = JSON.stringify(item).length + 1;
       if (bytes + size > NET_CAP_BYTES) {
