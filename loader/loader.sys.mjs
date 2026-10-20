@@ -24,7 +24,8 @@
 // Compact mode moves the node holding the notice (the navigator toolbox) off screen. While a prompt
 // waits, each compact-mode window gets Zen's own `flash-popup` attribute on the toolbox so the prompt
 // is visible; an observer restores it if Zen's flash timer clears it, and it is removed when the
-// prompt settles.
+// prompt settles. While a link is connected every window also gets a Stop key (Ctrl+Alt+Shift+H) and
+// an app-menu item, so Stop stays reachable when the notice is not.
 //
 // V3 capabilities: the Zen internals Hirozen calls are probed (most recent window) at init and at
 // ready into `capabilities` (status file + ready frame), and every call site guards per call with
@@ -551,6 +552,8 @@ class Loader {
   #noticeBase = null; // {text, warning, buttons}: the notice every window gets, Stop included
   #noticeObserver = null; // browser-delayed-startup-finished observer while a notice is up
   #compactFlash = new Map(); // window -> MutationObserver keeping flash-popup up while a prompt waits
+  #stopObserver = null; // browser-delayed-startup-finished observer while a link is connected
+  #stopWindows = new Map(); // window -> {key, item, separator, onUnload}: the per-window Stop UI
   #consent = { granted: new Set(), pending: null }; // per link; created on auth, cleared in #teardown
   #tabOpenWatchers = new Map(); // window -> {states: [state], handler}: agent-space popup re-homing
   // The network capture (T9-T11): one watcher per watched tabKey, the same watcher reachable by the
@@ -724,7 +727,7 @@ class Loader {
       warning,
       flashCompact,
       buttons: buttons ?? (stopButton
-        ? [{ label: "Stop", callback: () => { this.#disconnect("stopped by user in Zen", CLOSE_STOPPED); return false; } }]
+        ? [{ label: "Stop", callback: () => { this.#stopFromUser(); return false; } }]
         : []),
     };
     this.#renderNotice();
@@ -798,6 +801,95 @@ class Loader {
     sync();
   }
 
+  // The notice's Stop button, the per-window key and the menu item all end the link the same way: the
+  // close code is Zen's "stopped by user", which omp holds as a sticky stop until /hirozen-connect.
+  #stopFromUser() {
+    if (!this.#client) return;
+    this.#disconnect("stopped by user in Zen", CLOSE_STOPPED);
+  }
+
+  // While a link is connected, every non-private window gets a Stop key (Ctrl+Alt+Shift+H) and an
+  // app-menu item, so Stop stays reachable when the notice is off screen (compact mode). Zen keeps its
+  // menu bar (browser.xhtml `#toolbar-menubar`) permanently hidden (zen-sidebar.css), so the app menu
+  // is the reachable menu. Both pieces live only during the link: #teardown removes them, a window
+  // opened meanwhile is equipped through the same topic the notices use, and closing a window removes
+  // its own pieces.
+  #installStopUI() {
+    if (this.#stopObserver) return;
+    this.#stopObserver = subject => {
+      if (!this.#client || !subject || subject.closed || isPrivateWindow(subject)) return;
+      this.#addStopUI(subject);
+    };
+    Services.obs.addObserver(this.#stopObserver, "browser-delayed-startup-finished");
+    for (const win of browserWindows()) this.#addStopUI(win);
+  }
+
+  #addStopUI(win) {
+    if (this.#stopWindows.has(win) || !win.document) return;
+    const doc = win.document;
+    let key;
+    let separator;
+    let item;
+    try {
+      key = doc.createXULElement("key");
+      key.id = "hirozen-stop-key";
+      // Shift makes the character uppercase, exactly as Firefox's own accel+shift keys are declared
+      // (browserSets.ftl close-shortcut `.key = W`); keycode is for non-printing keys only.
+      key.setAttribute("key", "H");
+      key.setAttribute("modifiers", "control,alt,shift");
+      key.addEventListener("command", () => this.#stopFromUser());
+      doc.getElementById("mainKeyset").appendChild(key);
+
+      separator = doc.createXULElement("toolbarseparator");
+      item = doc.createXULElement("toolbarbutton");
+      item.id = "hirozen-stop-menuitem";
+      item.className = "subviewbutton";
+      item.setAttribute("label", "Stop Hirozen");
+      item.setAttribute("key", "hirozen-stop-key");
+      item.addEventListener("command", () => this.#stopFromUser());
+      const help = win.PanelMultiView?.getViewNode?.(doc, "appMenu-help-button2") ?? doc.getElementById("appMenu-help-button2");
+      if (!help?.parentNode) throw new Error("the app menu main view is missing");
+      help.after(separator);
+      separator.after(item);
+    } catch {
+      // An older Zen without the app menu (or a document already going away) loses this window's Stop
+      // doors; the notice's own Stop button remains. UI setup never breaks the link.
+      key?.remove();
+      separator?.remove();
+      item?.remove();
+      return;
+    }
+    const onUnload = () => this.#removeStopUI(win);
+    win.addEventListener("unload", onUnload, { once: true });
+    this.#stopWindows.set(win, { key, item, separator, onUnload });
+  }
+
+  #removeStopUI(win) {
+    const entry = this.#stopWindows.get(win);
+    if (!entry) return;
+    this.#stopWindows.delete(win);
+    try {
+      win.removeEventListener("unload", entry.onUnload);
+      entry.key.remove();
+      entry.item.remove();
+      entry.separator.remove();
+    } catch {
+      // The window is closing and its document is already going away.
+    }
+  }
+
+  #clearStopUI() {
+    if (this.#stopObserver) {
+      try {
+        Services.obs.removeObserver(this.#stopObserver, "browser-delayed-startup-finished");
+      } catch {
+        // The observer is already gone (shutdown); UI cleanup must never break the connection teardown.
+      }
+      this.#stopObserver = null;
+    }
+    for (const win of [...this.#stopWindows.keys()]) this.#removeStopUI(win);
+  }
+
   // The omp identity from the handoff that started this link, as every notice names it.
   #who() {
     const handoff = this.#status.lastHandoff;
@@ -842,6 +934,7 @@ class Loader {
             // dies with it, so the user's Allow is asked for again (plan §8.2).
             this.#consent = { granted: new Set(), pending: null };
             this.#startHeartbeat();
+            this.#installStopUI();
             this.#showNotice(`Hirozen: ${this.#who()} is connected. Stop ends the session.`);
             this.#writeStatus({ state: "connected", consent: [], consentPending: null, lastClose: null });
             ws.send({
@@ -945,6 +1038,7 @@ class Loader {
       resetScope: true,
     });
     this.#clearTabOpenWatchers();
+    this.#clearStopUI();
     // The capture is link state too: its observers and its buffers die here, which is also where Zen's
     // Stop lands.
     this.#stopNetwork();
