@@ -21,6 +21,11 @@
 // `network` is independent - and a call joins a pending notice by adding its own permission to the
 // asked set, so one Allow settles every waiter.
 //
+// Compact mode moves the node holding the notice (the navigator toolbox) off screen. While a prompt
+// waits, each compact-mode window gets Zen's own `flash-popup` attribute on the toolbox so the prompt
+// is visible; an observer restores it if Zen's flash timer clears it, and it is removed when the
+// prompt settles.
+//
 // V3 capabilities: the Zen internals Hirozen calls are probed (most recent window) at init and at
 // ready into `capabilities` (status file + ready frame), and every call site guards per call with
 // #need() so a Zen that lacks one gets E_UNSUPPORTED naming it instead of a TypeError.
@@ -545,6 +550,7 @@ class Loader {
   #noticeState = null; // {generation, text, warning, buttons} of the notice currently shown
   #noticeBase = null; // {text, warning, buttons}: the notice every window gets, Stop included
   #noticeObserver = null; // browser-delayed-startup-finished observer while a notice is up
+  #compactFlash = new Map(); // window -> MutationObserver keeping flash-popup up while a prompt waits
   #consent = { granted: new Set(), pending: null }; // per link; created on auth, cleared in #teardown
   #tabOpenWatchers = new Map(); // window -> {states: [state], handler}: agent-space popup re-homing
   // The network capture (T9-T11): one watcher per watched tabKey, the same watcher reachable by the
@@ -689,6 +695,15 @@ class Loader {
     this.#noticeState = null;
     for (const [notification, box] of this.#notices) this.#removeNotice(box, notification);
     this.#notices.clear();
+    for (const [win, observer] of this.#compactFlash) {
+      try {
+        observer.disconnect();
+        win.gNavToolbox?.removeAttribute("flash-popup");
+      } catch {
+        // The window (or its toolbox) went away; UI cleanup must never break the connection teardown.
+      }
+    }
+    this.#compactFlash.clear();
   }
 
   // Takes the notice off screen for good (link teardown): unlike #closeNotice, the base is dropped too,
@@ -703,10 +718,11 @@ class Loader {
   // notice is up gets it too: "browser-delayed-startup-finished" is notified once per top-level
   // browser window (browser-init.js L739, the topic DevToolsStartup.sys.mjs L372-375 listens on).
   // Private windows are excluded, exactly like everywhere else.
-  #showNotice(text, { warning = false, stopButton = true, buttons = null } = {}) {
+  #showNotice(text, { warning = false, stopButton = true, buttons = null, flashCompact = false } = {}) {
     this.#noticeBase = {
       text,
       warning,
+      flashCompact,
       buttons: buttons ?? (stopButton
         ? [{ label: "Stop", callback: () => { this.#disconnect("stopped by user in Zen", CLOSE_STOPPED); return false; } }]
         : []),
@@ -721,6 +737,7 @@ class Loader {
       generation: this.#noticeGen,
       text: this.#noticeBase.text,
       warning: this.#noticeBase.warning,
+      flashCompact: this.#noticeBase.flashCompact,
       buttons: this.#noticeBase.buttons,
     };
     this.#noticeState = state;
@@ -740,6 +757,7 @@ class Loader {
   #appendNotice(win, state) {
     const box = win.gNotificationBox;
     if (!box) return;
+    if (state.flashCompact) this.#flashCompactSidebar(win, state);
     box.appendNotification(
       "hirozen",
       { label: state.text, priority: state.warning ? box.PRIORITY_WARNING_HIGH : box.PRIORITY_INFO_HIGH },
@@ -753,6 +771,31 @@ class Loader {
       },
       () => {} // the window went away before the notification was appended
     );
+  }
+
+  // The notice's host is the navigator toolbox, which Zen's compact mode shifts off screen unless
+  // something marks it: `flash-popup` is the same attribute Zen's own flashSidebar sets to bring the
+  // sidebar back (ZenCompactMode.mjs L704-724, and zen-compact-mode.css L211). It is forced only while
+  // a prompt waits, and only in windows that are in compact mode. Zen's own flash timer can clear the
+  // attribute while the prompt is still up (selecting a tab calls flashSidebarIfNecessary, L250-262),
+  // so an observer restores it. `zen-user-show` is the user's own toggle and is never touched.
+  #flashCompactSidebar(win, state) {
+    const doc = win.document;
+    const toolbar = win.gNavToolbox;
+    if (!doc?.documentElement || !toolbar || !win.MutationObserver) return;
+    const sync = () => {
+      if (this.#noticeState !== state || !state.flashCompact || win.closed) return;
+      if (doc.documentElement.getAttribute("zen-compact-mode") === "true") {
+        if (!toolbar.hasAttribute("flash-popup")) toolbar.setAttribute("flash-popup", "true");
+      } else if (toolbar.hasAttribute("flash-popup")) {
+        toolbar.removeAttribute("flash-popup");
+      }
+    };
+    const observer = new win.MutationObserver(sync);
+    observer.observe(toolbar, { attributes: true, attributeFilter: ["flash-popup"] });
+    observer.observe(doc.documentElement, { attributes: true, attributeFilter: ["zen-compact-mode"] });
+    this.#compactFlash.set(win, observer);
+    sync();
   }
 
   // The omp identity from the handoff that started this link, as every notice names it.
@@ -1064,6 +1107,7 @@ class Loader {
     const pending = this.#consent.pending;
     if (pending) {
       this.#showNotice(`Hirozen: ${this.#who()} wants to ${permissionVerbs(pending.asks)} in Zen.`, {
+        flashCompact: true,
         buttons: [
           { label: "Allow", callback: () => { this.#settleConsent(pending, { granted: true }); return false; } },
           { label: "Deny", callback: () => { this.#settleConsent(pending, { granted: false }); return false; } },
