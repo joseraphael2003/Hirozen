@@ -827,6 +827,50 @@ test("E_GRANT_STALE corrects the tab cache, so the retry prompts instead of loop
   await started;
 }, 30_000);
 
+test("a granted act carries the origin its approval decided, not one recomputed after the link await", async () => {
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+  const loader = new FakeLoader(profileDir).on("zen.inventory", frame => loader.reply(frame, INVENTORY));
+  loader.on("browser.act", frame => loader.reply(frame, { ok: true, url: "https://example.com/", title: "Example Domain" }));
+  // The parallel read whose reply moves the plugin's tab cache off the granted origin.
+  loader.on("browser.read", frame =>
+    loader.reply(frame, { tabKey: TAB_KEY, url: "https://elsewhere.example/", title: "Elsewhere", text: "elsewhere", truncated: false }),
+  );
+  const started = loader.start().catch(() => undefined);
+
+  const act = host.tools.get("browser_act");
+  if (!act) throw new Error("browser_act is not registered");
+  const click = { tabKey: TAB_KEY, action: "click", ref: "ab12.e1" };
+  await callTool(host, "zen_tabs");
+  expect((await loader.nextRequest()).method).toBe("zen.inventory"); // the frame that call leaves queued
+  await runCommand(host, "hirozen-grant", `${TAB_KEY} 5`);
+  // omp allows this exact call outright: the grant covers the tab's cached origin.
+  expect(typeof act.approval === "function" ? act.approval(click) : act.approval).toMatchObject({ tier: "write", policy: "allow" });
+
+  // A parallel tool reply moves the cache to another origin before the act runs. The approval already
+  // happened, so the act must still name the origin it was allowed for: the loader's own check - not a
+  // cache this plugin re-read after awaiting the link - is what decides whether that origin is live.
+  const read = callTool(host, "browser_read", { tabKey: TAB_KEY });
+  expect((await loader.nextRequest()).method).toBe("browser.read");
+  expect((await read).isError).not.toBe(true);
+  const call = callTool(host, "browser_act", click);
+  const request = await loader.nextRequest();
+  expect(request.method).toBe("browser.act");
+  expect(request.params).toMatchObject({ tabKey: TAB_KEY, action: "click", grantOrigin: "https://example.com" });
+  expect((await call).isError).not.toBe(true);
+
+  // A call the approval did not grant carries no origin at all: it is the person's own yes, and the
+  // check exists for acts that ran without one.
+  const prompted = { tabKey: "1759000000000-cccc", action: "click", ref: "ab12.e1" };
+  expect(typeof act.approval === "function" ? act.approval(prompted) : act.approval).toMatchObject({ tier: "exec", policy: "prompt" });
+  const plain = callTool(host, "browser_act", prompted);
+  expect((await loader.nextRequest()).params).not.toHaveProperty("grantOrigin");
+  expect((await plain).isError).not.toBe(true);
+
+  await runCommand(host, "hirozen-grant", "clear");
+  await shutdown(host);
+  await started;
+}, 30_000);
+
 test("browser_cookies, browser_storage and browser_downloads send the agreed frames and render them", async () => {
   rmSync(join(profileDir, "hirozen-status.json"), { force: true });
   const callSpy = spyOn(ZenLink.prototype, "call");

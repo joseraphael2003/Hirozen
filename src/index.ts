@@ -255,6 +255,16 @@ const snapshotRefs = new Map<string, Map<string, { role: string; name: string }>
  */
 const grants = new GrantStore();
 /**
+ * The origin a pending browser_act's approval was allowed for, keyed by the very args object omp
+ * hands to both the approval and execute. The decision has to be taken once: `execute` awaits the
+ * link before it sends anything, and a tab cache a parallel reply moved in the meantime - or a grant
+ * that expired in it - would otherwise turn an act omp already allowed into one with no origin on the
+ * wire, which is the one check that catches a stale cache. Only a grant writes here; a call that is
+ * prompted (or not covered) is the person's own yes, and no origin check is owed for it. The entry
+ * goes with the args object, so nothing outlives the call.
+ */
+const grantedActOrigins = new WeakMap<object, string>();
+/**
  * Set by Zen's Stop button (close 4010); only /hirozen-connect, /hirozen-attach and a /hirozen-setup
  * that changes or clears the pair clear it.
  */
@@ -855,9 +865,11 @@ async function runBrowserAct(
 ): Promise<AgentToolResult<unknown>> {
   const access = await requireLink(pi, ctx);
   if ("failure" in access) return fail(access.failure);
-  // A covering grant lets this act run without an omp prompt; naming its origin on the wire lets the
-  // loader check the tab's live URL, so a stale tab cache here cannot act on a site nobody granted.
-  const grant = grants.coveringAct(params.tabKey, knownTabs.get(params.tabKey)?.url, params.action);
+  // The origin the approval let this call through for, decided there and carried here (see
+  // grantedActOrigins): naming it on the wire lets the loader check the tab's live URL, so a stale tab
+  // cache here cannot act on a site nobody granted. Reading it after the await above is what keeps the
+  // act omp allowed from losing that check - nothing recomputes it once the link is up.
+  const grantOrigin = grantedActOrigins.get(params);
   try {
     const result = await access.link.call<ZenActResult>(
       "browser.act",
@@ -869,7 +881,7 @@ async function runBrowserAct(
         key: params.key,
         dy: params.dy,
         url: params.url,
-        ...(grant ? { grantOrigin: grant.origin } : {}),
+        ...(grantOrigin ? { grantOrigin } : {}),
       },
       { timeoutMs: callBudget("act"), signal },
     );
@@ -1396,10 +1408,16 @@ function execApproval(reason: string): () => ExecApproval {
  * outright (write tier, allow policy — honoured in every approval mode, though a user deny rule still
  * wins) instead of prompting. Everything else prompts, navigate always: it can leave the site the
  * grant was given for.
+ *
+ * The decision is recorded for this exact args object as it is taken: `execute` reads it back and
+ * sends `grantOrigin` when it is there, so the grant check the loader does cannot be lost between the
+ * approval and the call (grantedActOrigins). An approval that does not grant forgets any earlier
+ * decision for the same object: a call that is prompted, or not covered, is the person's own yes.
  */
 function actApproval(args: unknown): ApprovalDecision {
   const params = approvalArgs<ActParams>(args);
   const grant = grants.coveringAct(params.tabKey, knownTabs.get(params.tabKey)?.url, params.action);
+  rememberGrantedAct(args, grant ? grant.origin : null);
   if (!grant) {
     return {
       tier: "exec",
@@ -1413,6 +1431,13 @@ function actApproval(args: unknown): ApprovalDecision {
     policy: "allow",
     reason: `granted by /hirozen-grant: ${grant.origin} for ${minutes} more min`,
   };
+}
+
+/** What `actApproval` decided about one browser_act call, for `execute` to read back (null = forget). */
+function rememberGrantedAct(args: unknown, origin: string | null): void {
+  if (typeof args !== "object" || args === null) return;
+  if (origin === null) grantedActOrigins.delete(args);
+  else grantedActOrigins.set(args, origin);
 }
 
 /** browser_cookies: a read, unless the call asks for the cookie values themselves. */
