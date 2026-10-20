@@ -751,8 +751,11 @@ test("/hirozen-grant covers the granted tab until the tab leaves the site", asyn
   expect(host.notifications.at(-1) ?? "").toContain("grants: https://example.com");
 
   // A click that navigated the tab off the granted site: the reply is where the tab is now, so the
-  // call after it prompts again (the grant is anchored to the origin it was given for).
+  // call after it prompts again (the grant is anchored to the origin it was given for). The approval
+  // of that next call still sees the old cache - the reply above has not landed yet - so it is granted
+  // and names the origin it was given for; the loader is what refuses it.
   landed = "https://elsewhere.example/page";
+  expect(typeof act.approval === "function" ? act.approval(click) : act.approval).toMatchObject({ tier: "write", policy: "allow" });
   const moved = callTool(host, "browser_act", click);
   const movedRequest = await loader.nextRequest();
   expect(movedRequest.params).toMatchObject({ grantOrigin: "https://example.com" }); // the old cache
@@ -852,6 +855,9 @@ test("a granted act carries the origin its approval decided, not one recomputed 
   const read = callTool(host, "browser_read", { tabKey: TAB_KEY });
   expect((await loader.nextRequest()).method).toBe("browser.read");
   expect((await read).isError).not.toBe(true);
+  // omp asks the approval again when the tool starts (its render path). That answer is "prompt" now -
+  // and it must not erase the decision the gate already made for this exact call.
+  expect(typeof act.approval === "function" ? act.approval(click) : act.approval).toMatchObject({ tier: "exec", policy: "prompt" });
   const call = callTool(host, "browser_act", click);
   const request = await loader.nextRequest();
   expect(request.method).toBe("browser.act");

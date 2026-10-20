@@ -259,9 +259,13 @@ const grants = new GrantStore();
  * hands to both the approval and execute. The decision has to be taken once: `execute` awaits the
  * link before it sends anything, and a tab cache a parallel reply moved in the meantime - or a grant
  * that expired in it - would otherwise turn an act omp already allowed into one with no origin on the
- * wire, which is the one check that catches a stale cache. Only a grant writes here; a call that is
- * prompted (or not covered) is the person's own yes, and no origin check is owed for it. The entry
- * goes with the args object, so nothing outlives the call.
+ * wire, which is the one check that catches a stale cache.
+ *
+ * Only a grant writes, and `execute` is what takes the entry away: omp evaluates the same approval
+ * again when the tool starts (its render path), so an approval that answers "prompt" - a grant that
+ * expired, a cache that moved - must leave the decision the gate already made alone. A call that is
+ * prompted is the person's own yes and owes no origin check; a call that is covered by a grant and
+ * then replaced (a tool_call handler) is a new object with its own entry.
  */
 const grantedActOrigins = new WeakMap<object, string>();
 /**
@@ -865,11 +869,13 @@ async function runBrowserAct(
 ): Promise<AgentToolResult<unknown>> {
   const access = await requireLink(pi, ctx);
   if ("failure" in access) return fail(access.failure);
-  // The origin the approval let this call through for, decided there and carried here (see
+  // The origin the approval let this call through for, decided there and consumed here (see
   // grantedActOrigins): naming it on the wire lets the loader check the tab's live URL, so a stale tab
   // cache here cannot act on a site nobody granted. Reading it after the await above is what keeps the
-  // act omp allowed from losing that check - nothing recomputes it once the link is up.
+  // act omp allowed from losing that check - nothing recomputes it once the link is up - and taking it
+  // (rather than reading it) is what keeps a later approval from seeing an answer of its own.
   const grantOrigin = grantedActOrigins.get(params);
+  grantedActOrigins.delete(params);
   try {
     const result = await access.link.call<ZenActResult>(
       "browser.act",
@@ -1409,15 +1415,16 @@ function execApproval(reason: string): () => ExecApproval {
  * wins) instead of prompting. Everything else prompts, navigate always: it can leave the site the
  * grant was given for.
  *
- * The decision is recorded for this exact args object as it is taken: `execute` reads it back and
- * sends `grantOrigin` when it is there, so the grant check the loader does cannot be lost between the
- * approval and the call (grantedActOrigins). An approval that does not grant forgets any earlier
- * decision for the same object: a call that is prompted, or not covered, is the person's own yes.
+ * A grant records the origin for this exact args object as it is taken; `execute` reads it back and
+ * sends `grantOrigin`, so the grant check the loader does cannot be lost between the approval and the
+ * call (grantedActOrigins). Only a grant writes: omp asks this same question again when the tool
+ * starts (its render path), and a "no" there — the grant expired, or a parallel reply moved the tab
+ * cache in between — must not erase the decision the gate already made.
  */
 function actApproval(args: unknown): ApprovalDecision {
   const params = approvalArgs<ActParams>(args);
   const grant = grants.coveringAct(params.tabKey, knownTabs.get(params.tabKey)?.url, params.action);
-  rememberGrantedAct(args, grant ? grant.origin : null);
+  if (grant) rememberGrantedAct(args, grant.origin);
   if (!grant) {
     return {
       tier: "exec",
@@ -1433,11 +1440,10 @@ function actApproval(args: unknown): ApprovalDecision {
   };
 }
 
-/** What `actApproval` decided about one browser_act call, for `execute` to read back (null = forget). */
-function rememberGrantedAct(args: unknown, origin: string | null): void {
+/** What `actApproval` decided about one browser_act call, for `execute` to read and consume. */
+function rememberGrantedAct(args: unknown, origin: string): void {
   if (typeof args !== "object" || args === null) return;
-  if (origin === null) grantedActOrigins.delete(args);
-  else grantedActOrigins.set(args, origin);
+  grantedActOrigins.set(args, origin);
 }
 
 /** browser_cookies: a read, unless the call asks for the cookie values themselves. */
