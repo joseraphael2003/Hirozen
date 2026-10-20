@@ -1118,7 +1118,7 @@ class Loader {
       }
     }
     if (!entry.loaded) {
-      throw new LoaderError("E_TAB_UNLOADED", `tab ${tabKey} has no docshell yet; open it in Zen first (Hirozen never loads tabs)`);
+      throw new LoaderError("E_TAB_UNLOADED", `tab ${tabKey} has no docshell yet; load it with zen_load_tab, which loads it where it is and never selects it`);
     }
     const spec = entry.browser.currentURI.spec;
     if (isPrivilegedPage(entry.browser) && !(allowAbout && isNavigableAbout(spec))) {
@@ -1126,7 +1126,7 @@ class Loader {
     }
     const wg = entry.browser.browsingContext?.currentWindowGlobal ?? null;
     if (!wg) {
-      throw new LoaderError("E_TAB_UNLOADED", `tab ${tabKey} has no live document; open it in Zen first (Hirozen never loads tabs)`);
+      throw new LoaderError("E_TAB_UNLOADED", `tab ${tabKey} has no live document right now (it is loading, navigating or closing); retry once the page has settled, or load a tab that is not loaded at all with zen_load_tab`);
     }
     return { tabKey, tab: entry.tab, browser: entry.browser, wg };
   }
@@ -2313,7 +2313,9 @@ class Loader {
     const { tabKey, tab, browser } = this.#resolveTab(params?.tabKey);
     const browserId = Number(browser.browsingContext?.browserId) || 0;
     if (!browserId) {
-      throw new LoaderError("E_TAB_UNLOADED", `tab ${tabKey} has no live browsing context; Hirozen cannot tell its requests apart`);
+      // Not E_TAB_UNLOADED: that code's gloss offers zen_load_tab, which cannot help a tab that is
+      // already loaded - and this one is, #resolveTab just accepted its live document.
+      throw new LoaderError("E_UNSUPPORTED", `tab ${tabKey} has no browsing context id, so Hirozen cannot tell its requests apart from other tabs'; nothing is being watched`);
     }
     await this.#gate("network", req);
     this.#checkDeadline(req);
