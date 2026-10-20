@@ -20,6 +20,7 @@ Wider reach, network read, fewer prompts. Verified on Windows on a Zen 1.22.3b t
 - Consent is three separate permissions (read, act, network) instead of a ladder; a call asks only for what is missing.
 - Loaded tabs in other spaces can be read, snapshotted and screenshotted; actions there are still refused.
 - The reinstall offer after a Zen update mentions `/hirozen-attach` only when Zen is running.
+- Recording requests on a loaded tab that Zen gives no browsing-context id is refused with `E_TAB_UNSCOPED`; try another tab.
 
 ## [0.2.2] - 2026-10-07
 
