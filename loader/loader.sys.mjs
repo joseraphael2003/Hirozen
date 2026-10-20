@@ -452,13 +452,15 @@ function isPrivateChannel(channel) {
   }
 }
 
-// nsIHttpHeaders -> a plain object, with the credential headers' values replaced. Names are compared
-// lowercased so the redaction cannot be dodged by casing.
-function collectHeaders(headers) {
+// nsIHttpChannel's header visitors -> a plain object, with the credential headers' values replaced.
+// The visitors are the only way in (there is no requestHeaders/responseHeaders attribute on
+// nsIHttpChannel - `http-on-modify-request` and the three examine topics hand over an nsIChannel
+// wrapper), and names are compared lowercased so the redaction cannot be dodged by casing.
+function collectHeaders(http, method) {
   const into = {};
-  if (!headers || typeof headers.visit !== "function") return into;
+  if (!http || typeof http[method] !== "function") return into;
   try {
-    headers.visit({
+    http[method]({
       visitHeader(name, value) {
         const key = String(name);
         into[key] = REDACTED_HEADERS.has(key.toLowerCase()) ? REDACTED : String(value);
@@ -2433,15 +2435,26 @@ class Loader {
       const watcher = this.#netByBrowser.get(browserId);
       if (!watcher) return; // a tab nobody is watching
       if (isPrivateChannel(channel)) return;
-      if (topic === "http-on-modify-request") this.#onRequest(watcher, channel);
-      else this.#onResponse(watcher, channel);
+      // The subject of these four topics is an nsIChannel wrapper: requestMethod, responseStatus and
+      // the header visitors belong to nsIHttpChannel, and reading them straight off the subject
+      // silently answers undefined (live T13: method "", status null, no headers at all). The QI is
+      // what every shipped caller of these topics does. The raw subject stays the buffer's key - it is
+      // the same object in both halves of the exchange, which is how the response finds its entry.
+      let http = null;
+      try {
+        http = channel.QueryInterface(Ci.nsIHttpChannel);
+      } catch {
+        return; // not an http channel (a file: or data: load): nothing here to record
+      }
+      if (topic === "http-on-modify-request") this.#onRequest(watcher, channel, http);
+      else this.#onResponse(watcher, channel, http);
     } catch {
       // An observer must never throw into Gecko's notification loop, and one unreadable channel must
       // not take the capture down with it.
     }
   }
 
-  #onRequest(watcher, channel) {
+  #onRequest(watcher, channel, http) {
     let url = "";
     let method = "";
     try {
@@ -2450,11 +2463,11 @@ class Loader {
       url = "";
     }
     try {
-      method = String(channel.requestMethod ?? "");
+      method = String(http.requestMethod ?? "");
     } catch {
       method = "";
     }
-    const requestHeaders = collectHeaders(channel.requestHeaders);
+    const requestHeaders = collectHeaders(http, "visitRequestHeaders");
     const entry = {
       channel,
       method,
@@ -2477,20 +2490,21 @@ class Loader {
 
   // The response half of a request the capture saw begin: the status, the content type and the timing
   // land on the same entry. A response whose request predates the watch has no entry and is dropped.
-  #onResponse(watcher, channel) {
+  #onResponse(watcher, channel, http) {
     const entry = watcher.byChannel.get(channel);
     if (!entry) return;
     try {
-      entry.status = Number(channel.responseStatus);
+      const status = Number(http.responseStatus);
+      entry.status = Number.isFinite(status) ? status : null;
     } catch {
       entry.status = null;
     }
     try {
-      entry.contentType = channel.contentType ? String(channel.contentType) : null;
+      entry.contentType = http.contentType ? String(http.contentType) : null;
     } catch {
       entry.contentType = null;
     }
-    entry.responseHeaders = collectHeaders(channel.responseHeaders);
+    entry.responseHeaders = collectHeaders(http, "visitResponseHeaders");
     entry.ms = Math.max(0, Date.now() - entry.startedAt);
     const added = headerBytes(entry.responseHeaders) + 48;
     entry.bytes += added;
