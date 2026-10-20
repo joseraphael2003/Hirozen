@@ -1111,6 +1111,9 @@ class Loader {
     // renders a tab of an inactive space correctly, verified live) - while every other inactive-space
     // tab keeps E_TAB_INACTIVE_SPACE for writes.
     if (write && !this.#isInActiveSpace(entry)) {
+      // The agent-space exemption is what this branch cannot decide without the workspaces module, so
+      // that is where its guard belongs (and not in #agentSpaceIdOf, which every act calls).
+      this.#need(entry.window, "gZenWorkspaces.getWorkspaces");
       const agentSpaceId = this.#agentSpaceIdOf(entry.window);
       const inAgentSpace = !!agentSpaceId && entry.tab.getAttribute("zen-workspace-id") === agentSpaceId;
       if (!inAgentSpace) {
@@ -1859,12 +1862,11 @@ class Loader {
   }
 
   // The agent space, by name: found when it exists, never created here (only zen.open creates it).
-  // The capability guard stays outside the try: inside it, the E_UNSUPPORTED it throws was caught by
-  // the same catch that answers "this window has no agent space", so a Zen without the API was never
-  // reported. A window whose getWorkspaces() itself throws still answers null - that is a window with
-  // no agent space to find, which is what every caller already handles.
+  // Deliberately tolerant: a window with no workspaces module answers null rather than throwing, so
+  // the popup watcher - which asks on every act and navigate - can never turn an ordinary act into a
+  // refusal. The two callers that cannot work without the module guard themselves with #need:
+  // #resolveTab's inactive-space branch and #ensureAgentSpace.
   #agentSpaceIdOf(win) {
-    this.#need(win, "gZenWorkspaces.getWorkspaces");
     try {
       const space = win.gZenWorkspaces?.getWorkspaces?.()?.find(candidate => candidate.name === AGENT_SPACE_NAME);
       return space?.uuid ?? null;
@@ -1878,6 +1880,8 @@ class Loader {
   // disabled), so its uuid may only be read after awaiting it. The name lookup stays first: an
   // existing "Hirozen Agent" space is reused, never created twice.
   async #ensureAgentSpace(win) {
+    // zen.open cannot work at all without the workspaces module: that is this call's guard.
+    this.#need(win, "gZenWorkspaces.getWorkspaces");
     let spaceId = this.#agentSpaceIdOf(win);
     if (!spaceId) {
       // dontChange=true: creating the space must not switch the user's own space (plan).
