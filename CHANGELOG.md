@@ -172,7 +172,8 @@ First release: read-only access to a running Zen browser from omp. Verified on Z
 - Two one-off results could not be reproduced: a Deny that returned an uncaptured code, and a transient `E_IN_USE` on an immediate reconnect.
 - Not yet validated on a daily profile. Click, type, navigation and Zen layout actions are planned for V2.
 
-[0.3.0]: https://github.com/joseraphael2003/Hirozen/compare/fa3c2e9...main
+[0.3.1]: https://github.com/joseraphael2003/Hirozen/compare/4954bba...main
+[0.3.0]: https://github.com/joseraphael2003/Hirozen/compare/fa3c2e9...4954bba
 [0.2.2]: https://github.com/joseraphael2003/Hirozen/compare/8d35252...fa3c2e9
 [0.2.1]: https://github.com/joseraphael2003/Hirozen/compare/d04686c...8d35252
 [0.2.0]: https://github.com/joseraphael2003/Hirozen/compare/1e071bc...d04686c
