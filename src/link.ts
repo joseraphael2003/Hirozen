@@ -14,7 +14,9 @@
 //      {id, error: {code, message}}; `deadline` is the absolute epoch ms after which the loader must
 //      not act on the request at all (see CALL_TIMEOUT_MS); loader events arrive as
 //      {type: "event", name, data}; the loader's 5 s liveness frame {type: "ping", t} is answered with
-//      {type: "pong", t}, and any frame type this link does not know is ignored.
+//      {type: "pong", t}, and any frame type this link does not know is ignored. When a call is
+//      aborted in omp, {type: "cancel", id} tells the loader to drop a pending Allow/Deny gate when
+//      that call was its last waiter; the loader sends no reply to a cancel.
 //   5. Exactly one authenticated connection: any further upgrade is closed with 4009, a pre-auth message
 //      that is not auth with 4002, a bad proof with 4003, Zen's Stop button with 4010, and the loader's
 //      heartbeat reap with 4012.
@@ -50,7 +52,9 @@ const CALL_TIMEOUT_MS = 150_000;
 /**
  * Error carrying a wire code from the loader (`{error: {code, message}}`) or a link-local one:
  * `E_AUTH` (the peer failed the loader proof / sent a pre-auth message that is not auth),
- * `E_UNKNOWN` (a reply that does not match the contract), `E_TIMEOUT`, `E_STOPPED`.
+ * `E_UNKNOWN` (a reply that does not match the contract), `E_TIMEOUT`, `E_STOPPED` (the link is
+ * closed or was never up) and `E_CANCELLED` (omp aborted the call; nothing was done and it can be
+ * retried).
  *
  * The loader's own codes travel the same way: `E_DENIED` (the Hirozen Allow/Deny notice in Zen was
  * denied or unanswered), `E_DEADLINE` (omp's budget passed before the loader acted; nothing was done),
@@ -161,7 +165,11 @@ export type CallOptions = {
    * ends the local wait and, cut from the same value, the `deadline` the loader honours.
    */
   timeoutMs?: number;
-  /** Cancels the call; the loader keeps working on it (a retry joins its single-flight start). */
+  /**
+   * Cancels the call. The link sends {type: "cancel", id} so the loader drops a pending Allow/Deny
+   * gate when this was its last waiter; a call the loader is already running keeps going (a retry
+   * joins its single-flight start).
+   */
   signal?: AbortSignal;
 };
 
@@ -394,7 +402,7 @@ export class ZenLink {
     const socket = this.#client;
     if (!socket) throw new HirozenError("E_STOPPED", "the Hirozen link is not connected");
     const signal = options.signal;
-    if (signal?.aborted) throw new HirozenError("E_STOPPED", `${method} was cancelled before it was sent`);
+    if (signal?.aborted) throw new HirozenError("E_CANCELLED", "cancelled in omp; nothing was done; retry");
 
     const timeoutMs = options.timeoutMs ?? CALL_TIMEOUT_MS;
     const id = this.#nextId++;
@@ -406,7 +414,19 @@ export class ZenLink {
       this.#take(id)?.reject(new HirozenError("E_TIMEOUT", `${method} timed out after ${timeoutMs} ms`));
     }, timeoutMs);
     const onAbort = () => {
-      this.#take(id)?.reject(new HirozenError("E_STOPPED", `${method} was cancelled`));
+      const pending = this.#take(id);
+      if (!pending) return;
+      // Before rejecting, tell the loader this call no longer waits: with the last waiter gone it drops
+      // the pending Allow/Deny gate (and its 120 s timer) instead of leaving a stale prompt up. A reply
+      // to the cancelled id is ignored (#take removed it), and no error code is invented for it.
+      if (socket.readyState === WebSocket.OPEN) {
+        try {
+          socket.send(JSON.stringify({ type: "cancel", id }));
+        } catch {
+          // A socket that died mid-send is the close path's problem; the call must still settle here.
+        }
+      }
+      pending.reject(new HirozenError("E_CANCELLED", "cancelled in omp; nothing was done; retry"));
     };
     signal?.addEventListener("abort", onAbort, { once: true });
     this.#pending.set(id, {

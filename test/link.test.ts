@@ -397,3 +397,50 @@ test("4012 (heartbeat timeout) carries no sticky kind", async () => {
   const info = await closeInfo(4012, "heartbeat timeout");
   expect(info).toEqual({ code: 4012, reason: "heartbeat timeout", stopKind: null });
 });
+
+test("an aborted call sends cancel and rejects E_CANCELLED", async () => {
+  const dir = makeProfileDir();
+  const link = useLink(new ZenLink());
+  const connecting = link.connect(dir, { timeoutMs: 5_000 });
+  const { socket, handoff, challenge } = await connectAsLoader(dir);
+  await authenticate(socket, handoff.nonce, challenge);
+  socket.send(READY_FRAME);
+  await connecting;
+
+  // Aborted before it was sent: there is no request id to cancel, so the loader sees nothing and the
+  // rejection is the link-local E_CANCELLED, never the "the loader dropped the session" E_STOPPED.
+  const already = new AbortController();
+  already.abort();
+  const preSend = await link.call("browser.read", { tabKey: "t1" }, { signal: already.signal }).then(
+    () => null,
+    (reason: unknown) => reason,
+  );
+  expect(preSend).toBeInstanceOf(HirozenError);
+  expect((preSend as HirozenError).code).toBe("E_CANCELLED");
+  expect((preSend as HirozenError).message).toBe("cancelled in omp; nothing was done; retry");
+
+  // Aborted while it waits for the loader: the frame goes out before the rejection, so the loader can
+  // drop its pending Allow/Deny gate instead of leaving the notice and the 120 s timer up.
+  const controller = new AbortController();
+  const call = link.call("browser.read", { tabKey: "t1" }, { signal: controller.signal });
+  const settled = call.then(
+    () => null,
+    (reason: unknown) => reason,
+  );
+  const request = await socket.next();
+  expect(request.method).toBe("browser.read");
+  controller.abort();
+  const cancel = await socket.next();
+  expect(cancel).toEqual({ type: "cancel", id: request.id });
+  const error = await settled;
+  expect(error).toBeInstanceOf(HirozenError);
+  expect((error as HirozenError).code).toBe("E_CANCELLED");
+  expect((error as HirozenError).message).toBe("cancelled in omp; nothing was done; retry");
+
+  // A late reply to the cancelled id is ignored, and the link keeps answering new calls.
+  socket.send({ id: request.id, result: { text: "late" } });
+  const next = link.call("zen.inventory", {});
+  const nextRequest = await socket.next();
+  socket.send({ id: nextRequest.id, result: [] });
+  expect(await next).toEqual([]);
+});

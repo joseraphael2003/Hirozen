@@ -55,6 +55,7 @@ const STOP_TEXT: Record<StopKind, string> = {
 /** Loader error codes the plugin owns; their message is already written for the user. */
 const PLUGIN_CODES: Record<string, true> = {
   E_AUTH: true,
+  E_CANCELLED: true,
   E_CONFIG: true,
   E_IN_USE: true,
   E_NO_UI: true,
@@ -84,7 +85,7 @@ const CODE_TEXT: Record<string, string> = {
   E_READ_FAILED: "the loader returned no usable page data (the page may still be loading, crashed or reloading)",
   E_REF_STALE:
     "that element reference is from an older page (or the element is gone); take a fresh browser_snapshot and retry",
-  E_STOPPED: "the loader dropped the session (fail-closed); retry, or run /hirozen-connect",
+  E_STOPPED: "the Hirozen link is not connected or closed before the call could run (nothing was done); retry",
   E_TAB_INACTIVE_SPACE:
     "that tab is in a non-active space: Hirozen reads, snapshots and screenshots there, but never switches spaces to act, upload or answer a dialog",
   E_TAB_UNKNOWN: "no such tab; list the tabs with zen_tabs",

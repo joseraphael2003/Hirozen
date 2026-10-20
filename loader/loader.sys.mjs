@@ -19,7 +19,9 @@
 // gated method runs, and omp keeps its per-action approval on top. V3: consent is a *set* of
 // independent permissions {read, act, network} rather than one ladder - `act` still implies `read`,
 // `network` is independent - and a call joins a pending notice by adding its own permission to the
-// asked set, so one Allow settles every waiter.
+// asked set, so one Allow settles every waiter. When omp aborts a call it sends {type: "cancel", id}:
+// that id stops counting as a waiter, and when the last waiter is gone the gate and its timer are
+// dropped without a consent.denied and without touching the grants.
 //
 // Compact mode moves the node holding the notice (the navigator toolbox) off screen. While a prompt
 // waits, each compact-mode window gets Zen's own `flash-popup` attribute on the toolbox so the prompt
@@ -36,7 +38,10 @@
 //   request {id, method, params, deadline?}; success {id, result}; error {id, error: {code, message}};
 //   loader events {type: "event", name, data}. Status file: hirozen-status.json. `deadline` is omp's
 //   absolute epoch-ms budget for the request: the loader refuses with E_DEADLINE before it acts once
-//   that moment has passed (a missing/non-finite deadline means no check).
+//   that moment has passed (a missing/non-finite deadline means no check). omp's abort frame
+//   {type: "cancel", id} names a request that no longer waits for Allow/Deny: when it was the gate's
+//   last waiter the gate and its timer are dropped (no consent.denied, grants untouched), and it is
+//   ignored when the id is not waiting on that gate. A cancel has no reply.
 //   loader->omp heartbeat {type: "ping", t}; omp->loader {type: "pong", t}, dropped before #handle.
 //   Close codes: 1000 done, 4002 pre-auth message, 4003 auth failed, 4010 stopped by user,
 //   4012 heartbeat timeout (not sticky).
@@ -959,6 +964,12 @@ class Loader {
         // E_UNKNOWN_METHOD for a frame that has no method).
         this.#lastInbound = Date.now();
         if (msg.type === "pong") return;
+        // omp aborted a call: drop the Allow/Deny gate if this was its last waiter. A cancel is not a
+        // request: it has no method and no reply.
+        if (msg.type === "cancel") {
+          this.#cancelConsent(msg.id);
+          return;
+        }
         this.#handle(msg).then(
           result => ws.send({ id: msg.id, result }),
           e => ws.send({
@@ -1063,9 +1074,10 @@ class Loader {
 
   async #handle(msg) {
     const params = msg.params ?? {};
-    // Per-request budget: frames run concurrently, so the deadline travels with the call, not in a
-    // field. Checkpoint 1 of the plan: the entry check, before any prompt.
-    const req = { deadline: Number.isFinite(msg.deadline) ? msg.deadline : null };
+    // Per-request budget and identity: frames run concurrently, so the deadline and the id that a
+    // cancel frame names travel with the call, not in a field. Checkpoint 1 of the plan: the entry
+    // check, before any prompt.
+    const req = { deadline: Number.isFinite(msg.deadline) ? msg.deadline : null, id: Number.isInteger(msg.id) ? msg.id : null };
     this.#checkDeadline(req);
     switch (msg.method) {
       case "zen.inventory":
@@ -1151,11 +1163,11 @@ class Loader {
           this.#emit("consent.pending", { asked: [...pending.asks] });
           this.#showConsentNotice();
         }
-        await pending.promise;
+        await this.#waitOnConsent(pending, req);
         continue;
       }
       const { promise, resolve, reject } = Promise.withResolvers();
-      const fresh = { asks: new Set([need]), promise, resolve, reject, timer: null };
+      const fresh = { asks: new Set([need]), waiters: new Set(), promise, resolve, reject, timer: null };
       this.#consent.pending = fresh;
       // 120 s is the plan's bound: no answer is a Deny (not sticky - the next call asks again). The
       // timer is real (the loader has no clock of its own), and never restarted when a call joins.
@@ -1163,8 +1175,37 @@ class Loader {
       this.#writeStatus({ consentPending: [...fresh.asks] });
       this.#emit("consent.pending", { asked: [...fresh.asks] });
       this.#showConsentNotice();
-      await promise;
+      await this.#waitOnConsent(fresh, req);
     }
+  }
+
+  // Waits on one gate for one call, remembering the call's request id so omp's cancel frame can tell
+  // whether anybody still waits on the answer. The id leaves the set however the wait ends. A frame
+  // without a numeric id cannot be cancelled, which only an out-of-contract peer sends.
+  async #waitOnConsent(pending, req) {
+    const id = req?.id;
+    if (Number.isInteger(id)) pending.waiters.add(id);
+    try {
+      await pending.promise;
+    } finally {
+      if (Number.isInteger(id)) pending.waiters.delete(id);
+    }
+  }
+
+  // omp aborted a call that was waiting for Allow/Deny (the agent interrupted it). The call is gone
+  // from omp's side, so its request id stops counting as a waiter. The last waiter leaving drops the
+  // gate and its 120 s timer and puts the connected notice back; no consent.denied is emitted (the
+  // user did not deny anything) and the granted permissions are untouched. An id that is not waiting
+  // on this gate is ignored, as is a cancel racing a settlement.
+  #cancelConsent(id) {
+    const pending = this.#consent.pending;
+    if (!pending || !Number.isInteger(id) || !pending.waiters.delete(id)) return;
+    if (pending.waiters.size > 0) return;
+    clearTimeout(pending.timer);
+    this.#consent.pending = null;
+    this.#writeStatus({ consent: [...this.#consent.granted], consentPending: null });
+    this.#showConsentNotice();
+    pending.reject(new LoaderError("E_CANCELLED", "the call was cancelled in omp before the Allow/Deny notice was answered"));
   }
 
   // Allow: every asked permission is added to the granted set, the status is written before the event

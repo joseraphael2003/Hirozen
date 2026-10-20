@@ -53,6 +53,7 @@ function fakeZenDir(): string {
  */
 class FakeLoader {
   readonly requests: Frame[] = [];
+  readonly cancels: Frame[] = [];
   readonly closed: Promise<{ code: number; reason: string }>;
   #ws: WebSocket | null = null;
   #handlers = new Map<string, (frame: Frame) => void>();
@@ -149,6 +150,10 @@ class FakeLoader {
       if (frame.type === "auth") {
         // The handshake is complete only now: anything sent earlier would be refused with 4002.
         if (!this.options.holdReady) this.sendReady(LOADER_SHA, this.options.readyZenDir ?? zenDir);
+        return;
+      }
+      if (frame.type === "cancel") {
+        this.cancels.push(frame);
         return;
       }
       if (typeof frame.id === "number" && typeof frame.method === "string") {
@@ -598,6 +603,46 @@ test("a loader code renders its own gloss and keeps the loader's message", async
   expect(unscopedText).not.toContain("/hirozen-status");
   expect(unscopedText).not.toContain("zen_load_tab");
   expect((unscoped.details as { code?: string } | undefined)?.code).toBe("E_TAB_UNSCOPED");
+  await shutdown(host);
+}, 30_000);
+
+test("an aborted call is E_CANCELLED and sends cancel; E_STOPPED no longer blames the loader", async () => {
+  rmSync(join(profileDir, "hirozen-status.json"), { force: true });
+  const loader = new FakeLoader(profileDir); // browser.read stays unanswered: omp aborts it
+  const started = loader.start().catch(() => undefined);
+  const tool = host.tools.get("browser_read");
+  if (!tool) throw new Error("browser_read is not registered");
+
+  const controller = new AbortController();
+  const pending = tool
+    .execute("call-cancel", { tabKey: TAB_KEY }, controller.signal, undefined, host.ctx)
+    .then(result => result);
+  const request = await loader.nextRequest();
+  expect(request.method).toBe("browser.read");
+  controller.abort();
+  const result = await pending;
+  await started;
+  await waitFor(() => loader.cancels.length > 0);
+
+  const text = textOf(result);
+  expect(result.isError).toBe(true);
+  expect(text.startsWith("E_CANCELLED")).toBe(true);
+  expect(text).toContain("cancelled in omp; nothing was done; retry");
+  expect((result.details as { code?: string } | undefined)?.code).toBe("E_CANCELLED");
+  // The frame goes out before the rejection, so the loader can drop the stale Allow/Deny gate.
+  expect(loader.cancels).toEqual([{ type: "cancel", id: request.id }]);
+
+  // E_STOPPED is a closed link, not every cancel; its gloss must not claim the loader dropped a
+  // session over a call omp itself abandoned.
+  loader.on("browser.read", frame =>
+    loader.send({ id: frame.id, error: { code: "E_STOPPED", message: "the Hirozen link is closed" } }),
+  );
+  const stopped = await callTool(host, "browser_read", { tabKey: TAB_KEY });
+  const stoppedText = textOf(stopped);
+  expect(stopped.isError).toBe(true);
+  expect(stoppedText.startsWith("E_STOPPED")).toBe(true);
+  expect(stoppedText).not.toContain("loader dropped the session");
+  expect(stoppedText).toContain("retry");
   await shutdown(host);
 }, 30_000);
 
