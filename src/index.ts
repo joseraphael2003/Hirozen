@@ -89,6 +89,8 @@ const CODE_TEXT: Record<string, string> = {
     "that tab is in a non-active space: Hirozen reads, snapshots and screenshots there, but never switches spaces to act, upload or answer a dialog",
   E_TAB_UNKNOWN: "no such tab; list the tabs with zen_tabs",
   E_TAB_UNLOADED: "that tab is not loaded; open it in Zen first, or load it with zen_load_tab (which never selects it)",
+  E_TAB_UNSCOPED:
+    "that tab's requests cannot be told apart from other tabs' (Zen gives its browsing context no id), so nothing is being watched; try another tab",
   E_UNSUPPORTED:
     "the running Zen does not expose an internal Hirozen needs (a Zen update, or an older Zen); update Hirozen, or read /hirozen-status for the missing names",
   E_UNKNOWN_METHOD: "the installed loader does not support that method; run /hirozen-install, restart Zen",

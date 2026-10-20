@@ -2322,8 +2322,10 @@ class Loader {
     const browserId = Number(browser.browsingContext?.browserId) || 0;
     if (!browserId) {
       // Not E_TAB_UNLOADED: that code's gloss offers zen_load_tab, which cannot help a tab that is
-      // already loaded - and this one is, #resolveTab just accepted its live document.
-      throw new LoaderError("E_UNSUPPORTED", `tab ${tabKey} has no browsing context id, so Hirozen cannot tell its requests apart from other tabs'; nothing is being watched`);
+      // already loaded - and this one is, #resolveTab just accepted its live document. Not
+      // E_UNSUPPORTED either: its gloss is about a Zen that lacks an internal, and the fix for this is
+      // another tab, not a Hirozen update.
+      throw new LoaderError("E_TAB_UNSCOPED", `tab ${tabKey} has no browsing context id; Hirozen cannot tell its requests apart from other tabs'`);
     }
     await this.#gate("network", req);
     this.#checkDeadline(req);

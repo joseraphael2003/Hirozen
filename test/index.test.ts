@@ -560,7 +560,7 @@ test("/hirozen-status reports the granted permissions and the missing capabiliti
   rmSync(join(profileDir, "hirozen-status.json"), { force: true });
 });
 
-test("a loader E_UNSUPPORTED renders its gloss and keeps the loader's message", async () => {
+test("a loader code renders its own gloss and keeps the loader's message", async () => {
   rmSync(join(profileDir, "hirozen-status.json"), { force: true });
   const loader = new FakeLoader(profileDir).on("browser.read", frame =>
     loader.send({
@@ -577,6 +577,27 @@ test("a loader E_UNSUPPORTED renders its gloss and keeps the loader's message", 
   expect(text).toContain("this Zen lacks gZenViewSplitter.splitTabs");
   expect(text).toContain("update Hirozen");
   expect((result.details as { code?: string } | undefined)?.code).toBe("E_UNSUPPORTED");
+
+  // A tab whose requests cannot be scoped has its own code, and its gloss must not send the agent to
+  // /hirozen-status (nothing is missing from this Zen) nor offer zen_load_tab (the tab is loaded).
+  loader.on("network.start", frame =>
+    loader.send({
+      id: frame.id,
+      error: {
+        code: "E_TAB_UNSCOPED",
+        message: `tab ${TAB_KEY} has no browsing context id; Hirozen cannot tell its requests apart from other tabs'`,
+      },
+    }),
+  );
+  const unscoped = await callTool(host, "browser_network_start", { tabKey: TAB_KEY });
+  const unscopedText = textOf(unscoped);
+  expect(unscoped.isError).toBe(true);
+  expect(unscopedText.startsWith("E_TAB_UNSCOPED")).toBe(true);
+  expect(unscopedText).toContain("cannot be told apart from other tabs'");
+  expect(unscopedText).toContain("try another tab"); // the gloss, not just the loader's message
+  expect(unscopedText).not.toContain("/hirozen-status");
+  expect(unscopedText).not.toContain("zen_load_tab");
+  expect((unscoped.details as { code?: string } | undefined)?.code).toBe("E_TAB_UNSCOPED");
   await shutdown(host);
 }, 30_000);
 
