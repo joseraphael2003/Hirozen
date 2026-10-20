@@ -2174,16 +2174,16 @@ class Loader {
   }
 
   // Puts the user's view back after a pending tab was inserted. Only a view the insert itself took
-  // may be undone: the inserted tab must be the selection now, exactly as #restoreUserView blames the
-  // popup it re-homed. A load can take seconds, and a user who picked another tab (or another space)
-  // in the meantime moved of their own accord - their view is theirs and is never put back. The
-  // selection is restored first, then the space on its own (a switch Zen started can land without the
-  // selection having moved), with the same call Zen's own onLocationChange makes and only ever to the
-  // space captured before the insert. Both are best-effort: a Zen that refuses leaves the user where
-  // they are.
+  // may be undone, exactly as #restoreUserView blames the popup it re-homed: the selection is either
+  // the tab this call inserted, or still the tab the user had - Zen's insert path can move the user's
+  // space before the inserted tab's selection lands, and then only the space moved. A selection on any
+  // other tab is the user's own and is never put back. The selection goes first, then the space on its
+  // own, with the same call Zen's own onLocationChange makes and only ever to the space captured
+  // before the insert. Both are best-effort: a Zen that refuses leaves the user where they are.
   #restoreLoadedView(win, tab, previousSelected, userSpaceId) {
-    if (win.gBrowser?.selectedTab !== tab) return;
-    if (previousSelected && !previousSelected.closed) {
+    const selected = win.gBrowser?.selectedTab ?? null;
+    if (selected !== tab && selected !== previousSelected) return;
+    if (previousSelected && !previousSelected.closed && selected !== previousSelected) {
       try {
         win.gBrowser.selectedTab = previousSelected;
       } catch {
