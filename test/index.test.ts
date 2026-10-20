@@ -847,7 +847,10 @@ test("browser_cookies, browser_storage and browser_downloads send the agreed fra
             httpOnly: true,
             sameSite: "lax",
           },
-          { name: "theme", value: "dark", domain: "example.com", path: "/", expires: null, secure: false, httpOnly: false, sameSite: "unspecified" },
+          // `sameSite` is a name the loader maps from nsICookie's integer; "unset" is a cookie with no
+          // sameSite attribute, "none" one that asks for SameSite=None.
+          { name: "theme", value: "dark", domain: "example.com", path: "/", expires: null, secure: false, httpOnly: false, sameSite: "unset" },
+          { name: "csrf", value: "<10 chars>", domain: "example.com", path: "/", expires: null, secure: true, httpOnly: false, sameSite: "none" },
         ],
         truncated: false,
       }),
@@ -896,6 +899,9 @@ test("browser_cookies, browser_storage and browser_downloads send the agreed fra
     expect(cookiesText).toContain("flags=secure,httpOnly,sameSite=lax");
     expect(cookiesText).toContain("theme=dark");
     expect(cookiesText).toContain("expires=session");
+    // "unset" (no sameSite attribute) is not a flag; "none" is, spelled out.
+    expect(cookiesText).toContain("- theme=dark domain=example.com path=/ expires=session\n");
+    expect(cookiesText).toContain("flags=secure,sameSite=none");
 
     // 2. Reading a value itself is a different decision: it prompts, and the wire says so.
     const cookiesTool = host.tools.get("browser_cookies");

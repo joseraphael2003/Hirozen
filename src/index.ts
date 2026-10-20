@@ -155,6 +155,8 @@ type ZenCookie = {
   expires: number | null;
   secure: boolean;
   httpOnly: boolean;
+  /** The loader's name for nsICookie's integer: `none` | `lax` | `strict` | `unset` (no attribute) |
+   *  `unknown` (a value no Gecko constant covers). Never a raw number. */
   sameSite: string | null;
 };
 type ZenCookies = { tabKey: string; url: string; cookies: ZenCookie[]; truncated: boolean };
@@ -972,12 +974,14 @@ async function runBrowserDialog(
 // call asked for `reveal`, and a recorded request's headers never carry a live cookie or authorization
 // value. This side only renders what came back.
 
-/** `flags=secure,httpOnly,sameSite=lax` for the cookie attributes that are set, or "" for none. */
+/** `flags=secure,httpOnly,sameSite=lax` for the cookie attributes that are set, or "" for none.
+ *  `sameSite` is the name the loader maps nsICookie's integer to; "unset" means the cookie has no
+ *  sameSite attribute at all, which is not a flag. */
 function cookieFlags(cookie: ZenCookie): string {
   const flags = [
     cookie.secure ? "secure" : "",
     cookie.httpOnly ? "httpOnly" : "",
-    cookie.sameSite && cookie.sameSite !== "unspecified" ? `sameSite=${cookie.sameSite}` : "",
+    cookie.sameSite && cookie.sameSite !== "unset" ? `sameSite=${cookie.sameSite}` : "",
   ].filter(flag => flag !== "");
   return flags.length === 0 ? "" : ` flags=${flags.join(",")}`;
 }
