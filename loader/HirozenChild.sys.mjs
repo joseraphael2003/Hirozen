@@ -318,11 +318,18 @@ export class HirozenChild extends JSWindowActorChild {
     let labels = null; // id of a labelled control -> the label element, built once per snapshot
 
     // One candidate: the same visibility rules the snapshot always had (a zero-size or invisible
-    // element cannot be pointed at, and the same test makes it E_NOT_INTERACTABLE for act).
-    const consider = el => {
+    // element cannot be pointed at, and the same test makes it E_NOT_INTERACTABLE for act). The rect
+    // is answered here so the walk's two callers - the listing one and the one that only has to know
+    // whether an element *would* have been listed - share one measurement.
+    const listable = el => {
       const rect = el.getBoundingClientRect();
-      if (!(rect.width > 0) || !(rect.height > 0)) return;
-      if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return;
+      if (!(rect.width > 0) || !(rect.height > 0)) return null;
+      return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) ? rect : null;
+    };
+
+    const consider = el => {
+      const rect = listable(el);
+      if (!rect) return;
       if (labels === null) {
         labels = new Map();
         for (const label of doc.querySelectorAll("label[for]")) {
@@ -343,15 +350,19 @@ export class HirozenChild extends JSWindowActorChild {
 
     // The walk covers the light DOM and every open *or closed* shadow root (openOrClosedShadowRoot is
     // the ChromeOnly property that answers for a closed root too), so a web component's internals are
-    // reachable - refs inside them resolve through the same DOC_STATE map as any other element. False
-    // means the element cap was reached: the rest of the tree is not walked at all.
+    // reachable - refs inside them resolve through the same DOC_STATE map as any other element.
+    // Past the cap nothing more is listed, and the walk only keeps looking for one more element it
+    // would have listed: `truncated` then means "an interactive element was skipped", not "the tree
+    // continued", so a page whose 400 listed elements sit under a long non-interactive tail is not
+    // truncated. False still means the cap was reached, and the walk stops there.
     const visit = root => {
       for (const el of root.querySelectorAll("*")) {
-        if (elements.length >= MAX_ELEMENTS) {
+        if (elements.length < MAX_ELEMENTS) {
+          if (el.matches(ELEMENT_SELECTOR)) consider(el);
+        } else if (el.matches(ELEMENT_SELECTOR) && listable(el)) {
           truncated = true;
           return false;
         }
-        if (el.matches(ELEMENT_SELECTOR)) consider(el);
         const shadow = el.openOrClosedShadowRoot ?? null;
         if (shadow && visit(shadow) === false) return false;
       }
