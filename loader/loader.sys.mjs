@@ -548,12 +548,12 @@ class Loader {
   #consent = { granted: new Set(), pending: null }; // per link; created on auth, cleared in #teardown
   #tabOpenWatchers = new Map(); // window -> {states: [state], handler}: agent-space popup re-homing
   // The network capture (T9-T11): one watcher per watched tabKey, the same watcher reachable by the
-  // tab's browserId (the observer's only filter), the one shared observer object, and the TabClose
-  // listener installed on each window that has a watched tab.
-  #netWatch = new Map(); // tabKey -> {tabKey, tab, browserId, entries, byChannel, bytes, dropped}
+  // tab's browserId (the observer's only filter), the one shared observer object, and the
+  // TabClose/unload listeners installed on each window that has a watched tab.
+  #netWatch = new Map(); // tabKey -> {tabKey, tab, browserId, win, entries, byChannel, bytes, dropped}
   #netByBrowser = new Map(); // browserId -> the same watcher
   #netObserver = null; // registered for every NET_TOPICS topic while a watcher is live
-  #netWindows = new Map(); // window -> its TabClose handler
+  #netWindows = new Map(); // window -> the listeners that keep its watchers honest (TabClose, unload)
 
   init(mode, hashes) {
     if (this.#started) return "already-started";
@@ -2311,14 +2311,27 @@ class Loader {
     }
     await this.#gate("network", req);
     this.#checkDeadline(req);
+    // The gate can wait minutes for the Allow/Deny answer. A tab (or a window) that closed in the
+    // meantime has no requests to watch, and installing the watcher anyway would leave its buffer, its
+    // browserId and a window listener behind until stop or teardown.
+    if (!this.#tabIsLive(tab, browser)) {
+      throw new LoaderError("E_TAB_UNKNOWN", `tab ${tabKey} closed while the call waited for the Allow/Deny answer; nothing is being watched`);
+    }
+    const win = browser.ownerGlobal ?? tab.ownerDocument?.defaultView ?? null;
     if (!this.#netWatch.has(tabKey)) {
-      const watcher = { tabKey, tab, browserId, entries: [], byChannel: new Map(), bytes: 0, dropped: 0 };
+      const watcher = { tabKey, tab, browserId, win, entries: [], byChannel: new Map(), bytes: 0, dropped: 0 };
       this.#netWatch.set(tabKey, watcher);
       this.#netByBrowser.set(browserId, watcher);
     }
     this.#installNetworkObservers();
-    this.#watchTabClose(browser.ownerGlobal ?? tab.ownerDocument?.defaultView ?? null);
+    this.#watchTabClose(win);
     return { tabKey, url: browser.currentURI.spec, active: true };
+  }
+
+  // A tab that closed while a call waited: `closing` is set the moment its removal starts, and a gone
+  // browsing context is what a tab in a window that went away leaves behind.
+  #tabIsLive(tab, browser) {
+    return !!tab && !tab.closing && !!browser?.browsingContext;
   }
 
   // T11: what has been captured for that tab, then the buffer is cleared. Reading a tab nobody is
@@ -2366,28 +2379,48 @@ class Loader {
 
   // TabClose is the one event that can take a watcher away without the agent asking: the tab (and its
   // buffer) is gone, and the refcount has to notice. Zen's own listeners take the same event on the
-  // window, so the handler goes there too - one per window that has a watched tab.
+  // window, so the handler goes there too - one per window that has a watched tab. A *closing window*
+  // does not fire TabClose for each of its tabs, so the window's own `unload` is taken as well: that
+  // is the one event a closing window always fires, and without it its watchers, their browserIds and
+  // its listeners would sit in the maps until the link went away.
   #watchTabClose(win) {
     if (!win || this.#netWindows.has(win)) return;
-    const handler = event => {
-      const tab = event?.target ?? null;
-      for (const watcher of [...this.#netWatch.values()]) {
-        if (watcher.tab === tab) this.#dropWatcher(watcher);
-      }
+    const listeners = {
+      close: event => {
+        const tab = event?.target ?? null;
+        for (const watcher of [...this.#netWatch.values()]) {
+          if (watcher.tab === tab) this.#dropWatcher(watcher);
+        }
+      },
+      unload: () => this.#onWindowGone(win),
     };
     try {
-      win.addEventListener("TabClose", handler);
-      this.#netWindows.set(win, handler);
+      win.addEventListener("TabClose", listeners.close);
+      win.addEventListener("unload", listeners.unload);
+      this.#netWindows.set(win, listeners);
     } catch {
       // A window that refuses the listener is a window that is going away; its tabs go with it.
+      this.#onWindowGone(win);
     }
   }
 
-  #unwatchTabClose() {
-    for (const [win, handler] of [...this.#netWindows]) {
-      this.#netWindows.delete(win);
+  // The window is going away: its tabs never get a TabClose of their own, so every watcher it owns
+  // goes with it. Its listeners are removed here rather than left for the last watcher.
+  #onWindowGone(win) {
+    for (const watcher of [...this.#netWatch.values()]) {
+      if (watcher.win === win) this.#dropWatcher(watcher);
+    }
+    this.#unwatchTabClose(win);
+  }
+
+  // `win` limits it to one window's listeners (the one that just went away); with none, every window's.
+  #unwatchTabClose(win = null) {
+    for (const [listening, listeners] of [...this.#netWindows]) {
+      if (win && listening !== win) continue;
+      this.#netWindows.delete(listening);
       try {
-        win.removeEventListener("TabClose", handler);
+        listening.removeEventListener("TabClose", listeners.close);
+        listening.removeEventListener("unload", listeners.unload);
       } catch {
         // Nothing left to remove.
       }
