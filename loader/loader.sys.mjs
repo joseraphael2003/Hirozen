@@ -422,13 +422,17 @@ function capabilityPresent(name, win) {
   }
 }
 
-// The origin of a URI as `new URL(u).origin` spells it: scheme://host[:port], with the default port
-// omitted (nsIURI.port is -1 when the URL did not carry one). Anything that is not http(s) has no
-// origin a grant could match, so the comparison there is always a refusal.
+// The origin of a URI, spelled exactly as the plugin's `new URL(url).origin` spells it: the plugin's
+// grant carries that string, so a hand-built one has to agree with it in every case, IPv6 included
+// (nsIURI.host answers `::1` for `http://[::1]/`, where the origin keeps the brackets). Anything that
+// is not http(s) has no origin a grant could match, so the comparison there is always a refusal.
 function originOf(uri) {
   if (!uri || (uri.scheme !== "http" && uri.scheme !== "https")) return null;
-  const port = Number.isInteger(uri.port) && uri.port > 0 ? `:${uri.port}` : "";
-  return `${uri.scheme}://${uri.host}${port}`;
+  try {
+    return new URL(uri.spec).origin;
+  } catch {
+    return null;
+  }
 }
 
 // The tab a channel belongs to: the top-level browsing context's browserId. 0 means "no tab" - a
