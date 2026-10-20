@@ -2,6 +2,30 @@
 
 All notable changes to Hirozen are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/).
 
+## [0.3.0] - 2026-10-20
+
+Wider reach, network read, fewer prompts. Verified on Windows on a Zen 1.22.3b test install, with a short check on the everyday Zen 1.23.3b. The loader and actor changed, so run `/hirozen-install` and restart Zen; until then tool calls return `E_STALE_LOADER`.
+
+### Added
+
+- `browser_act` hover; elements inside open and closed shadow roots in snapshots and actions.
+- `browser_read mode:"article"`: the reader-mode article, without moving the tab to reader view.
+- `zen_load_tab`: loads an unloaded tab through Zen's own restore, without selecting it or changing your space.
+- Network permission: `browser_cookies`, `browser_storage` (values hidden unless you approve a reveal), `browser_downloads`, and per-tab request recording (`browser_network_start`/`_read`/`_stop`) with cookie and authorization headers redacted.
+- `/hirozen-grant <tabKey|origin> <minutes>`: covered clicks, typing, keys, scrolling and hover skip the omp prompt; navigation and everything else still ask. `/hirozen-grant clear` ends it.
+- The loader reports which Zen internals it found; a tool whose internal is missing refuses with `E_UNSUPPORTED`, and `/hirozen-status` lists them.
+
+### Changed
+
+- Consent is three separate permissions (read, act, network) instead of a ladder; a call asks only for what is missing.
+- Loaded tabs in other spaces can be read, snapshotted and screenshotted; actions there are still refused.
+- The reinstall offer after a Zen update mentions `/hirozen-attach` only when Zen is running.
+
+### Fixed
+
+- Network entries had no method, status or headers on a real Zen (found in live QA).
+- A cookie's `sameSite` showed as a raw number.
+
 ## [0.2.2] - 2026-10-07
 
 Configure once, work from any folder. Verified on Windows with the everyday Zen 1.23.1b (Gecko 157.0.1) and a 1.22.3b test install. The loader changed, so run `/hirozen-install` and restart Zen; until then tool calls return `E_STALE_LOADER`.
@@ -138,7 +162,8 @@ First release: read-only access to a running Zen browser from omp. Verified on Z
 - Two one-off results could not be reproduced: a Deny that returned an uncaptured code, and a transient `E_IN_USE` on an immediate reconnect.
 - Not yet validated on a daily profile. Click, type, navigation and Zen layout actions are planned for V2.
 
-[0.2.2]: https://github.com/joseraphael2003/Hirozen/compare/8d35252...main
+[0.3.0]: https://github.com/joseraphael2003/Hirozen/compare/fa3c2e9...main
+[0.2.2]: https://github.com/joseraphael2003/Hirozen/compare/8d35252...fa3c2e9
 [0.2.1]: https://github.com/joseraphael2003/Hirozen/compare/d04686c...8d35252
 [0.2.0]: https://github.com/joseraphael2003/Hirozen/compare/1e071bc...d04686c
 [0.1.2]: https://github.com/joseraphael2003/Hirozen/compare/21eaaec...1e071bc

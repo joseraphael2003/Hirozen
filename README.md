@@ -4,7 +4,7 @@ An [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) plugin that lets the om
 
 The agent can list your tabs and spaces, read pages, take screenshots, click, type, navigate, upload files, answer page dialogs, and arrange tabs with Zen's own layout features (spaces, split view, glance).
 
-> **Status:** 0.2.2. Verified on Zen 1.23.1b (Gecko 157.0.1) on Windows, on the everyday profile, and on a 1.22.3b test install. See [CHANGELOG.md](CHANGELOG.md).
+> **Status:** 0.3.0. Verified on Windows on a Zen 1.22.3b test install, with a short check on the everyday Zen 1.23.3b. See [CHANGELOG.md](CHANGELOG.md).
 
 ## How it works
 
@@ -24,16 +24,20 @@ omp + Hirozen plugin  <── authenticated loopback WebSocket ──  Hirozen l
 |---|---|
 | `zen_tabs` | Lists tabs in every window and space, without loading unloaded tabs. |
 | `zen_spaces` | Lists your spaces and which one is active. |
-| `browser_read` | Returns the readable text of a tab, capped at 40,000 characters. |
+| `browser_read` | Returns the readable text of a tab, capped at 40,000 characters; `mode:"article"` returns the reader-mode article instead. |
 | `browser_screenshot` | Takes a PNG screenshot of a tab. |
-| `browser_snapshot` | Lists a tab's clickable and typeable elements with short refs (up to 400). |
-| `browser_act` | Clicks, types, presses a key, scrolls or navigates (http/https only). |
+| `browser_snapshot` | Lists a tab's clickable and typeable elements with short refs (up to 400), including inside open and closed shadow roots. |
+| `browser_act` | Clicks, types, presses a key, scrolls, hovers or navigates (http/https only). |
 | `browser_upload` | Sets local files on a page's file input. |
 | `browser_dialog` | Accepts or dismisses a page's `alert`/`confirm`/`prompt` (with optional text). |
 | `zen_open` | Opens a URL in the background in a "Hirozen Agent" space, without switching your space. |
 | `zen_move` | Moves a tab to another space. |
 | `zen_split` / `zen_unsplit` | Puts tabs in a split view, or takes one out. Never includes your selected tab. |
 | `zen_glance` | Opens an http(s) URL in a glance. |
+| `zen_load_tab` | Loads an unloaded tab in the background through Zen's own restore, without selecting it. |
+| `browser_cookies` / `browser_storage` | Reads a tab's cookies, or its local/session storage or IndexedDB names. Values are hidden unless you approve `reveal:true`. |
+| `browser_downloads` | Lists recent downloads. |
+| `browser_network_start` / `_read` / `_stop` | Records one tab's requests (URL, status, timing, headers; cookie and auth headers redacted). |
 
 Every tool except `zen_tabs`, `zen_spaces`, `browser_read`, `browser_screenshot` and `browser_snapshot` asks for omp approval first, showing the tab and the target (for example `button "Save"`). Tools run only in the interactive root omp session. Subagents and headless runs are refused.
 
@@ -45,6 +49,7 @@ Every tool except `zen_tabs`, `zen_spaces`, `browser_read`, `browser_screenshot`
 | `/hirozen-install` | Installs or verifies the autoconfig, loader and actor in the configured Zen install. Restart Zen once afterwards. |
 | `/hirozen-attach` | Loads Hirozen into an already-running Zen without a restart, through a one-time debugger connection. |
 | `/hirozen-connect` | Reconnects after you pressed Stop in Zen. |
+| `/hirozen-grant` | `/hirozen-grant <tabKey|origin> <minutes 1-60>` lets clicks, typing, keys, scrolling and hover on that site run without omp prompts; `/hirozen-grant clear` ends it. Navigation and everything else still ask. |
 | `/hirozen-status` | Shows the configured Zen and where that setting came from, plus install, link and consent state. |
 
 ## Setup
@@ -78,11 +83,12 @@ HIROZEN_PROFILE=<full path to the Zen profile folder>
 
 ## Safety
 
-- **Consent in Zen.** The first read asks in Zen: "omp pid … wants to read pages". Acting (clicks, typing, uploads, dialogs, layout) asks again for "read and act". Deny returns `E_DENIED`, and an unanswered prompt is denied after 120 s. The terminal tells you when Zen is waiting for you.
-- **Approval in omp.** Each action is also approved in omp, with the tab and target shown.
+- **Consent in Zen.** Permissions are asked separately in Zen: read pages, act on pages (clicks, typing, uploads, dialogs, layout, tab loading; includes read), and network data (cookies, storage, downloads, request headers). A call asks only for what is not granted yet. Deny returns `E_DENIED`, and an unanswered prompt is denied after 120 s. The terminal tells you when Zen is waiting for you.
+- **Approval in omp.** Each action is also approved in omp, with the tab and target shown, unless a `/hirozen-grant` you gave covers that tab's site. A grant stops covering a tab that has moved to another site (`E_GRANT_STALE`).
+- **Network data is redacted.** Cookie and storage values and cookie/authorization headers are hidden unless you approve a reveal. No response bodies, no blocking.
 - **Visible.** While connected, every Zen window shows a notice naming the omp process and what it may do, with a **Stop** button. Stop is sticky until you run `/hirozen-connect`.
 - **Your view stays yours.** `zen_open` works in the "Hirozen Agent" space; popups from agent tabs stay there, and your space and selected tab are restored.
-- **Private windows and privileged pages are never exposed** (`E_PRIVATE`, `E_PRIVILEGED_PAGE`). Tabs in your other inactive spaces are refused (`E_TAB_INACTIVE_SPACE`); tabs in the agent space are not.
+- **Private windows and privileged pages are never exposed** (`E_PRIVATE`, `E_PRIVILEGED_PAGE`). Loaded tabs in your other spaces can be read, snapshotted and screenshotted, but actions there are refused (`E_TAB_INACTIVE_SPACE`); tabs in the agent space are not.
 - **No late actions.** Each request carries omp's deadline; if Zen is still waiting when omp gives up, the loader does nothing (`E_DEADLINE`).
 - **Tamper check.** A modified loader or actor is refused at Zen startup and reported by omp as `E_STALE_LOADER`.
 
@@ -100,7 +106,7 @@ Changing any file in `loader/` changes its hash, so run `/hirozen-install` again
 
 ## Roadmap
 
-- **Later:** background research tasks in the agent space, network inspection, and support for sites that publish WebMCP tools.
+- **Later:** response bodies and request blocking, JS in the page, iframes, drag and drop, background research tasks, and sites that publish WebMCP tools.
 
 ## License
 
