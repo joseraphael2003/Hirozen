@@ -1179,27 +1179,36 @@ class Loader {
     }
   }
 
-  // Waits on one gate for one call, remembering the call's request id so omp's cancel frame can tell
-  // whether anybody still waits on the answer. The id leaves the set however the wait ends. A frame
-  // without a numeric id cannot be cancelled, which only an out-of-contract peer sends.
+  // Waits on one gate for one call, remembering the call itself so omp's cancel frame can tell
+  // whether anybody still waits on the answer. A cancel for a non-last waiter leaves the gate up for
+  // the others, so after the await this call must check its own flag: the Allow that settles the
+  // others must never let it resume and run its action after omp was told it was cancelled. The
+  // waiter leaves the set however the wait ends.
   async #waitOnConsent(pending, req) {
-    const id = req?.id;
-    if (Number.isInteger(id)) pending.waiters.add(id);
+    pending.waiters.add(req);
     try {
       await pending.promise;
+      if (req.cancelled) {
+        throw new LoaderError("E_CANCELLED", "the call was cancelled in omp while the Allow/Deny notice was up");
+      }
     } finally {
-      if (Number.isInteger(id)) pending.waiters.delete(id);
+      pending.waiters.delete(req);
     }
   }
 
   // omp aborted a call that was waiting for Allow/Deny (the agent interrupted it). The call is gone
-  // from omp's side, so its request id stops counting as a waiter. The last waiter leaving drops the
-  // gate and its 120 s timer and puts the connected notice back; no consent.denied is emitted (the
-  // user did not deny anything) and the granted permissions are untouched. An id that is not waiting
-  // on this gate is ignored, as is a cancel racing a settlement.
+  // from omp's side, so it stops counting as a waiter and is marked cancelled: if another waiter's
+  // Allow settles the shared gate later, this call throws instead of running its action. The last
+  // waiter leaving drops the gate and its 120 s timer and puts the connected notice back; no
+  // consent.denied is emitted (the user did not deny anything) and the granted permissions are
+  // untouched. An id that is not waiting on this gate is ignored, as is a cancel racing a settlement.
   #cancelConsent(id) {
     const pending = this.#consent.pending;
-    if (!pending || !Number.isInteger(id) || !pending.waiters.delete(id)) return;
+    if (!pending || !Number.isInteger(id)) return;
+    const waiter = [...pending.waiters].find(candidate => candidate.id === id);
+    if (!waiter) return;
+    waiter.cancelled = true;
+    pending.waiters.delete(waiter);
     if (pending.waiters.size > 0) return;
     clearTimeout(pending.timer);
     this.#consent.pending = null;
